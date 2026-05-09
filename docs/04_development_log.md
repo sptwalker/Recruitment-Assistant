@@ -1,5 +1,80 @@
 # 开发日志
 
+## 2026-05-09
+
+### 当前阶段
+
+项目推进到 `P5：智联聊天附件简历自动采集闭环调试`。当前目标是完成自动登录、进入聊天、逐个选择候选人、点击 `要附件简历` / `查看简历附件`，捕获附件下载链接并保存 PDF，连续处理 5 个候选人。
+
+### 已完成内容
+
+- 增强智联登录态维护：
+  - `login_manually()` 支持登录后自动进入智联系统首页。
+  - 新增 `keep_open` 参数，避免登录态保存后浏览器立即关闭。
+  - `scripts/zhilian_login.py` 新增 `--keep-open`、`--no-enter-home` 参数。
+  - `app/pages/05_login.py` 调整为登录后保持浏览器窗口打开，便于确认登录状态。
+- 增强脚本直接运行能力：
+  - `scripts/init_db.py`
+  - `scripts/check_zhilian_login.py`
+  - `scripts/capture_zhilian_page.py`
+  - `scripts/capture_zhilian_manual_pages.py`
+  - 以上脚本补充项目根目录导入路径，便于从项目根目录直接执行。
+- 新增智联聊天附件简历自动采集入口：
+  - `scripts/download_zhilian_chat_resumes.py`
+  - 支持手动监听下载链接、自动监听、全自动点击候选人并下载附件简历。
+- 增强 Playwright 浏览器上下文：
+  - `recruitment_assistant/core/browser.py` 开启 `accept_downloads=True`，支持浏览器下载附件 PDF。
+- 大幅增强智联适配器：`recruitment_assistant/platforms/zhilian/adapter.py`
+  - 自动进入智联聊天页面。
+  - 自动点击左侧聊天入口，包含 DOM 点击和坐标兜底。
+  - 自动识别左侧候选人列表。
+  - 跳过第一项 `快速处理新招呼`，从真实候选人开始向下处理。
+  - 根据实际 DOM 坐标修正候选人卡片点击范围，使用 `elementsFromPoint()` 和真实鼠标点击双重兜底。
+  - 支持点击聊天详情区的 `要附件简历`。
+  - 支持点击 `查看简历附件`、`查看附件简历`、`下载附件简历` 等按钮文案。
+  - 避免误点 `已向对方要附件简历` 等状态文本。
+  - 如果未找到 `要附件简历`，继续尝试查看已收到的附件简历。
+  - 自动监听智联附件下载链接并保存 PDF。
+  - 保存原始附件记录到 `raw_resume`。
+  - 增加聊天详情区操作元素打印，便于继续定位真实按钮 DOM。
+- 新增 PDF 简历解析能力：
+  - `recruitment_assistant/parsers/pdf_resume_parser.py`
+  - `scripts/parse_pdf_resumes.py`
+  - `pyproject.toml` 新增 `pypdf>=5.0.0` 依赖。
+
+### 本次重点修复
+
+- 修复登录后浏览器窗口自动关闭的问题。
+- 修复登录后未自动进入智联系统首页的问题。
+- 修复进入聊天页后误把整页容器识别为候选人的问题。
+- 修复误点左侧第一项 `快速处理新招呼` 的问题。
+- 修复已读取候选人文本但未真正选中候选人聊天的情况。
+- 修复 `查看简历附件` 文案未被匹配的问题。
+- 修复误把 `已向对方要附件简历` 状态文本当作按钮点击的问题。
+
+### 当前可用命令
+
+```powershell
+python scripts/zhilian_login.py --account default --wait 180 --keep-open
+python scripts/check_zhilian_login.py --account default
+python scripts/download_zhilian_chat_resumes.py --account default --auto-click --max-resumes 5 --wait 900 --per-candidate-wait 60
+python scripts/parse_pdf_resumes.py
+```
+
+### 验证状态
+
+代码已通过编译检查：
+
+```powershell
+python -m compileall recruitment_assistant scripts app
+```
+
+### 下一步建议
+
+1. 继续使用真实智联聊天页验证 `查看简历附件` 点击是否能稳定触发下载请求。
+2. 如果仍未捕获下载链接，依据新增的聊天详情区操作元素日志继续收窄按钮 DOM 选择器。
+3. 完成 5 个候选人附件简历连续下载后，进入 PDF 解析字段准确率优化。
+
 ## 2026-05-08
 
 ### 当前阶段

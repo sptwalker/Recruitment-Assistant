@@ -29,5 +29,5 @@ wait_seconds = st.number_input("等待人工登录秒数", min_value=30, max_val
 
 if st.button("打开智联招聘登录并保存登录态"):
     with st.spinner("请在弹出的浏览器中完成人工登录..."):
-        state_path = adapter.login_manually(wait_seconds=int(wait_seconds))
+        state_path = adapter.login_manually(wait_seconds=int(wait_seconds), keep_open=True)
     st.success(f"登录态已保存：{state_path}")

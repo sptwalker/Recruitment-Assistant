@@ -39,7 +39,11 @@ def open_browser_session(
     settings = get_settings()
     playwright = sync_playwright().start()
     browser = playwright.chromium.launch(headless=settings.playwright_headless if headless is None else headless)
-    context_kwargs = {"viewport": viewport or {"width": 1440, "height": 900}}
+    context_kwargs = {
+        "viewport": viewport or {"width": 1440, "height": 900},
+        "accept_downloads": True,
+    }
+
     if state_path and state_path.exists():
         context_kwargs["storage_state"] = str(state_path)
     context = browser.new_context(**context_kwargs)

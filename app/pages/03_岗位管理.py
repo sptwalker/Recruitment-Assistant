@@ -3,13 +3,15 @@ from tempfile import NamedTemporaryFile
 
 import streamlit as st
 
+from components.layout import inject_vibe_style, page_header
 from recruitment_assistant.schemas.job import JobPositionCreate
 from recruitment_assistant.services.job_service import JobService
 from recruitment_assistant.storage.db import create_session
 from recruitment_assistant.utils.docx_utils import extract_docx_text
 
-st.set_page_config(page_title="岗位管理", layout="wide")
-st.title("岗位管理")
+st.set_page_config(page_title="标签与岗位", layout="wide", initial_sidebar_state="collapsed")
+inject_vibe_style("标签")
+page_header("标签与岗位", "维护岗位 JD、技能标签与岗位画像。")
 
 with st.expander("新增岗位 JD", expanded=True):
     uploaded_file = st.file_uploader("上传 Word 格式 JD", type=["docx"])
@@ -29,20 +31,16 @@ with st.expander("新增岗位 JD", expanded=True):
         job_name = col1.text_input("岗位名称 *")
         department = col2.text_input("部门")
         city = col3.text_input("城市")
-
         col4, col5 = st.columns(2)
         salary_min = col4.number_input("月薪下限", min_value=0, value=0, step=1000)
         salary_max = col5.number_input("月薪上限", min_value=0, value=0, step=1000)
-
         col6, col7, col8 = st.columns(3)
         degree = col6.text_input("学历要求")
         exp_min = col7.number_input("最低经验", min_value=0.0, max_value=60.0, value=0.0, step=0.5)
         exp_max = col8.number_input("最高经验", min_value=0.0, max_value=60.0, value=0.0, step=0.5)
-
         required_skills = st.text_input("必备技能，逗号分隔")
         preferred_skills = st.text_input("加分技能，逗号分隔")
         description = st.text_area("JD 文本", value=extracted_text, height=180)
-
         submitted = st.form_submit_button("保存岗位")
         if submitted:
             if not job_name.strip():
@@ -71,7 +69,7 @@ keyword = st.text_input("按岗位名称搜索")
 with create_session() as session:
     jobs = JobService(session).list_jobs(keyword=keyword or None)
 
-st.subheader("岗位列表")
+st.markdown('<div class="vibe-card"><h3>岗位列表</h3>', unsafe_allow_html=True)
 st.dataframe(
     [
         {
@@ -79,11 +77,9 @@ st.dataframe(
             "岗位": item.job_name,
             "部门": item.department,
             "城市": item.city,
-            "薪资下限": item.salary_min,
-            "薪资上限": item.salary_max,
+            "薪资": f"{item.salary_min or '-'} - {item.salary_max or '-'}",
             "学历": item.degree_requirement,
-            "最低经验": item.experience_min_years,
-            "最高经验": item.experience_max_years,
+            "经验": f"{item.experience_min_years}-{item.experience_max_years}年",
             "来源文件": item.source_file_name,
             "状态": item.status,
         }
@@ -91,3 +87,4 @@ st.dataframe(
     ],
     use_container_width=True,
 )
+st.markdown('</div>', unsafe_allow_html=True)

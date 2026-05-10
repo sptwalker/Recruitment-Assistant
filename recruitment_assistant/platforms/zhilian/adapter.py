@@ -1,18 +1,22 @@
+import re
 import time
 from datetime import datetime
 from hashlib import sha256
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from typing import Callable
+from urllib.parse import parse_qs, unquote, urlparse
 
 
 
 from loguru import logger
-from playwright.sync_api import BrowserContext, Download, Page, Request, TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import BrowserContext, Download, Error as PlaywrightError, Page, Request, TimeoutError as PlaywrightTimeoutError
 
 
 
 from recruitment_assistant.config.settings import get_settings
 from recruitment_assistant.core.browser import get_state_path, open_browser_session, save_storage_state
+from recruitment_assistant.extractors.scrapling_candidate_extractor import extract_candidate_info
+from recruitment_assistant.parsers.pdf_resume_parser import clean_candidate_signature, parse_resume_file
 from recruitment_assistant.platforms.base import BasePlatformAdapter
 from recruitment_assistant.utils.hash_utils import text_hash
 from recruitment_assistant.utils.snapshot_utils import safe_filename, save_text_snapshot
@@ -42,6 +46,8 @@ class ZhilianAdapter(BasePlatformAdapter):
                 page.wait_for_timeout(3000)
             except PlaywrightTimeoutError:
                 logger.warning("等待登录跳转超时，将尝试进入智联系统首页后保存当前登录态。")
+            except PlaywrightError as exc:
+                raise RuntimeError("登录窗口已关闭或登录流程已取消") from exc
             if enter_home:
                 try:
                     page.goto(self.home_url, wait_until="domcontentloaded", timeout=30000)
@@ -298,10 +304,40 @@ class ZhilianAdapter(BasePlatformAdapter):
 
     def _filename_from_download_url(self, download_url: str) -> str:
         query = parse_qs(urlparse(download_url).query)
-        raw_name = (query.get("fileName") or [""])[0]
+        raw_name = (query.get("fileName") or query.get("filename") or query.get("name") or [""])[0]
         if raw_name:
-            return f"{safe_filename(raw_name, max_length=80)}.pdf"
+            decoded_name = unquote(raw_name)
+            safe_name = safe_filename(Path(decoded_name).stem or decoded_name, max_length=80)
+            suffix = Path(decoded_name).suffix.lower()
+            if suffix in {".pdf", ".doc", ".docx"}:
+                return f"{safe_name}{suffix}"
+            return f"{safe_name}.pdf"
         return "resume.pdf"
+
+    def _detect_attachment_suffix(self, content: bytes, content_type: str, suggested_filename: str) -> str:
+        suffix = Path(suggested_filename).suffix.lower()
+        if content.startswith(b"%PDF"):
+            return ".pdf"
+        if content.startswith(b"PK\x03\x04"):
+            return ".docx"
+        if content.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
+            return ".doc"
+        if suffix in {".pdf", ".doc", ".docx"}:
+            return suffix
+        if "pdf" in content_type.lower():
+            return ".pdf"
+        if "word" in content_type.lower() or "msword" in content_type.lower():
+            return ".doc"
+        return suffix or ".bin"
+
+    def _is_supported_resume_file(self, content: bytes, suffix: str) -> bool:
+        if suffix == ".pdf":
+            return content.startswith(b"%PDF") and b"%%EOF" in content[-2048:]
+        if suffix == ".docx":
+            return content.startswith(b"PK\x03\x04")
+        if suffix == ".doc":
+            return content.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1")
+        return False
 
     def _is_resume_attachment_download_url(self, url: str) -> bool:
         return "attachment.zhaopin.com" in url and "downloadFileTemporary" in url
@@ -328,8 +364,14 @@ class ZhilianAdapter(BasePlatformAdapter):
         content_type = response.headers.get("content-type", "")
         disposition = response.headers.get("content-disposition", "")
         suggested_filename = filename or self._filename_from_download_url(download_url)
-        if ".pdf" not in suggested_filename.lower() and "pdf" in content_type.lower():
-            suggested_filename = f"{suggested_filename}.pdf"
+        suffix = self._detect_attachment_suffix(content, content_type, suggested_filename)
+        suggested_filename = f"{safe_filename(Path(suggested_filename).stem or 'resume', max_length=80)}{suffix}"
+        if not self._is_supported_resume_file(content, suffix):
+            preview = content[:80].hex()
+            raise RuntimeError(
+                f"附件文件格式无效或下载不完整：suffix={suffix}, "
+                f"content-type={content_type}, size={len(content)}, head={preview}"
+            )
         target_path = self._build_attachment_path(suggested_filename, source_url=download_url)
         target_path.write_bytes(content)
         file_hash = sha256(content).hexdigest()
@@ -343,7 +385,7 @@ class ZhilianAdapter(BasePlatformAdapter):
                 "attachment": {
                     "file_name": target_path.name,
                     "file_path": str(target_path),
-                    "file_ext": target_path.suffix.lower(),
+                    "file_ext": suffix,
                     "mime_type": content_type or None,
                     "file_size": target_path.stat().st_size,
                     "file_hash": file_hash,
@@ -626,7 +668,12 @@ class ZhilianAdapter(BasePlatformAdapter):
         return False
 
 
-    def _click_next_uncontacted_candidate(self, page: Page, seen_signatures: set[str]) -> str | None:
+    def _click_next_uncontacted_candidate(
+        self,
+        page: Page,
+        seen_signatures: set[str],
+        should_skip_candidate_signature: Callable[[str], bool] | None = None,
+    ) -> str | None:
         script = r"""
             (seen) => {
                 const isVisible = (el) => {
@@ -691,12 +738,12 @@ class ZhilianAdapter(BasePlatformAdapter):
                 for (const target of targets) {
                     const rect = target.getBoundingClientRect();
                     const signature = normalize(target.innerText || target.textContent).slice(0, 220);
-                    const key = `${Math.round(rect.left)}:${Math.round(rect.top)}:${signature}`;
-                    if (!signature || seen.includes(signature) || used.has(key) || skip(signature)) continue;
+                    const positionKey = `pos:${Math.round(rect.left)}:${Math.round(rect.top)}:${Math.round(rect.width)}:${Math.round(rect.height)}`;
+                    const key = `${positionKey}:${signature}`;
+                    if (!signature || seen.includes(signature) || seen.includes(positionKey) || used.has(key) || skip(signature)) continue;
                     used.add(key);
                     const x = Math.min(410, Math.max(230, rect.left + rect.width * 0.55));
                     const y = rect.top + rect.height / 2;
-                    const before = normalize(document.body ? document.body.innerText : '');
                     target.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, clientX: x, clientY: y }));
                     target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, clientX: x, clientY: y, button: 0 }));
                     target.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, clientX: x, clientY: y, button: 0 }));
@@ -707,7 +754,7 @@ class ZhilianAdapter(BasePlatformAdapter):
                         pointTarget.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, clientX: x, clientY: y, button: 0 }));
                         pointTarget.click();
                     }
-                    return { signature, x, y };
+                    return { signature, positionKey, x, y };
                 }
                 return null;
             }
@@ -718,9 +765,11 @@ class ZhilianAdapter(BasePlatformAdapter):
             except Exception:
                 continue
             if result:
+                signature = result["signature"]
+                if should_skip_candidate_signature and should_skip_candidate_signature(signature):
+                    return "\n".join([signature, result["positionKey"], "skipped_before_click"])
                 page.mouse.click(result["x"], result["y"])
-                page.wait_for_timeout(1500)
-                return result["signature"]
+                return "\n".join([signature, result["positionKey"]])
         return None
 
     def _print_candidate_candidates(self, page: Page) -> None:
@@ -855,12 +904,262 @@ class ZhilianAdapter(BasePlatformAdapter):
             exclude_texts=["已向对方要附件简历", "要附件简历", "索要附件简历", "请求附件简历", "获取附件简历", "要简历"],
         )
 
+    def _clean_candidate_name(self, value: str) -> str:
+        text = re.sub(r"\s+", " ", str(value or "")).strip()
+        if not text:
+            return ""
+        stop_tokens = [
+            "沟通", "聊天", "附件", "简历", "查看", "下载", "电话", "手机号", "求职", "职位", "岗位",
+            "未读", "已读", "在线", "打招呼", "要附件", "本科", "专科", "硕士", "博士", "经验",
+            "岁", "性别", "工作", "学历", "平台", "快捷", "发送", "复制", "不合适", "约面试",
+            "设置备注", "已向对方要附件简历", "待识别",
+        ]
+        text = re.sub(r"(姓名|候选人|联系人)[:：]", " ", text)
+        for part in re.split(r"[｜|/\\,，;；:：\n\r\t ]+", text):
+            part = part.strip(" ·-—_()（）[]【】")
+            if not part or any(token in part for token in stop_tokens):
+                continue
+            if re.search(r"\d|岁|年|男|女", part):
+                continue
+            if re.fullmatch(r"[\u4e00-\u9fa5]{2,4}", part) or re.fullmatch(r"[A-Za-z][A-Za-z .·-]{1,30}", part):
+                return part
+        return ""
+
+    def _clean_candidate_job_title(self, value: str, candidate_name: str = "") -> str:
+        text = re.sub(r"\s+", " ", str(value or "")).strip(" -—｜|:：")
+        if not text or text == candidate_name:
+            return ""
+        job_keywords = [
+            "工程师", "经理", "主管", "专员", "顾问", "运营", "销售", "开发", "产品", "设计", "会计", "人事",
+            "行政", "客服", "教师", "司机", "助理", "总监", "招聘", "采购", "算法", "测试", "前端", "后端",
+            "架构", "实施", "运维", "财务", "出纳", "法务", "分析师", "需求分析",
+        ]
+        company_noise = ["有限公司", "分公司", "集团", "科技", "公司", "企业", "中心", "事业部", "工作室", "系统集成"]
+        section_noise = ["工作经历", "项目经历", "教育经历", "实习经历", "培训经历", "校园经历"]
+        text = re.sub(r"^(求职岗位|求职职位|应聘岗位|应聘职位|期望职位|期望岗位|目标职位|目标岗位|职位|岗位)[:： ]*", "", text).strip(" -—｜|")
+        text = re.sub(r"^(" + "|".join(section_noise) + r")\s*[（(]?\s*\d+(?:\.\d+)?\s*年\s*[）)]?\s*", "", text).strip(" -—｜|")
+        text = re.split(r"电话|手机|性别|姓名|男|女|\d{2,}|岁|经验|本科|专科|硕士|博士|学历|在线|沟通|附件|简历", text)[0].strip(" -—｜|")
+        parts = [part.strip(" -—｜|/\\,，;；:：()（）[]【】") for part in re.split(r"[·•|｜/\\,，;；\n\r\t]+", text)]
+        candidates = [part for part in parts if part]
+        candidates.append(text)
+        text = ""
+        for part in reversed(candidates):
+            if not (2 <= len(part) <= 40):
+                continue
+            if any(token in part for token in company_noise + section_noise):
+                continue
+            if any(keyword.lower() in part.lower() for keyword in job_keywords):
+                text = part
+                break
+        if not text:
+            text = candidates[-1] if candidates else ""
+        if not text or text == candidate_name:
+            return ""
+        if self._clean_candidate_name(text) == text:
+            return ""
+        if any(token in text for token in ["聊天", "沟通", "附件", "简历", "查看", "下载", "电话", "手机", "未读", "已读", "快捷回复", "设置备注", "不合适"]):
+            return ""
+        if any(token in text for token in company_noise + section_noise):
+            return ""
+        return text if 2 <= len(text) <= 40 else ""
+
+    def _parse_candidate_signature(self, signature: str) -> dict:
+        name, job_title = clean_candidate_signature(signature or "")
+        name = self._clean_candidate_name(name or "")
+        job_title = self._clean_candidate_job_title(job_title or "", name)
+        return {"name": name or "待识别", "job_title": job_title or "待识别", "extractor": "candidate_signature"}
+
+    def _is_unknown_or_noise(self, value: str) -> bool:
+        text = re.sub(r"\s+", " ", str(value or "")).strip()
+        return not text or text == "待识别" or any(
+            token in text
+            for token in ["设置备注", "不合适", "已向对方要附件简历", "要附件简历", "查看附件简历"]
+        )
+
+    def _candidate_info_score(self, info: dict) -> int:
+        weights = {"phone": 4, "name": 3, "job_title": 2, "gender": 1}
+        return sum(weights[key] for key in weights if info.get(key) and info.get(key) != "待识别")
+
+    def _extract_candidate_info_from_resume_file(self, file_path: str | None, fallback_signature: str = "") -> dict:
+        if not file_path:
+            return {}
+        try:
+            parsed = parse_resume_file(file_path, candidate_signature=fallback_signature)
+        except Exception as exc:
+            logger.warning("附件简历解析失败，跳过附件字段兜底：{}", exc)
+            return {}
+        data = parsed.to_dict()
+        return {
+            "name": data.get("name") or "待识别",
+            "gender": self._extract_gender_from_resume_text(parsed.text) or "待识别",
+            "job_title": data.get("expected_position") or data.get("current_position") or data.get("job_title") or "待识别",
+            "phone": data.get("phone") or "待识别",
+            "profile_text": data.get("text_preview") or parsed.text[:1000],
+            "extractor": "resume_file",
+        }
+
+    def _extract_gender_from_resume_text(self, text: str) -> str:
+        text = re.sub(r"\s+", " ", str(text or ""))
+        if re.search(r"性别[:： ]*男|男士|男 \|", text):
+            return "男"
+        if re.search(r"性别[:： ]*女|女士|女 \|", text):
+            return "女"
+        return ""
+    def _parse_candidate_info_text(self, source_text: str, fallback_signature: str = "", extractor: str = "dom_fallback") -> dict:
+        lines = [re.sub(r"\s+", " ", line).strip() for line in str(source_text or "").splitlines()]
+        lines = [line for line in lines if line and len(line) <= 220]
+        merged = " ".join(lines) or fallback_signature
+        phone_match = re.search(r"(?<!\d)(1[3-9]\d{9})(?!\d)", merged)
+        gender = ""
+        if re.search(r"性别[:： ]*男|(^|[^\u4e00-\u9fa5])男([^\u4e00-\u9fa5]|$)", merged):
+            gender = "男"
+        elif re.search(r"性别[:： ]*女|(^|[^\u4e00-\u9fa5])女([^\u4e00-\u9fa5]|$)", merged):
+            gender = "女"
+
+        name = ""
+        job_title = ""
+        job_keywords = [
+            "工程师", "经理", "主管", "专员", "顾问", "运营", "销售", "开发", "产品", "设计", "会计", "人事",
+            "行政", "客服", "教师", "司机", "助理", "总监", "招聘", "采购", "算法", "测试", "前端", "后端",
+            "架构", "实施", "运维", "财务", "出纳", "法务",
+        ]
+        label_pattern = r"求职岗位|求职职位|应聘岗位|应聘职位|期望职位|期望岗位|目标职位|目标岗位|职位|岗位"
+        for line in lines:
+            if not name:
+                match = re.search(r"(?:姓名|候选人)[:： ]*([\u4e00-\u9fa5]{2,4}|[A-Za-z][A-Za-z .·-]{1,30})", line)
+                name = self._clean_candidate_name(match.group(1) if match else line)
+            if not job_title:
+                match = re.search(rf"(?:{label_pattern})[:： ]*([^｜|,，;；\n\r]+)", line)
+                if match:
+                    job_title = self._clean_candidate_job_title(match.group(1), name)
+            if not job_title and any(token in line for token in job_keywords):
+                job_title = self._clean_candidate_job_title(line, name)
+
+        if not name:
+            name = self._clean_candidate_name(fallback_signature)
+        if not job_title:
+            for line in fallback_signature.splitlines():
+                if any(token in line for token in job_keywords):
+                    job_title = self._clean_candidate_job_title(line, name)
+                    if job_title:
+                        break
+        return {
+            "name": name or "待识别",
+            "gender": gender or "待识别",
+            "job_title": job_title or "待识别",
+            "phone": phone_match.group(1) if phone_match else "待识别",
+            "profile_text": "\n".join(lines),
+            "extractor": extractor,
+        }
+
+    def _extract_profile_text_by_dom(self, page: Page) -> str:
+        script = r"""
+            () => {
+                const isVisible = (el) => {
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none' && style.opacity !== '0';
+                };
+                const normalize = (text) => (text || '').replace(/\s+/g, ' ').trim();
+                const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 1440;
+                const keywords = /姓名|候选人|男|女|求职|应聘|职位|岗位|电话|手机|1[3-9]\d{9}|岁|经验|本科|专科|硕士|博士|学历|工作年限/;
+                const excludes = /快捷回复|发送|表情|聊天记录|附件简历|要附件简历|查看简历附件|下载简历|请输入|复制|已读|未读/;
+                const nodes = Array.from(document.querySelectorAll('aside, section, header, article, div, span, p'))
+                    .filter((el) => isVisible(el))
+                    .map((el) => {
+                        const rect = el.getBoundingClientRect();
+                        const text = normalize(el.innerText || el.textContent || el.getAttribute('title') || el.getAttribute('aria-label'));
+                        const cls = String(el.className || '');
+                        const area = rect.width * rect.height;
+                        const rightPanel = rect.left >= Math.max(430, viewportWidth * 0.48) && rect.top >= 50 && rect.top <= 520;
+                        const profileClass = /candidate|profile|detail|resume|user|person|talent|card|info/i.test(cls);
+                        const keywordScore = (text.match(keywords) || []).length;
+                        return { text, cls, x: rect.left, y: rect.top, w: rect.width, h: rect.height, area, rightPanel, profileClass, keywordScore };
+                    })
+                    .filter((item) => item.text && item.text.length >= 2 && item.text.length <= 500)
+                    .filter((item) => item.rightPanel && !excludes.test(item.text) && (keywords.test(item.text) || item.profileClass));
+                nodes.sort((a, b) => {
+                    const scoreA = (a.keywordScore * 10) + (a.profileClass ? 8 : 0) + Math.min(a.area / 10000, 8) - (a.y / 1000);
+                    const scoreB = (b.keywordScore * 10) + (b.profileClass ? 8 : 0) + Math.min(b.area / 10000, 8) - (b.y / 1000);
+                    return scoreB - scoreA;
+                });
+                const seen = new Set();
+                const lines = [];
+                for (const item of nodes.slice(0, 36)) {
+                    for (const part of item.text.split(/\n| {2,}|\t/)) {
+                        const line = normalize(part);
+                        if (!line || line.length > 220 || seen.has(line) || excludes.test(line)) continue;
+                        seen.add(line);
+                        lines.push(line);
+                        if (lines.length >= 30) break;
+                    }
+                    if (lines.length >= 30) break;
+                }
+                return lines.join('\n');
+            }
+        """
+        for frame in page.frames:
+            try:
+                text = frame.evaluate(script)
+            except Exception:
+                continue
+            if text:
+                return text
+        return ""
+
+    def _merge_candidate_info(self, primary: dict, fallback: dict) -> dict:
+        merged = dict(primary or {})
+        for key in ["name", "gender", "job_title", "phone"]:
+            if not merged.get(key) or merged.get(key) == "待识别":
+                merged[key] = fallback.get(key) or "待识别"
+        profile_texts = [text for text in [merged.get("profile_text"), fallback.get("profile_text")] if text]
+        merged["profile_text"] = "\n".join(dict.fromkeys("\n".join(profile_texts).splitlines()))
+        merged["extractor"] = f"{merged.get('extractor', 'dom')}+fallback"
+        return merged
+
+    def _extract_current_candidate_info(self, page: Page, fallback_signature: str = "", resume_file_path: str | None = None) -> dict:
+        signature_info = self._parse_candidate_signature(fallback_signature)
+        resume_info = self._extract_candidate_info_from_resume_file(resume_file_path, fallback_signature)
+        dom_text = self._extract_profile_text_by_dom(page)
+        dom_info = self._parse_candidate_info_text(dom_text, fallback_signature, extractor="dom_profile")
+        best_info = self._merge_candidate_info(resume_info, dom_info) if resume_info else dom_info
+        try:
+            scrapling_info = extract_candidate_info(page.content(), fallback_signature)
+            best_info = self._merge_candidate_info(best_info, scrapling_info)
+        except Exception as exc:
+            logger.warning("Scrapling 候选人信息提取失败，使用附件/DOM结果：{}", exc)
+        if not best_info:
+            best_info = signature_info
+        if not self._is_unknown_or_noise(signature_info.get("name")):
+            best_info["name"] = signature_info["name"]
+        elif self._is_unknown_or_noise(best_info.get("name")):
+            best_info["name"] = "待识别"
+        if not self._is_unknown_or_noise(signature_info.get("job_title")):
+            best_info["job_title"] = signature_info["job_title"]
+        elif self._is_unknown_or_noise(best_info.get("job_title")):
+            best_info["job_title"] = "待识别"
+        best_info["extractor"] = f"{best_info.get('extractor', 'unknown')}+signature_guard"
+        logger.info(
+            "候选人信息提取结果：name={}, gender={}, job_title={}, phone={}, extractor={}",
+            best_info.get("name"),
+            best_info.get("gender"),
+            best_info.get("job_title"),
+            best_info.get("phone"),
+            best_info.get("extractor"),
+        )
+        return best_info
+
     def auto_click_chat_attachment_resumes(
         self,
         target_url: str | None = None,
         max_resumes: int = 5,
         wait_seconds: int = 900,
         per_candidate_wait_seconds: int = 60,
+        on_resume_saved: Callable[[dict], None] | None = None,
+        should_skip_resume: Callable[[dict], bool] | None = None,
+        should_skip_candidate_signature: Callable[[str], bool] | None = None,
+        on_resume_skipped: Callable[[dict], None] | None = None,
+        should_continue: Callable[[], bool] | None = None,
     ) -> list[dict]:
         if not self.state_path.exists():
             raise RuntimeError("智联招聘登录态不存在，请先完成登录。")
@@ -870,6 +1169,9 @@ class ZhilianAdapter(BasePlatformAdapter):
         captured_urls: set[str] = set()
         pending_urls: list[str] = []
         seen_candidates: set[str] = set()
+
+        def can_continue() -> bool:
+            return should_continue() if should_continue else True
 
         def handle_request(request: Request) -> None:
             url = request.url
@@ -892,21 +1194,57 @@ class ZhilianAdapter(BasePlatformAdapter):
 
             deadline = time.monotonic() + wait_seconds
             while len(results) < max_resumes and time.monotonic() < deadline:
-                signature = self._click_next_uncontacted_candidate(page, seen_candidates)
+                if not can_continue():
+                    break
+                signature = self._click_next_uncontacted_candidate(page, seen_candidates, should_skip_candidate_signature)
                 if not signature:
                     logger.warning("未找到新的未联系候选人，尝试滚动列表。")
                     self._print_candidate_candidates(page)
                     page.mouse.wheel(0, 900)
-                    page.wait_for_timeout(3000)
+                    page.wait_for_timeout(600)
                     continue
 
-                seen_candidates.add(signature)
-                print(f"已选择候选人：{signature[:80]}")
-                page.wait_for_timeout(3000)
+                seen_candidates.update(signature.splitlines())
+                display_signature = signature.splitlines()[0]
+                print(f"已选择候选人：{display_signature[:80]}")
+                if "skipped_before_click" in signature.splitlines():
+                    if on_resume_skipped:
+                        on_resume_skipped({
+                            "platform_code": self.platform_code,
+                            "source_url": page.url,
+                            "raw_json": {
+                                "candidate_signature": display_signature,
+                                "candidate_info": self._parse_candidate_signature(display_signature),
+                                "attachment": {},
+                            },
+                            "raw_html_path": None,
+                            "content_hash": "",
+                        })
+                    continue
+                if should_skip_candidate_signature and should_skip_candidate_signature(display_signature):
+                    if on_resume_skipped:
+                        on_resume_skipped({
+                            "platform_code": self.platform_code,
+                            "source_url": page.url,
+                            "raw_json": {
+                                "candidate_signature": display_signature,
+                                "candidate_info": self._parse_candidate_signature(display_signature),
+                                "attachment": {},
+                            },
+                            "raw_html_path": None,
+                            "content_hash": "",
+                        })
+                    page.wait_for_timeout(50)
+                    continue
+                page.wait_for_timeout(800)
+                if not can_continue():
+                    break
 
                 if not self._click_request_attachment_resume(page):
                     logger.warning("当前候选人未找到可点击的'要附件简历'按钮，可能已经收到附件，继续尝试点击'查看简历附件'。")
-                page.wait_for_timeout(2000)
+                page.wait_for_timeout(800)
+                if not can_continue():
+                    break
 
                 if not self._click_view_attachment_resume(page):
                     logger.warning("当前候选人未找到'查看附件简历'按钮，等待可能的自动链接。")
@@ -915,6 +1253,8 @@ class ZhilianAdapter(BasePlatformAdapter):
                 candidate_deadline = time.monotonic() + per_candidate_wait_seconds
                 saved_current_candidate = False
                 while time.monotonic() < candidate_deadline and not saved_current_candidate:
+                    if not can_continue():
+                        break
                     pages = [item for item in session.context.pages if not item.is_closed()]
                     pending_urls.extend(self._find_attachment_urls_from_pages(pages, captured_urls))
                     while pending_urls and len(results) < max_resumes:
@@ -929,13 +1269,24 @@ class ZhilianAdapter(BasePlatformAdapter):
                         except Exception as exc:
                             logger.warning("自动下载附件失败：{}", exc)
                             continue
-                        row["raw_json"]["candidate_signature"] = signature
+                        attachment = row["raw_json"].get("attachment", {})
+                        candidate_info = self._extract_current_candidate_info(page, display_signature, attachment.get("file_path"))
+                        candidate_info["resume_file_name"] = attachment.get("file_name")
+                        row["raw_json"]["candidate_signature"] = display_signature
+                        row["raw_json"]["candidate_info"] = candidate_info
+                        if should_skip_resume and should_skip_resume(row):
+                            if on_resume_skipped:
+                                on_resume_skipped(row)
+                            saved_current_candidate = True
+                            break
                         results.append(row)
+                        if on_resume_saved:
+                            on_resume_saved(row)
                         saved_current_candidate = True
                         attachment = row["raw_json"]["attachment"]
                         print(f"已自动保存第 {len(results)} 份：{attachment['file_path']}")
                         break
-                    page.wait_for_timeout(1000)
+                    page.wait_for_timeout(500)
 
                 if not saved_current_candidate:
                     logger.warning("当前候选人在等待时间内未捕获到附件下载链接。")

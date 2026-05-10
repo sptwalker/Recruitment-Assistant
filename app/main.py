@@ -59,6 +59,7 @@ def new_task_dialog() -> None:
             "stopped": False,
             "logs": [],
             "candidates": [],
+            "skipped_count": 0,
             "task_config": st.session_state.pending_collect_task,
             "thread": None,
         }

@@ -668,14 +668,14 @@ class ZhilianAdapter(BasePlatformAdapter):
         return False
 
 
-    def _click_next_uncontacted_candidate(
+    def _collect_uncontacted_candidate_targets(
         self,
         page: Page,
         seen_signatures: set[str],
-        should_skip_candidate_signature: Callable[[str], bool] | None = None,
-    ) -> str | None:
+        max_targets: int = 12,
+    ) -> list[dict]:
         script = r"""
-            (seen) => {
+            ({seen, maxTargets}) => {
                 const isVisible = (el) => {
                     const rect = el.getBoundingClientRect();
                     const style = window.getComputedStyle(el);
@@ -734,6 +734,7 @@ class ZhilianAdapter(BasePlatformAdapter):
                         .sort((a, b) => a.rect.top - b.rect.top);
                     for (const row of rows) targets.push(row.el);
                 }
+                const output = [];
                 const used = new Set();
                 for (const target of targets) {
                     const rect = target.getBoundingClientRect();
@@ -742,34 +743,42 @@ class ZhilianAdapter(BasePlatformAdapter):
                     const key = `${positionKey}:${signature}`;
                     if (!signature || seen.includes(signature) || seen.includes(positionKey) || used.has(key) || skip(signature)) continue;
                     used.add(key);
-                    const x = Math.min(410, Math.max(230, rect.left + rect.width * 0.55));
-                    const y = rect.top + rect.height / 2;
-                    target.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, clientX: x, clientY: y }));
-                    target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, clientX: x, clientY: y, button: 0 }));
-                    target.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, clientX: x, clientY: y, button: 0 }));
-                    target.click();
-                    const pointTarget = document.elementFromPoint(x, y);
-                    if (pointTarget && pointTarget !== target) {
-                        pointTarget.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, clientX: x, clientY: y, button: 0 }));
-                        pointTarget.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, clientX: x, clientY: y, button: 0 }));
-                        pointTarget.click();
-                    }
-                    return { signature, positionKey, x, y };
+                    output.push({
+                        signature,
+                        positionKey,
+                        x: Math.min(410, Math.max(230, rect.left + rect.width * 0.55)),
+                        y: rect.top + rect.height / 2,
+                    });
+                    if (output.length >= maxTargets) break;
                 }
-                return null;
+                return output;
             }
         """
         for frame in page.frames:
             try:
-                result = frame.evaluate(script, list(seen_signatures))
+                targets = frame.evaluate(script, {"seen": list(seen_signatures), "maxTargets": max_targets})
             except Exception:
                 continue
-            if result:
-                signature = result["signature"]
-                if should_skip_candidate_signature and should_skip_candidate_signature(signature):
-                    return "\n".join([signature, result["positionKey"], "skipped_before_click"])
-                page.mouse.click(result["x"], result["y"])
-                return "\n".join([signature, result["positionKey"]])
+            if targets:
+                return targets
+        return []
+
+
+    def _click_next_uncontacted_candidate(
+        self,
+        page: Page,
+        seen_signatures: set[str],
+        should_skip_candidate_signature: Callable[[str], bool] | None = None,
+    ) -> str | None:
+        targets = self._collect_uncontacted_candidate_targets(page, seen_signatures, max_targets=16)
+        for result in targets:
+            signature = result["signature"]
+            position_key = result["positionKey"]
+            if should_skip_candidate_signature and should_skip_candidate_signature(signature):
+                seen_signatures.update({signature, position_key})
+                return "\n".join([signature, position_key, "skipped_before_click"])
+            page.mouse.click(result["x"], result["y"])
+            return "\n".join([signature, position_key])
         return None
 
     def _print_candidate_candidates(self, page: Page) -> None:
@@ -1196,18 +1205,17 @@ class ZhilianAdapter(BasePlatformAdapter):
             while len(results) < max_resumes and time.monotonic() < deadline:
                 if not can_continue():
                     break
-                signature = self._click_next_uncontacted_candidate(page, seen_candidates, should_skip_candidate_signature)
-                if not signature:
-                    logger.warning("未找到新的未联系候选人，尝试滚动列表。")
-                    self._print_candidate_candidates(page)
-                    page.mouse.wheel(0, 900)
-                    page.wait_for_timeout(600)
-                    continue
-
-                seen_candidates.update(signature.splitlines())
-                display_signature = signature.splitlines()[0]
-                print(f"已选择候选人：{display_signature[:80]}")
-                if "skipped_before_click" in signature.splitlines():
+                signature = None
+                skipped_batch = 0
+                while can_continue():
+                    skipped_signature = self._click_next_uncontacted_candidate(page, seen_candidates, should_skip_candidate_signature)
+                    if not skipped_signature or "skipped_before_click" not in skipped_signature.splitlines():
+                        signature = skipped_signature
+                        break
+                    seen_candidates.update(skipped_signature.splitlines())
+                    display_signature = skipped_signature.splitlines()[0]
+                    print(f"已快速跳过重复候选人：{display_signature[:80]}")
+                    skipped_batch += 1
                     if on_resume_skipped:
                         on_resume_skipped({
                             "platform_code": self.platform_code,
@@ -1220,7 +1228,20 @@ class ZhilianAdapter(BasePlatformAdapter):
                             "raw_html_path": None,
                             "content_hash": "",
                         })
+                    if skipped_batch >= 16:
+                        break
+                if not can_continue():
+                    break
+                if not signature:
+                    logger.warning("未找到新的未联系候选人，尝试滚动列表。")
+                    self._print_candidate_candidates(page)
+                    page.mouse.wheel(0, 900)
+                    page.wait_for_timeout(600)
                     continue
+
+                seen_candidates.update(signature.splitlines())
+                display_signature = signature.splitlines()[0]
+                print(f"已选择候选人：{display_signature[:80]}")
                 if should_skip_candidate_signature and should_skip_candidate_signature(display_signature):
                     if on_resume_skipped:
                         on_resume_skipped({

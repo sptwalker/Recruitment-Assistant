@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 from components.layout import inject_vibe_style, page_header
 from recruitment_assistant.config.settings import get_settings
@@ -78,6 +79,7 @@ def get_runtime_state() -> dict:
             "stopped": False,
             "logs": [],
             "candidates": [],
+            "skipped_count": 0,
             "task_config": default_task_config(),
             "thread": None,
         }
@@ -89,7 +91,7 @@ def init_state() -> None:
     if "collect_task_logs" not in st.session_state:
         st.session_state.collect_task_logs = list(runtime.get("logs", []))
     if "collect_candidates" not in st.session_state:
-        st.session_state.collect_candidates = runtime["candidates"]
+        st.session_state.collect_candidates = list(runtime.get("candidates", []))
     if "collect_paused" not in st.session_state:
         st.session_state.collect_paused = runtime["paused"]
     if "collect_stopped" not in st.session_state:
@@ -114,6 +116,8 @@ def sync_runtime_to_session() -> dict:
     st.session_state.collect_stopped = runtime["stopped"]
     st.session_state.collect_running = runtime["running"]
     st.session_state.pending_collect_task = runtime.get("task_config") or pending_task or default_task_config()
+    if "skipped_count" not in runtime:
+        runtime["skipped_count"] = 0
     return runtime
 
 
@@ -121,15 +125,30 @@ def append_collect_log(message: str) -> None:
     runtime = get_runtime_state()
     timestamp = datetime.now().strftime("%H:%M:%S")
     runtime["logs"].append(f"[{timestamp}] {message}")
-    runtime["logs"] = runtime["logs"][-200:]
+    runtime["logs"] = runtime["logs"][-5000:]
     st.session_state.collect_task_logs = list(runtime.get("logs", []))
 
 
 def render_log_html(container=None) -> None:
-    logs = st.session_state.get("collect_task_logs", [])[-80:]
+    logs = st.session_state.get("collect_task_logs", [])[-300:]
     html = "<br/>".join(line.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") for line in logs)
+    body = html or "等待任务启动..."
     target = container or st
-    target.markdown(f'<div class="collect-log-box">{html or "等待任务启动..."}</div>', unsafe_allow_html=True)
+    target.markdown(f'<div class="collect-log-box" id="collect-log-box">{body}</div>', unsafe_allow_html=True)
+    components.html(
+        """
+        <script>
+        const scrollCollectLog = () => {
+            const boxes = window.parent.document.querySelectorAll('.collect-log-box');
+            boxes.forEach((box) => { box.scrollTop = box.scrollHeight; });
+        };
+        scrollCollectLog();
+        setTimeout(scrollCollectLog, 80);
+        setTimeout(scrollCollectLog, 250);
+        </script>
+        """,
+        height=0,
+    )
 
 
 def render_candidate_table(container=None) -> None:
@@ -197,6 +216,10 @@ def save_raw_resume_rows(rows: list[dict], task_id: int | None = None) -> list[i
     return saved_ids
 
 
+def normalize_duplicate_text(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
 def build_collect_candidate_key(platform_code: str, row: dict) -> str:
     raw_json = row.get("raw_json", {}) or {}
     info = raw_json.get("candidate_info", {}) or {}
@@ -214,6 +237,21 @@ def build_collect_signature_key(platform_code: str, candidate_signature: str) ->
     return text_hash("|".join(str(part).strip() for part in [platform_code, candidate_signature] if part)) or ""
 
 
+def build_collect_name_job_key(platform_code: str, name: str, job_title: str) -> str:
+    name = normalize_duplicate_text(name)
+    job_title = normalize_duplicate_text(job_title)
+    if not name or name == "待识别" or not job_title or job_title == "待识别":
+        return ""
+    return text_hash("|".join([platform_code, name, job_title])) or ""
+
+
+def build_collect_name_key(platform_code: str, name: str) -> str:
+    name = normalize_duplicate_text(name)
+    if not name or name == "待识别":
+        return ""
+    return text_hash("|".join([platform_code, name])) or ""
+
+
 def build_duplicate_lookup_keys(platform_code: str = "zhilian") -> set[str]:
     with create_session() as session:
         stmt = platform_candidate_record.select().with_only_columns(
@@ -227,36 +265,40 @@ def build_duplicate_lookup_keys(platform_code: str = "zhilian") -> set[str]:
         for row in session.execute(stmt).mappings():
             if row.get("candidate_key"):
                 keys.add(row["candidate_key"])
-            if row.get("candidate_signature"):
-                keys.add(build_collect_signature_key(platform_code, row["candidate_signature"]))
-            row_for_key = {"raw_json": {"candidate_info": {"phone": row.get("phone") or "", "name": row.get("name") or "", "job_title": row.get("job_title") or ""}}}
+            signature = normalize_duplicate_text(row.get("candidate_signature") or "")
+            if signature:
+                keys.add(build_collect_signature_key(platform_code, signature))
+                name, job_title = parse_candidate_signature(signature)
+                keys.add(build_collect_name_job_key(platform_code, name, job_title))
+                keys.add(build_collect_name_key(platform_code, name))
+            name = normalize_duplicate_text(row.get("name") or "")
+            job_title = normalize_duplicate_text(row.get("job_title") or "")
+            phone = normalize_duplicate_text(row.get("phone") or "")
+            row_for_key = {"raw_json": {"candidate_info": {"phone": phone, "name": name, "job_title": job_title}}}
             candidate_key = build_collect_candidate_key(platform_code, row_for_key)
             if candidate_key:
                 keys.add(candidate_key)
-            name_job_key = build_collect_candidate_key(platform_code, {"raw_json": {"candidate_info": {"name": row.get("name") or "", "job_title": row.get("job_title") or ""}}})
-            if name_job_key:
-                keys.add(name_job_key)
-        return keys
+            keys.add(build_collect_name_job_key(platform_code, name, job_title))
+            keys.add(build_collect_name_key(platform_code, name))
+        return {key for key in keys if key}
 
 
 def is_duplicate_candidate_signature(candidate_signature: str, lookup_keys: set[str], platform_code: str = "zhilian") -> bool:
-    signature = re.sub(r"\s+", " ", str(candidate_signature or "")).strip()
+    signature = normalize_duplicate_text(candidate_signature)
     if not signature:
         return False
     if build_collect_signature_key(platform_code, signature) in lookup_keys:
         return True
     name, job_title = parse_candidate_signature(signature)
+    if build_collect_name_job_key(platform_code, name, job_title) in lookup_keys:
+        return True
+    if build_collect_name_key(platform_code, name) in lookup_keys:
+        return True
     candidate_key = build_collect_candidate_key(
         platform_code,
         {"raw_json": {"candidate_info": {"name": name, "job_title": job_title}, "candidate_signature": signature}},
     )
-    if candidate_key in lookup_keys:
-        return True
-    name_job_key = build_collect_candidate_key(
-        platform_code,
-        {"raw_json": {"candidate_info": {"name": name, "job_title": job_title}}},
-    )
-    return name_job_key in lookup_keys
+    return candidate_key in lookup_keys
 
 
 def is_duplicate_candidate(row: dict) -> bool:
@@ -451,7 +493,7 @@ def run_collect_task(task_config: dict, runtime: dict | None = None) -> None:
     def log(message: str) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
         runtime["logs"].append(f"[{timestamp}] {message}")
-        runtime["logs"] = runtime["logs"][-200:]
+        runtime["logs"] = runtime["logs"][-5000:]
 
     def should_pause_or_stop() -> bool:
         if runtime.get("stopped"):
@@ -510,7 +552,9 @@ def run_collect_task(task_config: dict, runtime: dict | None = None) -> None:
             if not should_pause_or_stop():
                 return
             record = build_candidate_record(row)
-            log(f"已跳过重复候选人：{record['姓名']} / {record['求职岗位']} / {record['简历文件名']}")
+            runtime["skipped_count"] = int(runtime.get("skipped_count") or 0) + 1
+            skipped_count = runtime["skipped_count"]
+            log(f"已快速跳过重复候选人：{record['姓名']} / {record['求职岗位']}，累计跳过 {skipped_count} 位。")
 
         collect_kwargs = {
             "target_url": "https://rd5.zhaopin.com/",
@@ -587,6 +631,7 @@ def start_collect_task(task_config: dict, runtime: dict) -> None:
     runtime["stopped"] = False
     runtime["logs"] = []
     runtime["candidates"] = []
+    runtime["skipped_count"] = 0
     runtime["task_config"] = task_to_run
     st.session_state.collect_task_logs = list(runtime.get("logs", []))
     st.session_state.collect_candidates = list(runtime.get("candidates", []))

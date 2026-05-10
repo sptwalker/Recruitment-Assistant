@@ -5,6 +5,7 @@ BG = "#F5F7FA"
 WHITE = "#FFFFFF"
 SUCCESS_BG = "#E6F4EA"
 ACCENT = "#FF9F43"
+APP_VERSION = "V0.36"
 
 MENU_ITEMS = [
     ("首页", "⌂", "/"),
@@ -79,10 +80,10 @@ div.stButton > button:disabled {{ background:#D1D5DB !important; border-color:#D
 @media (max-width:760px) {{ .block-container {{ padding-top:76px !important; padding-left:78px !important; }} .vibe-page-title {{ display:block; }} .vibe-topbar {{ padding:0 14px; }} .vibe-card {{ padding:16px; border-radius:18px; }} }}
 </style>
 <div class="vibe-topbar">
-  <div class="vibe-brand"><div class="vibe-logo">⌁</div><span>简历智采助手</span></div>
+  <div class="vibe-brand"><div class="vibe-logo">⌁</div><span>简历智采助手 {APP_VERSION}</span></div>
   <div class="vibe-actions"><a href="/智联采集" target="_self">⌁ 采集任务</a><a href="/简历下载解析" target="_self">☷ 简历管理</a><a href="/平台登录" target="_self">⚙ 系统设置</a><div class="vibe-avatar">HR</div></div>
 </div>
-<aside class="vibe-sidebar">{menu_html}<div class="vibe-version">Resume AI Collector<br/>v0.3.0</div></aside>
+<aside class="vibe-sidebar">{menu_html}<div class="vibe-version">Resume AI Collector<br/>{APP_VERSION}</div></aside>
 """,
         unsafe_allow_html=True,
     )

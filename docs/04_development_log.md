@@ -1,6 +1,42 @@
 # 开发日志
 
-## 2026-05-10
+## 2026-05-11
+
+### 简历管理页、解析入库与调试清库
+
+#### 已完成内容
+
+- 将原 `app/pages/07_简历下载解析.py` 改造为简历管理页：
+  - 按 `data/attachments/zhilian/YYYYMMDD` 日期目录加载已保存简历。
+  - 展示加载概览：总数、已解析、待解析、失败数。
+  - 支持批量解析 PDF/DOC/DOCX，失败自动重试 1 次。
+  - 按文件 `SHA256` 去重，重复文件自动跳过。
+  - 对解析结果进行清洗、规范化并写入 `raw_resume`、`candidate`、`resume`、`resume_attachment`、`resume_skill`。
+  - 展示原始简历列表，包含解析状态、失败原因、原文链接。
+  - 恢复并保留 `导出 Excel` 功能。
+- 增加临时调试按钮 `调试：清除当前解析库`：
+  - 清除当前智联解析库相关的 `resume_score`、`resume_tag`、`resume_skill`、`project_experience`、`education_experience`、`work_experience`、`resume_attachment`、`resume`。
+  - 删除 `raw_resume` 前先清理 `platform_candidate_record`，避免外键约束报错。
+  - 删除不再被任何简历引用的孤立 `candidate`。
+  - 清除后重置页面状态并刷新解析状态。
+- 修复解析入库异常：
+  - `Decimal` 写入 JSONB 导致 `Object of type Decimal is not JSON serializable`，新增 `json_safe()` 递归转换。
+  - 年份被误识别为工作年限导致 `NumericValueOutOfRange`，限制工作年限仅接受 `0~80.0`。
+  - 清除解析库时 `raw_resume` 被 `platform_candidate_record` 引用导致外键报错，补充依赖表删除顺序。
+- 提升 `recruitment_assistant/parsers/pdf_resume_parser.py` 解析准确率：
+  - 增强姓名提取，避免把章节标题、城市、状态词、项目标题误识别为姓名。
+  - 增强城市提取，优先识别 `工作地区`、`目标地点`，避免籍贯覆盖求职城市。
+  - 增强期望职位提取，支持同一行多标签文本中的 `期望职位`。
+  - 增强当前公司/职位提取，限定在工作/实习经历区域，避免教育经历和项目描述误填。
+  - 扩展技能词典，补充机器学习、深度学习、RAG、大模型、LangChain、Milvus 等技能。
+- 移除“信息测试”页面入口，`app/components/layout.py` 版本更新为 `V0.36`。
+
+#### 验证状态
+
+- `python -m py_compile app/pages/07_简历下载解析.py` 已通过。
+- `python -m py_compile recruitment_assistant/parsers/pdf_resume_parser.py` 已通过。
+- `app/pages/07_简历下载解析.py`、`recruitment_assistant/parsers/pdf_resume_parser.py` lint 均无错误。
+- 已使用 `data/attachments/zhilian/20260511` 下样例 PDF 重新验证解析结果：姓名、当前公司、当前职位、期望职位、城市等核心字段明显改善。
 
 ### 采集任务稳定性与重复候选人快速跳过优化
 

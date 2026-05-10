@@ -4,8 +4,8 @@ from scrapling.parser import Selector
 
 UNKNOWN = "待识别"
 PROFILE_KEYWORDS = (
-    "男", "女", "求职", "应聘", "职位", "岗位", "电话", "手机", "岁", "经验",
-    "本科", "专科", "硕士", "博士", "学历", "工作年限", "期望",
+    "男", "女", "求职", "应聘", "职位", "岗位", "电话", "手机", "年龄", "岁", "经验",
+    "本科", "大专", "专科", "硕士", "博士", "研究生", "高中", "中专", "学历", "最高学历", "教育", "工作年限", "期望",
 )
 EXCLUDE_KEYWORDS = (
     "快捷回复", "发送", "表情", "聊天记录", "附件简历", "要附件简历", "查看简历附件",
@@ -116,6 +116,10 @@ def _line_profile_score(line: str) -> int:
         score += 5
     if any(token in line for token in JOB_KEYWORDS):
         score += 4
+    if re.search(r"(?<!\d)\d{2}\s*岁(?!\d)|年龄[:： ]*\d{2}", line):
+        score += 4
+    if re.search(r"本科|大专|专科|硕士|博士|研究生|高中|中专|学历|最高学历", line):
+        score += 4
     if clean_candidate_name(line):
         score += 3
     return score
@@ -126,6 +130,25 @@ def _extract_gender(text: str) -> str:
         return "男"
     if re.search(r"(^|[^\u4e00-\u9fa5])女([^\u4e00-\u9fa5]|$)|性别[:： ]*女", text):
         return "女"
+    return UNKNOWN
+
+
+def _extract_age(text: str) -> str:
+    match = re.search(r"(?:年龄|年纪)[:： ]*(\d{2})\s*岁?|(?<!\d)(\d{2})\s*岁(?!\d)", text)
+    if not match:
+        return UNKNOWN
+    age = int(match.group(1) or match.group(2))
+    return f"{age}岁" if 16 <= age <= 70 else UNKNOWN
+
+
+def _extract_education(text: str) -> str:
+    for degree in ["博士", "硕士", "研究生", "本科", "大专", "专科", "高中", "中专"]:
+        if degree in text:
+            if degree == "研究生":
+                return "硕士"
+            if degree == "专科":
+                return "大专"
+            return degree
     return UNKNOWN
 
 
@@ -160,9 +183,13 @@ def extract_candidate_info(html: str, fallback_signature: str = "") -> dict:
     if not name:
         name = clean_candidate_name(fallback_signature)
 
+    education = _extract_education(merged)
     return {
         "name": name or UNKNOWN,
         "gender": _extract_gender(merged),
+        "age": _extract_age(merged),
+        "education": education,
+        "highest_degree": education,
         "job_title": _extract_job_title(lines, name),
         "phone": phone_match.group(1) if phone_match else UNKNOWN,
         "profile_text": profile_text,

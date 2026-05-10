@@ -1,3 +1,4 @@
+import importlib
 import inspect
 import os
 import re
@@ -8,13 +9,14 @@ from pathlib import Path
 
 import streamlit as st
 import streamlit.components.v1 as components
+from sqlalchemy import delete, func, select
 
-from components.layout import inject_vibe_style, page_header
+from components.layout import APP_VERSION, inject_vibe_style, page_header
 from recruitment_assistant.config.settings import get_settings
 from recruitment_assistant.parsers.pdf_resume_parser import clean_candidate_signature
-from recruitment_assistant.platforms.zhilian.adapter import ZhilianAdapter
+import recruitment_assistant.platforms.zhilian.adapter as zhilian_adapter_module
 from recruitment_assistant.schemas.raw_resume import RawResumeCreate
-from recruitment_assistant.services.crawl_task_service import CrawlTaskService, PlatformCandidateRecordService, platform_candidate_record
+from recruitment_assistant.services.crawl_task_service import CrawlTaskService, platform_candidate_record
 from recruitment_assistant.services.raw_resume_service import RawResumeService
 from recruitment_assistant.storage.db import Base, create_session, engine
 from recruitment_assistant.utils.hash_utils import text_hash
@@ -49,8 +51,8 @@ st.markdown(
     box-shadow:0 12px 32px rgba(31,41,55,.05);
 }
 .collect-info-item { background:#FFFFFF; border:1px solid #E5EAF2; border-radius:14px; padding:12px 14px; }
-.collect-running-text { color:#F59E0B; font-size:14px; font-weight:700; white-space:nowrap; animation:collectPulse 1.2s infinite ease-in-out; }
-@keyframes collectPulse { 0%,100% { opacity:.42; transform:translateX(0); } 50% { opacity:1; transform:translateX(3px); } }
+.collect-running-text { color:#F59E0B; font-size:14px; font-weight:700; white-space:nowrap; }
+.collect-task-progress { color:#4A90E2; font-size:14px; font-weight:700; white-space:nowrap; }
 .collect-empty { color:#94A3B8; font-size:13px; }
 </style>
 """,
@@ -65,6 +67,7 @@ def default_task_config() -> dict:
         "简历数量": 5,
         "搜索时间分钟": None,
         "采集速度": "快速采集（5-15s间隔）",
+        "每候选人等待秒数": 20,
         "账号标识": "default",
         "间隔秒": "5-15",
         "任务状态": "等待启动",
@@ -79,6 +82,7 @@ def get_runtime_state() -> dict:
             "stopped": False,
             "logs": [],
             "candidates": [],
+            "scanned_count": 0,
             "skipped_count": 0,
             "task_config": default_task_config(),
             "thread": None,
@@ -116,6 +120,8 @@ def sync_runtime_to_session() -> dict:
     st.session_state.collect_stopped = runtime["stopped"]
     st.session_state.collect_running = runtime["running"]
     st.session_state.pending_collect_task = runtime.get("task_config") or pending_task or default_task_config()
+    if "scanned_count" not in runtime:
+        runtime["scanned_count"] = 0
     if "skipped_count" not in runtime:
         runtime["skipped_count"] = 0
     return runtime
@@ -134,20 +140,30 @@ def render_log_html(container=None) -> None:
     html = "<br/>".join(line.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") for line in logs)
     body = html or "等待任务启动..."
     target = container or st
-    target.markdown(f'<div class="collect-log-box" id="collect-log-box">{body}</div>', unsafe_allow_html=True)
+    target.markdown(f'<div id="collect-log-box" class="collect-log-box" data-collect-log-box="1">{body}<span id="collect-log-bottom"></span></div>', unsafe_allow_html=True)
+    scroll_token = str(len(logs))
     components.html(
-        """
+        f"""
         <script>
-        const scrollCollectLog = () => {
-            const boxes = window.parent.document.querySelectorAll('.collect-log-box');
-            boxes.forEach((box) => { box.scrollTop = box.scrollHeight; });
-        };
-        scrollCollectLog();
-        setTimeout(scrollCollectLog, 80);
-        setTimeout(scrollCollectLog, 250);
+        (() => {{
+            const token = {scroll_token!r};
+            const scrollCollectLog = () => {{
+                const doc = window.parent.document;
+                const boxes = Array.from(doc.querySelectorAll('#collect-log-box, [data-collect-log-box="1"], .collect-log-box'));
+                boxes.forEach((box) => {{
+                    box.scrollTop = box.scrollHeight;
+                    box.dataset.autoScrollToken = token;
+                    const bottom = box.querySelector('#collect-log-bottom');
+                    if (bottom) bottom.scrollIntoView({{ block: 'end' }});
+                }});
+            }};
+            scrollCollectLog();
+            requestAnimationFrame(scrollCollectLog);
+            [50, 150, 350, 800, 1200].forEach((delay) => setTimeout(scrollCollectLog, delay));
+        }})();
         </script>
         """,
-        height=0,
+        height=1,
     )
 
 
@@ -200,19 +216,15 @@ def save_raw_resume_rows(rows: list[dict], task_id: int | None = None) -> list[i
     saved_ids = []
     with create_session() as session:
         raw_service = RawResumeService(session)
-        candidate_service = PlatformCandidateRecordService(session)
         for row in rows:
-            if candidate_service.candidate_exists(row.get("platform_code", "zhilian"), row):
-                continue
             raw_resume = raw_service.create_raw_resume(RawResumeCreate(**row))
             saved_ids.append(raw_resume.id)
-            candidate_service.upsert_from_raw_resume(
-                platform_code=row.get("platform_code", "zhilian"),
-                target_site="智联招聘",
-                row=row,
-                raw_resume_id=raw_resume.id,
-                task_id=task_id,
+            profile_key = build_profile_dedup_key(
+                row.get("platform_code", "zhilian"),
+                (row.get("raw_json", {}) or {}).get("pre_download_candidate_info", {}) or {},
             )
+            if profile_key:
+                upsert_profile_dedup_record(session, row, profile_key, raw_resume.id, task_id)
     return saved_ids
 
 
@@ -220,90 +232,131 @@ def normalize_duplicate_text(value: str) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
 
 
-def build_collect_candidate_key(platform_code: str, row: dict) -> str:
+def normalize_profile_value(value: str) -> str:
+    text = normalize_duplicate_text(value)
+    return "" if not text or text == "待识别" else text
+
+
+def normalize_profile_age(value: str) -> str:
+    text = normalize_profile_value(value)
+    match = re.search(r"(?<!\d)(\d{2})(?!\d)", text)
+    if not match:
+        return ""
+    age = int(match.group(1))
+    return f"{age}岁" if 16 <= age <= 70 else ""
+
+
+def normalize_profile_education(value: str) -> str:
+    text = normalize_profile_value(value)
+    if not text:
+        return ""
+    degree_map = {
+        "博士": "博士",
+        "硕士": "硕士",
+        "研究生": "硕士",
+        "本科": "本科",
+        "大专": "大专",
+        "专科": "大专",
+        "高中": "高中",
+        "中专": "中专",
+    }
+    for keyword, degree in degree_map.items():
+        if keyword in text:
+            return degree
+    return text
+
+
+def build_profile_dedup_key(platform_code: str, info: dict) -> str:
+    name = normalize_profile_value(info.get("name") or info.get("姓名") or "")
+    age = normalize_profile_age(info.get("age") or info.get("年龄") or "")
+    education = normalize_profile_education(info.get("education") or info.get("highest_degree") or info.get("学历") or "")
+    if not name or not age or not education:
+        return ""
+    return text_hash("|".join([platform_code, "profile_name_age_education", name, age, education])) or ""
+
+
+def build_profile_dedup_label(info: dict) -> str:
+    name = normalize_profile_value(info.get("name") or info.get("姓名") or "") or "待识别"
+    age = normalize_profile_age(info.get("age") or info.get("年龄") or "") or "待识别"
+    education = normalize_profile_education(info.get("education") or info.get("highest_degree") or info.get("学历") or "") or "待识别"
+    return f"{name}/{age}/{education}"
+
+
+def build_profile_lookup_keys(platform_code: str = "zhilian") -> set[str]:
+    with create_session() as session:
+        return {
+            str(key)
+            for key in session.execute(
+                platform_candidate_record.select()
+                .with_only_columns(platform_candidate_record.c.candidate_key)
+                .where(platform_candidate_record.c.platform_code == platform_code)
+            ).scalars()
+            if key
+        }
+
+
+def get_profile_dedup_count(platform_code: str = "zhilian") -> int:
+    return len(build_profile_lookup_keys(platform_code))
+
+
+def upsert_profile_dedup_record(session, row: dict, profile_key: str, raw_resume_id: int, task_id: int | None = None) -> None:
     raw_json = row.get("raw_json", {}) or {}
-    info = raw_json.get("candidate_info", {}) or {}
-    parts = [
-        platform_code,
-        row.get("source_candidate_id") or "",
-        info.get("phone") or "",
-        info.get("name") or raw_json.get("candidate_signature") or "",
-        info.get("job_title") or "",
-    ]
-    return text_hash("|".join(str(part).strip() for part in parts if part)) or ""
-
-
-def build_collect_signature_key(platform_code: str, candidate_signature: str) -> str:
-    return text_hash("|".join(str(part).strip() for part in [platform_code, candidate_signature] if part)) or ""
-
-
-def build_collect_name_job_key(platform_code: str, name: str, job_title: str) -> str:
-    name = normalize_duplicate_text(name)
-    job_title = normalize_duplicate_text(job_title)
-    if not name or name == "待识别" or not job_title or job_title == "待识别":
-        return ""
-    return text_hash("|".join([platform_code, name, job_title])) or ""
-
-
-def build_collect_name_key(platform_code: str, name: str) -> str:
-    name = normalize_duplicate_text(name)
-    if not name or name == "待识别":
-        return ""
-    return text_hash("|".join([platform_code, name])) or ""
-
-
-def build_duplicate_lookup_keys(platform_code: str = "zhilian") -> set[str]:
-    with create_session() as session:
-        stmt = platform_candidate_record.select().with_only_columns(
-            platform_candidate_record.c.candidate_key,
-            platform_candidate_record.c.candidate_signature,
-            platform_candidate_record.c.name,
-            platform_candidate_record.c.job_title,
-            platform_candidate_record.c.phone,
-        ).where(platform_candidate_record.c.platform_code == platform_code)
-        keys: set[str] = set()
-        for row in session.execute(stmt).mappings():
-            if row.get("candidate_key"):
-                keys.add(row["candidate_key"])
-            signature = normalize_duplicate_text(row.get("candidate_signature") or "")
-            if signature:
-                keys.add(build_collect_signature_key(platform_code, signature))
-                name, job_title = parse_candidate_signature(signature)
-                keys.add(build_collect_name_job_key(platform_code, name, job_title))
-                keys.add(build_collect_name_key(platform_code, name))
-            name = normalize_duplicate_text(row.get("name") or "")
-            job_title = normalize_duplicate_text(row.get("job_title") or "")
-            phone = normalize_duplicate_text(row.get("phone") or "")
-            row_for_key = {"raw_json": {"candidate_info": {"phone": phone, "name": name, "job_title": job_title}}}
-            candidate_key = build_collect_candidate_key(platform_code, row_for_key)
-            if candidate_key:
-                keys.add(candidate_key)
-            keys.add(build_collect_name_job_key(platform_code, name, job_title))
-            keys.add(build_collect_name_key(platform_code, name))
-        return {key for key in keys if key}
-
-
-def is_duplicate_candidate_signature(candidate_signature: str, lookup_keys: set[str], platform_code: str = "zhilian") -> bool:
-    signature = normalize_duplicate_text(candidate_signature)
-    if not signature:
-        return False
-    if build_collect_signature_key(platform_code, signature) in lookup_keys:
-        return True
-    name, job_title = parse_candidate_signature(signature)
-    if build_collect_name_job_key(platform_code, name, job_title) in lookup_keys:
-        return True
-    if build_collect_name_key(platform_code, name) in lookup_keys:
-        return True
-    candidate_key = build_collect_candidate_key(
-        platform_code,
-        {"raw_json": {"candidate_info": {"name": name, "job_title": job_title}, "candidate_signature": signature}},
+    info = raw_json.get("pre_download_candidate_info", {}) or {}
+    existing = session.execute(
+        platform_candidate_record.select().where(
+            platform_candidate_record.c.platform_code == row.get("platform_code", "zhilian"),
+            platform_candidate_record.c.candidate_key == profile_key,
+        )
+    ).mappings().first()
+    if existing:
+        session.execute(
+            platform_candidate_record.update()
+            .where(platform_candidate_record.c.id == existing["id"])
+            .values(
+                hit_count=int(existing.get("hit_count") or 0) + 1,
+                raw_resume_id=existing.get("raw_resume_id") or raw_resume_id,
+                task_id=existing.get("task_id") or task_id,
+            )
+        )
+        session.commit()
+        return
+    session.execute(
+        platform_candidate_record.insert().values(
+            platform_code=row.get("platform_code", "zhilian"),
+            target_site="智联招聘",
+            candidate_key=profile_key,
+            candidate_signature=None,
+            name=normalize_profile_value(info.get("name") or info.get("姓名") or "") or None,
+            gender=None,
+            job_title=None,
+            phone=None,
+            resume_file_name=None,
+            source_url=row.get("source_url"),
+            content_hash=None,
+            raw_resume_id=raw_resume_id,
+            task_id=task_id,
+        )
     )
-    return candidate_key in lookup_keys
+    session.commit()
 
 
-def is_duplicate_candidate(row: dict) -> bool:
+def build_profile_debug_index(platform_code: str = "zhilian") -> dict[str, list[str]]:
+    index: dict[str, list[str]] = {}
     with create_session() as session:
-        return PlatformCandidateRecordService(session).candidate_exists(row.get("platform_code", "zhilian"), row)
+        rows = session.execute(
+            select(platform_candidate_record.c.name, platform_candidate_record.c.candidate_key)
+            .where(platform_candidate_record.c.platform_code == platform_code)
+        ).mappings()
+        for row in rows:
+            name = normalize_profile_value(row.get("name") or "")
+            if not name:
+                continue
+            values = index.setdefault(name, [])
+            key_text = str(row.get("candidate_key") or "")[:12]
+            item = f"pre_key:{key_text}"
+            if item not in values:
+                values.append(item)
+    return index
 
 
 def clean_candidate_name(value: str) -> str:
@@ -395,9 +448,12 @@ def build_candidate_record(row: dict) -> dict:
     candidate_name = signature_name if is_unknown_or_noise(info_name) else info_name
     job_from_info = clean_job_title(info.get("job_title") or "", candidate_name)
     job_title = signature_job_title if is_unknown_or_noise(job_from_info) else job_from_info
+    age = info.get("age") or info.get("年龄") or "待识别"
+    education = info.get("education") or info.get("highest_degree") or info.get("学历") or "待识别"
     return {
         "姓名": candidate_name,
-        "性别": info.get("gender") or "待识别",
+        "年龄": age,
+        "学历": education,
         "求职岗位": job_title,
         "电话": info.get("phone") or "待识别",
         "简历文件名": info.get("resume_file_name") or attachment.get("file_name") or Path(file_path).name or "待识别",
@@ -438,6 +494,7 @@ def render_task_editor(task_config: dict, has_login_state: bool, disabled: bool 
         col4, col5, col6 = st.columns(3)
         resume_count = int(task_config.get("简历数量") or 5)
         search_minutes = int(task_config.get("搜索时间分钟") or 60)
+        per_candidate_wait_seconds = int(task_config.get("每候选人等待秒数") or 20)
         if target_mode == "指定数量简历":
             resume_count = int(col4.number_input("简历数量", min_value=1, max_value=500, value=resume_count, step=1, disabled=disabled))
             search_minutes_value = None
@@ -445,16 +502,13 @@ def render_task_editor(task_config: dict, has_login_state: bool, disabled: bool 
             search_minutes = int(col4.number_input("搜索时间（分钟）", min_value=10, max_value=900, value=search_minutes, step=10, disabled=disabled))
             search_minutes_value = search_minutes
             resume_count = settings.crawler_max_resumes_per_task
+        per_candidate_wait_seconds = int(col5.number_input("每候选人等待秒数", min_value=5, max_value=180, value=per_candidate_wait_seconds, step=5, disabled=disabled))
+        task_status = task_config.get("任务状态", "等待启动")
         login_state_text = "已保存" if has_login_state else "未保存"
         login_state_color = "#16A34A" if has_login_state else "#DC2626"
-        task_status = task_config.get("任务状态", "等待启动")
-        col5.markdown(
-            f'<div class="collect-info-item"><div class="collect-info-label">登录态</div>'
-            f'<div class="collect-info-value" style="font-size:13px;color:{login_state_color};">{login_state_text}</div></div>',
-            unsafe_allow_html=True,
-        )
         col6.markdown(
-            f'<div class="collect-info-item"><div class="collect-info-label">任务状态</div>'
+            f'<div class="collect-info-item"><div class="collect-info-label">登录态 / 任务状态</div>'
+            f'<div class="collect-info-value" style="font-size:13px;color:{login_state_color};">{login_state_text}</div>'
             f'<div class="collect-info-value" style="font-size:13px;">{task_status}</div></div>',
             unsafe_allow_html=True,
         )
@@ -466,6 +520,7 @@ def render_task_editor(task_config: dict, has_login_state: bool, disabled: bool 
         "简历数量": resume_count if target_mode == "指定数量简历" else None,
         "搜索时间分钟": search_minutes_value,
         "采集速度": speed_mode,
+        "每候选人等待秒数": per_candidate_wait_seconds,
         "账号标识": task_config.get("账号标识") or "default",
         "间隔秒": "5-15" if speed_mode.startswith("快速") else "10-45",
     }
@@ -485,7 +540,8 @@ def get_task_target_count(task_config: dict) -> int:
 def run_collect_task(task_config: dict, runtime: dict | None = None) -> None:
     runtime = runtime or get_runtime_state()
     account_name = task_config.get("账号标识") or "default"
-    adapter = ZhilianAdapter(account_name=account_name)
+    adapter_module = importlib.reload(zhilian_adapter_module)
+    adapter = adapter_module.ZhilianAdapter(account_name=account_name)
     has_login_state = adapter.state_path.exists()
     started_monotonic = time.monotonic()
     task_batch = None
@@ -518,6 +574,7 @@ def run_collect_task(task_config: dict, runtime: dict | None = None) -> None:
                 planned_count=target_count,
             )
             task_batch_id = task_batch.id
+        log(f"当前系统版本：{APP_VERSION}。")
         log(f"采集任务启动，批次ID：{task_batch_id}。")
         log(f"任务配置：目标网站=智联招聘，使用账号={account_name}，目标数量={target_count}，采集速度={task_config.get('采集速度', '快速采集（5-15s间隔）')}。")
         if not has_login_state:
@@ -529,11 +586,15 @@ def run_collect_task(task_config: dict, runtime: dict | None = None) -> None:
 
         search_minutes = task_config.get("搜索时间分钟")
         speed_mode = task_config.get("采集速度") or "快速采集（5-15s间隔）"
+        min_download_interval = 5 if speed_mode.startswith("快速") else 10
         run_seconds = int(search_minutes) * 60 if search_minutes else 900
-        per_candidate_wait = 30 if speed_mode.startswith("快速") else 60
-        log(f"打开智联页面并进入聊天采集流程，目标数量：{target_count}，最长运行：{run_seconds} 秒。")
-        duplicate_lookup_keys = build_duplicate_lookup_keys("zhilian")
-        log(f"已加载历史候选人去重索引：{len(duplicate_lookup_keys)} 条。")
+        per_candidate_wait = int(task_config.get("每候选人等待秒数") or 20)
+        log(f"打开智联页面并进入聊天采集流程，目标数量：{target_count}，最长运行：{run_seconds} 秒，每候选人最多等待：{per_candidate_wait} 秒，下载间隔：{min_download_interval} 秒。")
+        profile_lookup_keys = build_profile_lookup_keys("zhilian")
+        start_profile_key_count = len(profile_lookup_keys)
+        log(f"已加载下载前个人信息去重库：当前共有 {start_profile_key_count} 条个人信息键。")
+        scanned_candidate_keys: set[str] = set()
+        profile_debug_index = build_profile_debug_index("zhilian")
 
         def on_resume_saved(row: dict) -> None:
             if not should_pause_or_stop():
@@ -541,45 +602,99 @@ def run_collect_task(task_config: dict, runtime: dict | None = None) -> None:
             record = build_candidate_record(row)
             runtime["candidates"].append(record)
             runtime["candidates"] = runtime["candidates"][-200:]
-            duplicate_lookup_keys.add(build_collect_candidate_key(row.get("platform_code", "zhilian"), row))
-            signature = (row.get("raw_json", {}) or {}).get("candidate_signature") or ""
-            if signature:
-                duplicate_lookup_keys.add(build_collect_signature_key(row.get("platform_code", "zhilian"), signature))
-            log(f"正在读取候选人信息：{record['姓名']}，求职岗位：{record['求职岗位']}，电话：{record['电话']}。")
+            platform_code = row.get("platform_code", "zhilian")
+            raw_json = row.get("raw_json", {}) or {}
+            pre_info = raw_json.get("pre_download_candidate_info", {}) or {}
+            profile_key = build_profile_dedup_key(platform_code, pre_info)
+            if profile_key:
+                profile_lookup_keys.add(profile_key)
+                profile_name = normalize_profile_value(pre_info.get("name") or pre_info.get("姓名") or "")
+                if profile_name:
+                    values = profile_debug_index.setdefault(profile_name, [])
+                    item = build_profile_dedup_label(pre_info)
+                    if item not in values:
+                        values.append(item)
+            log(f"正在读取候选人信息：{record['姓名']}，年龄：{record['年龄']}，学历：{record['学历']}，求职岗位：{record['求职岗位']}，电话：{record['电话']}。")
             log(f"简历附件下载成功：{record['简历文件名']}。")
 
         def on_resume_skipped(row: dict) -> None:
             if not should_pause_or_stop():
                 return
+            raw_json = row.get("raw_json", {}) or {}
             record = build_candidate_record(row)
+            skip_stage = raw_json.get("skip_stage") or "before_download_profile"
+            stage_label = {
+                "before_download_profile": "下载前个人信息键",
+            }.get(skip_stage, skip_stage)
             runtime["skipped_count"] = int(runtime.get("skipped_count") or 0) + 1
             skipped_count = runtime["skipped_count"]
-            log(f"已快速跳过重复候选人：{record['姓名']} / {record['求职岗位']}，累计跳过 {skipped_count} 位。")
+            log(f"已跳过重复候选人（{stage_label}）：{record['姓名']} / {record['学历']}，累计跳过 {skipped_count} 位。")
+
+        def on_diagnostic(message: str) -> None:
+            log(message)
+
+        def on_download_failed(payload: dict) -> None:
+            runtime["download_failed_count"] = int(runtime.get("download_failed_count") or 0) + 1
+            candidate = normalize_duplicate_text(payload.get("candidate_signature") or "")[:60] or "未知候选人"
+            log(
+                f"附件下载失败：候选人={candidate}，"
+                f"url_hash={payload.get('url_hash') or '空'}，原因={payload.get('error') or '未知错误'}。"
+            )
+
+        def should_skip_candidate_profile_with_log(info: dict, signature: str = "") -> bool:
+            profile_key = build_profile_dedup_key("zhilian", info)
+            profile_label = build_profile_dedup_label(info)
+            scan_key = normalize_duplicate_text(signature) or profile_label
+            if scan_key and scan_key not in scanned_candidate_keys:
+                scanned_candidate_keys.add(scan_key)
+                runtime["scanned_count"] = int(runtime.get("scanned_count") or 0) + 1
+            should_skip = bool(profile_key and profile_key in profile_lookup_keys)
+            profile_name = normalize_profile_value(info.get("name") or info.get("姓名") or "")
+            same_name_history = profile_debug_index.get(profile_name, []) if profile_name else []
+            same_name_text = "；".join(same_name_history[:5]) if same_name_history else "无"
+            key_hash_text = profile_key[:12] if profile_key else "缺失"
+            log(
+                f"下载前个人信息重复判断：hit={should_skip}，action_skip={should_skip}，"
+                f"profile={profile_label}，key={'有' if profile_key else '缺失'}，key_hash={key_hash_text}，"
+                f"历史同名={same_name_text}。"
+            )
+            return should_skip
 
         collect_kwargs = {
             "target_url": "https://rd5.zhaopin.com/",
             "max_resumes": target_count,
             "wait_seconds": run_seconds,
             "per_candidate_wait_seconds": per_candidate_wait,
+            "min_download_interval_seconds": min_download_interval,
             "on_resume_saved": on_resume_saved,
+            "on_resume_skipped": on_resume_skipped,
             "should_continue": should_pause_or_stop,
+            "on_diagnostic": on_diagnostic,
         }
         collect_signature = inspect.signature(adapter.auto_click_chat_attachment_resumes)
-        if "should_skip_resume" in collect_signature.parameters:
-            collect_kwargs["should_skip_resume"] = lambda row: build_collect_candidate_key(row.get("platform_code", "zhilian"), row) in duplicate_lookup_keys
-            collect_kwargs["on_resume_skipped"] = on_resume_skipped
-        if "should_skip_candidate_signature" in collect_signature.parameters:
-            collect_kwargs["should_skip_candidate_signature"] = lambda signature: is_duplicate_candidate_signature(signature, duplicate_lookup_keys, "zhilian")
-        if "should_skip_resume" not in collect_signature.parameters:
-            log("当前加载的智联适配器暂不支持采集前去重，将在入库前执行去重。")
+        log(
+            "智联适配器能力检测："
+            f"profile去重={'支持' if 'should_skip_candidate_profile' in collect_signature.parameters else '不支持'}。"
+        )
+        if "should_skip_candidate_profile" in collect_signature.parameters:
+            collect_kwargs["should_skip_candidate_profile"] = should_skip_candidate_profile_with_log
+        else:
+            log("当前加载的智联适配器不支持下载前个人信息去重，请更新适配器后再测试去重。")
+        if "on_resume_skipped" not in collect_signature.parameters:
+            collect_kwargs.pop("on_resume_skipped", None)
+        if "min_download_interval_seconds" not in collect_signature.parameters:
+            collect_kwargs.pop("min_download_interval_seconds", None)
         if "should_continue" not in collect_signature.parameters:
             collect_kwargs.pop("should_continue", None)
+        if "on_diagnostic" not in collect_signature.parameters:
+            collect_kwargs.pop("on_diagnostic", None)
+        if "on_download_failed" in collect_signature.parameters:
+            collect_kwargs["on_download_failed"] = on_download_failed
         rows = adapter.auto_click_chat_attachment_resumes(**collect_kwargs)
         saved_ids = save_raw_resume_rows(rows, task_id=task_batch_id)
-        skipped_count = max(len(rows) - len(saved_ids), 0)
-        if skipped_count:
-            log(f"入库前去重完成，已跳过重复候选人 {skipped_count} 位。")
         elapsed_seconds = int(time.monotonic() - started_monotonic)
+        final_failed_count = int(runtime.get("download_failed_count") or 0)
+        final_scanned_count = int(runtime.get("scanned_count") or 0)
         final_status = "cancelled" if runtime.get("stopped") else "success"
         display_status = "已停止" if runtime.get("stopped") else "已完成"
         with create_session() as session:
@@ -589,9 +704,17 @@ def run_collect_task(task_config: dict, runtime: dict | None = None) -> None:
                     task,
                     status=final_status,
                     success_count=len(saved_ids),
-                    failed_count=0,
+                    failed_count=final_failed_count,
                 )
-        log(f"自动采集结束，入库记录数：{len(saved_ids)}，耗时：{elapsed_seconds} 秒。")
+        final_profile_key_count = get_profile_dedup_count("zhilian")
+        added_profile_key_count = max(final_profile_key_count - start_profile_key_count, 0)
+        log(f"本次采集新增下载前个人信息键 {added_profile_key_count} 条，当前共有 {final_profile_key_count} 条。")
+        log(
+            f"本次采集一共扫描了{final_scanned_count}位候选人，成功下载了{len(saved_ids)}份简历，失败了{final_failed_count}次。"
+        )
+        log(
+            f"自动采集结束，入库记录数：{len(saved_ids)}，耗时：{elapsed_seconds} 秒。"
+        )
         runtime["task_config"] = {
             **task_config,
             "任务状态": display_status,
@@ -631,7 +754,9 @@ def start_collect_task(task_config: dict, runtime: dict) -> None:
     runtime["stopped"] = False
     runtime["logs"] = []
     runtime["candidates"] = []
+    runtime["scanned_count"] = 0
     runtime["skipped_count"] = 0
+    runtime["download_failed_count"] = 0
     runtime["task_config"] = task_to_run
     st.session_state.collect_task_logs = list(runtime.get("logs", []))
     st.session_state.collect_candidates = list(runtime.get("candidates", []))
@@ -646,7 +771,8 @@ init_state()
 runtime = sync_runtime_to_session()
 pending_task = st.session_state.get("pending_collect_task") or default_task_config()
 account_name = pending_task.get("账号标识") or "default"
-adapter = ZhilianAdapter(account_name=account_name)
+adapter_module = importlib.reload(zhilian_adapter_module)
+adapter = adapter_module.ZhilianAdapter(account_name=account_name)
 has_login_state = adapter.state_path.exists()
 start_label = "已登录开始任务" if has_login_state else "登录开始任务"
 
@@ -656,7 +782,7 @@ if st.session_state.pop("auto_start_collect_task", False) and not runtime.get("r
     st.rerun()
 pending_task = render_task_editor(pending_task, has_login_state, disabled=is_running)
 
-b1, b2, b3, b4, b5 = st.columns(5)
+b1, b2, b3, b4, b5, b6 = st.columns(6)
 with b1:
     if st.button(start_label, type="primary", use_container_width=True, disabled=is_running):
         start_collect_task(pending_task, runtime)
@@ -692,9 +818,31 @@ with b5:
         runtime["task_config"] = default_task_config()
         sync_runtime_to_session()
         st.rerun()
+with b6:
+    if st.button("清空去重索引", use_container_width=True, disabled=runtime.get("running", False)):
+        with create_session() as session:
+            before_count = session.scalar(
+                select(func.count())
+                .select_from(platform_candidate_record)
+                .where(platform_candidate_record.c.platform_code == "zhilian")
+            ) or 0
+            session.execute(delete(platform_candidate_record).where(platform_candidate_record.c.platform_code == "zhilian"))
+            session.commit()
+        append_collect_log(f"已清空智联下载前个人信息去重库：删除 {before_count} 条索引记录。")
+        st.rerun()
 
 title_placeholder = st.empty()
-running_title = '<div class="collect-running-text">采集任务执行中……</div>' if is_running else ''
+scanned_count = int(runtime.get("scanned_count") or 0)
+skipped_count = int(runtime.get("skipped_count") or 0)
+total_skipped_count = skipped_count
+running_title = (
+    f'<div style="display:flex;align-items:center;gap:14px;">'
+    f'<span class="collect-running-text">任务执行中……</span>'
+    f'<span class="collect-task-progress">当前任务已经扫描了{scanned_count}位候选人，其中下载前个人信息键去重跳过了{total_skipped_count}人。</span>'
+    f'</div>'
+    if is_running
+    else ''
+)
 title_placeholder.markdown(f'<div class="plain-section-title"><h3>任务信息</h3>{running_title}</div>', unsafe_allow_html=True)
 log_placeholder = st.empty()
 render_log_html(log_placeholder)

@@ -145,7 +145,7 @@ def parse_resume_text(path: Path, text: str, candidate_signature: str | None = N
     parsed.skills = find_skills(text)
 
     name_from_file, job_from_file = infer_name_and_job_from_filename(path.name)
-    name_from_sig, job_from_sig = clean_candidate_signature(candidate_signature or "")
+    name_from_sig, _ = clean_candidate_signature(candidate_signature or "")
     parsed.name = first_valid_name(find_name_near_contact(lines, parsed.phone, parsed.email), parsed.name, name_from_file, name_from_sig)
     parsed.current_city = parsed.current_city or find_city(lines)
     parsed.expected_position = parsed.expected_position or find_expected_position_by_label(lines)
@@ -154,7 +154,7 @@ def parse_resume_text(path: Path, text: str, candidate_signature: str | None = N
         parsed.current_company = fallback_company
     if not parsed.current_position or not is_valid_job_title(parsed.current_position):
         parsed.current_position = fallback_position
-    parsed.job_title = first_non_empty(job_from_file, job_from_sig, parsed.expected_position, parsed.current_position)
+    parsed.job_title = first_non_empty(parsed.expected_position, parsed.current_position, job_from_file)
     return parsed
 
 

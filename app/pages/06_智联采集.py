@@ -168,35 +168,53 @@ def append_collect_log(message: str) -> None:
 
 
 def classify_collect_log_line(line: str) -> str:
-    if any(token in line for token in ["简历附件下载成功", "附件简历已保存", "自动采集结束"]):
+    success_tokens = ["简历附件下载成功", "附件简历已保存", "自动采集结束", "成功下载", "已保存"]
+    failed_tokens = ["附件下载失败", "下载失败", "采集任务失败", "附件系统内下载失败", "失败", "错误", "异常", "污染", "归属污染"]
+    skipped_tokens = [
+        "已跳过", "快速跳过", "重复拦截：duplicate=True", "候选人详情未确认切换", "详情未切换",
+        "未捕获下载链接", "违规候选人", "旧链接", "非当前候选人", "已丢弃", "无可下载附件",
+        "附件链接未捕获", "终止当前候选人", "已阻止非当前候选人附件下载",
+    ]
+    if any(token in line for token in success_tokens):
         return "collect-log-success"
-    if any(token in line for token in ["附件下载失败", "下载失败", "采集任务失败", "附件系统内下载失败"]):
+    if any(token in line for token in failed_tokens):
         return "collect-log-failed"
-    if any(token in line for token in ["已跳过", "快速跳过", "重复拦截：duplicate=True"]):
+    if any(token in line for token in skipped_tokens):
         return "collect-log-skipped"
     return ""
 
 
-def render_log_html(container=None) -> None:
-    logs = st.session_state.get("collect_task_logs", [])[-300:]
+def collect_log_line_style(css_class: str) -> str:
+    base = "display:block;white-space:pre-wrap;word-break:break-word;"
+    if css_class == "collect-log-success":
+        return base + "color:#168A45!important;font-weight:700!important;"
+    if css_class == "collect-log-failed":
+        return base + "color:#C73552!important;font-weight:700!important;"
+    if css_class == "collect-log-skipped":
+        return base + "color:#C96E08!important;font-weight:700!important;"
+    return base + "color:#1F2937!important;font-weight:400!important;"
+
+
+def build_collect_log_body(logs: list[str]) -> str:
     html_lines = []
-    for line in logs:
+    for line in logs[-300:]:
         css_class = classify_collect_log_line(line)
-        class_attr = f" collect-log-line {css_class}" if css_class else " collect-log-line"
-        html_lines.append(f'<span class="{class_attr.strip()}">{html.escape(line)}</span>')
-    body = "".join(html_lines) if html_lines else '<span class="collect-empty">暂无任务输出。任务启动后将自动显示最新日志。</span>'
+        style_attr = collect_log_line_style(css_class)
+        class_attr = f"collect-log-line {css_class}" if css_class else "collect-log-line"
+        html_lines.append(f'<div class="{class_attr}" style="{style_attr}">{html.escape(line)}</div>')
+    return "".join(html_lines) if html_lines else '<div class="collect-empty" style="color:#94A3B8!important;font-size:13px;">暂无任务输出。任务启动后将自动显示最新日志。</div>'
+
+
+def render_log_html(container=None) -> None:
+    body = build_collect_log_body(st.session_state.get("collect_task_logs", []))
     target = container or st
     target.markdown(f'<div id="collect-log-box" class="collect-log-box" data-collect-log-box="1">{body}</div>', unsafe_allow_html=True)
 
 
 def render_live_log_panel(refresh_seconds: float = 1.5) -> None:
-    logs = runtime.get("logs", [])[-300:]
-    html_lines = []
-    for line in logs:
-        css_class = classify_collect_log_line(line)
-        class_attr = f" collect-log-line {css_class}" if css_class else " collect-log-line"
-        html_lines.append(f'<span class="{class_attr.strip()}">{html.escape(line)}</span>')
-    body = "".join(html_lines) if html_lines else '<span class="collect-empty">暂无任务输出。任务启动后将自动显示最新日志。</span>'
+    live_runtime = get_runtime_state()
+    logs = live_runtime.get("logs") or st.session_state.get("collect_task_logs", [])
+    body = build_collect_log_body(list(logs))
     components.html(
         f"""
 <!doctype html>
@@ -556,16 +574,21 @@ def is_probably_person_name(value: str) -> bool:
 JOB_TITLE_HINTS = [
     "工程师", "经理", "主管", "专员", "顾问", "运营", "销售", "开发", "产品", "设计", "会计", "人事",
     "行政", "客服", "教师", "司机", "助理", "总监", "招聘", "采购", "算法", "测试", "前端", "后端",
-    "架构", "实施", "运维", "财务", "出纳", "法务", "分析师", "需求分析",
+    "架构", "实施", "运维", "财务", "出纳", "法务", "分析师", "需求分析", "策划", "企划", "营销", "品牌",
+    "市场", "编导", "导演", "剪辑", "摄像", "摄影", "视频", "深度学习", "图像识别", "图像处理", "机器视觉",
+    "Golang", "Go开发", "后台开发", "后端开发", "玩具设计", "动画设计", "商业/经营分析", "经营分析", "质量管理",
+    "质量测试", "移动产品经理", "美术设计师", "视觉设计", "电气工程师", "电商运营", "国内电商运营",
 ]
 COMPANY_NOISE_TOKENS = ["有限公司", "分公司", "集团", "科技", "公司", "企业", "中心", "事业部", "工作室", "系统集成"]
 JOB_SECTION_NOISE_TOKENS = ["工作经历", "项目经历", "教育经历", "实习经历", "培训经历", "校园经历"]
+JOB_DIRECTION_NOISE_TOKENS = ["AI方向", "ai方向", "A I方向", "方向"]
 
 
 def extract_core_job_title(value: str) -> str:
     text = re.sub(r"\s+", " ", str(value or "")).strip(" -—｜|:：")
     if not text:
         return ""
+    text = re.sub(r"[（(][^（）()]{0,24}方向[）)]", "", text)
     text = re.sub(r"^(求职岗位|求职职位|应聘岗位|应聘职位|期望职位|期望岗位|目标职位|目标岗位|职位|岗位)[:： ]*", "", text).strip(" -—｜|")
     text = re.sub(r"^(" + "|".join(JOB_SECTION_NOISE_TOKENS) + r")\s*[（(]?\s*\d+(?:\.\d+)?\s*年\s*[）)]?\s*", "", text).strip(" -—｜|")
     text = re.split(r"电话|手机|性别|姓名|男|女|\d{2,}|岁|经验|本科|专科|硕士|博士|学历|在线|沟通|附件|简历", text)[0].strip(" -—｜|")
@@ -575,20 +598,23 @@ def extract_core_job_title(value: str) -> str:
     for part in reversed(candidates):
         if not (2 <= len(part) <= 40):
             continue
-        if any(token in part for token in COMPANY_NOISE_TOKENS + JOB_SECTION_NOISE_TOKENS):
+        if any(token in part for token in COMPANY_NOISE_TOKENS + JOB_SECTION_NOISE_TOKENS + JOB_DIRECTION_NOISE_TOKENS):
             continue
         if any(hint.lower() in part.lower() for hint in JOB_TITLE_HINTS):
             return part
-    return text if 2 <= len(text) <= 40 and not any(token in text for token in COMPANY_NOISE_TOKENS + JOB_SECTION_NOISE_TOKENS) else ""
+    return text if 2 <= len(text) <= 40 and not any(token in text for token in COMPANY_NOISE_TOKENS + JOB_SECTION_NOISE_TOKENS + JOB_DIRECTION_NOISE_TOKENS) else ""
 
 
 def clean_job_title(value: str, candidate_name: str = "") -> str:
     text = extract_core_job_title(value)
     if not text or text == "待识别":
         return "待识别"
-    if text == candidate_name or is_probably_person_name(text):
+    has_job_hint = any(hint.lower() in text.lower() for hint in JOB_TITLE_HINTS)
+    if text == candidate_name or (not has_job_hint and is_probably_person_name(text)):
         return "待识别"
     if any(token in text for token in ["电话", "手机", "附件", "简历", "聊天", "沟通", "未读", "已读", "设置备注", "不合适"]):
+        return "待识别"
+    if any(token in text for token in COMPANY_NOISE_TOKENS + JOB_SECTION_NOISE_TOKENS + JOB_DIRECTION_NOISE_TOKENS):
         return "待识别"
     return text if 2 <= len(text) <= 40 else "待识别"
 
@@ -598,11 +624,11 @@ def build_candidate_record(row: dict) -> dict:
     info = raw_json.get("candidate_info", {}) or {}
     attachment = raw_json.get("attachment", {}) or {}
     file_path = attachment.get("file_path") or ""
-    signature_name, signature_job_title = parse_candidate_signature(raw_json.get("candidate_signature") or "")
+    signature_name, _ = parse_candidate_signature(raw_json.get("candidate_signature") or "")
     info_name = clean_candidate_name(info.get("name") or "")
     candidate_name = signature_name if is_unknown_or_noise(info_name) else info_name
     job_from_info = clean_job_title(info.get("job_title") or "", candidate_name)
-    job_title = signature_job_title if is_unknown_or_noise(job_from_info) else job_from_info
+    job_title = job_from_info
     age = info.get("age") or info.get("年龄") or "待识别"
     education = info.get("education") or info.get("highest_degree") or info.get("学历") or "待识别"
     return {
@@ -785,7 +811,7 @@ def run_collect_task(task_config: dict, runtime: dict | None = None) -> None:
             signature = normalize_duplicate_text(raw_json.get("candidate_signature") or "")
             if signature:
                 signature_head = re.sub(r"^(?:\d+|[一二三四五六七八九十]+)[\.、\)）\s]+", "", signature.splitlines()[0]).strip()
-                sig_name, _sig_job = clean_candidate_signature(signature_head)
+                sig_name, _ = clean_candidate_signature(signature_head)
                 sig_name = normalize_profile_value(sig_name or "")
                 age_match = re.search(r"(\d{2})\s*岁", signature)
                 education_match = re.search(r"(博士|硕士|本科|大专|专科|高中|中专)", signature)
@@ -861,6 +887,8 @@ def run_collect_task(task_config: dict, runtime: dict | None = None) -> None:
                 "request_attachment_disabled": "无可下载附件",
                 "attachment_url_not_captured": "附件链接未捕获",
                 "duplicate_content_hash": "疑似重复附件内容",
+                "violation_candidate_dialog": "违规候选人警告",
+                "candidate_detail_not_switched": "候选人详情未切换",
             }.get(skip_stage, skip_stage)
             runtime["skipped_count"] = int(runtime.get("skipped_count") or 0) + 1
             skipped_count = runtime["skipped_count"]

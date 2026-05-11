@@ -18,6 +18,10 @@ JOB_KEYWORDS = (
     "工程师", "经理", "主管", "专员", "顾问", "运营", "销售", "开发", "产品", "设计",
     "会计", "人事", "行政", "客服", "教师", "司机", "助理", "总监", "招聘", "采购",
     "算法", "测试", "前端", "后端", "架构", "实施", "运维", "财务", "出纳", "法务",
+    "分析师", "需求分析", "策划", "企划", "营销", "品牌", "市场", "编导", "导演", "剪辑",
+    "摄像", "摄影", "视频", "深度学习", "图像识别", "图像处理", "机器视觉", "Golang", "Go开发",
+    "后台开发", "后端开发", "玩具设计", "动画设计", "商业/经营分析", "经营分析", "质量管理", "质量测试",
+    "移动产品经理", "美术设计师", "视觉设计", "电气工程师", "电商运营", "国内电商运营",
 )
 NAME_STOP_TOKENS = EXCLUDE_KEYWORDS + (
     "电话", "手机号", "求职", "职位", "岗位", "本科", "专科", "硕士", "博士", "经验",
@@ -54,6 +58,8 @@ def _clean_job_title(value: str | None, candidate_name: str = "") -> str:
         return ""
     company_noise = ("有限公司", "分公司", "集团", "科技", "公司", "企业", "中心", "事业部", "工作室", "系统集成")
     section_noise = ("工作经历", "项目经历", "教育经历", "实习经历", "培训经历", "校园经历")
+    direction_noise = ("AI方向", "ai方向", "A I方向", "方向")
+    text = re.sub(r"[（(][^（）()]{0,24}方向[）)]", "", text)
     text = re.sub(r"^(" + "|".join(JOB_LABELS) + r")[:： ]*", "", text).strip(" -—｜|")
     text = re.sub(r"^(" + "|".join(section_noise) + r")\s*[（(]?\s*\d+(?:\.\d+)?\s*年\s*[）)]?\s*", "", text).strip(" -—｜|")
     text = re.split(r"电话|手机|性别|男|女|\d{2,}|岁|经验|本科|专科|硕士|博士|学历", text)[0].strip(" -—｜|")
@@ -63,14 +69,15 @@ def _clean_job_title(value: str | None, candidate_name: str = "") -> str:
     for part in reversed(candidates):
         if not (2 <= len(part) <= 40):
             continue
-        if any(token in part for token in company_noise + section_noise):
+        if any(token in part for token in company_noise + section_noise + direction_noise):
             continue
         if any(keyword.lower() in part.lower() for keyword in JOB_KEYWORDS):
             text = part
             break
-    if not text or text == candidate_name or _is_probably_person_name(text):
+    has_job_keyword = any(keyword.lower() in text.lower() for keyword in JOB_KEYWORDS)
+    if not text or text == candidate_name or (not has_job_keyword and _is_probably_person_name(text)):
         return ""
-    if any(token in text for token in EXCLUDE_KEYWORDS + company_noise + section_noise):
+    if any(token in text for token in EXCLUDE_KEYWORDS + company_noise + section_noise + direction_noise):
         return ""
     return text if 2 <= len(text) <= 40 else ""
 

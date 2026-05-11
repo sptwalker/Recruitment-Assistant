@@ -54,20 +54,28 @@ def open_browser_session(
 
     if user_data_dir:
         user_data_dir.mkdir(parents=True, exist_ok=True)
-        context = playwright.chromium.launch_persistent_context(
-            user_data_dir=str(user_data_dir),
-            headless=browser_headless,
-            **context_kwargs,
-        )
-        page = context.pages[0] if context.pages else context.new_page()
-        return BrowserSession(playwright=playwright, browser=context.browser, context=context, page=page)
+        try:
+            context = playwright.chromium.launch_persistent_context(
+                user_data_dir=str(user_data_dir),
+                headless=browser_headless,
+                **context_kwargs,
+            )
+            page = context.pages[0] if context.pages else context.new_page()
+            return BrowserSession(playwright=playwright, browser=context.browser, context=context, page=page)
+        except Exception:
+            playwright.stop()
+            raise
 
-    browser = playwright.chromium.launch(headless=browser_headless)
-    if state_path and state_path.exists():
-        context_kwargs["storage_state"] = str(state_path)
-    context = browser.new_context(**context_kwargs)
-    page = context.new_page()
-    return BrowserSession(playwright=playwright, browser=browser, context=context, page=page)
+    try:
+        browser = playwright.chromium.launch(headless=browser_headless)
+        if state_path and state_path.exists():
+            context_kwargs["storage_state"] = str(state_path)
+        context = browser.new_context(**context_kwargs)
+        page = context.new_page()
+        return BrowserSession(playwright=playwright, browser=browser, context=context, page=page)
+    except Exception:
+        playwright.stop()
+        raise
 
 
 def save_storage_state(context: BrowserContext, state_path: Path) -> None:

@@ -1,5 +1,28 @@
 # 开发日志
 
+## 2026-05-12
+
+### V0.91 智联采集残留清理与边界校准
+
+#### 已完成内容
+
+- 清理附件状态旧逻辑残留：
+  - 删除 `recruitment_assistant/platforms/zhilian/adapter.py` 中已不再调用的 `_has_attachment_message_hint()`。
+  - 保持 `_wait_for_requested_attachment_ready()` 只等待右下角 `查看附件简历` 按钮，不再读取聊天正文文本作为附件 ready 判断。
+- 清理智联采集页岗位字段残留：
+  - `app/pages/06_智联采集.py` 丢弃未使用的签名岗位返回值，明确左侧签名岗位不再覆盖右侧详情岗位。
+- 同步更新页面版本号：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V0.91`。
+
+#### 验证状态
+
+- 残留关键词复查：`_has_attachment_message_hint` 已无命中；`APP_VERSION` 已为 `V0.91`。
+- 已通过编译检查：
+
+```powershell
+python -m py_compile "recruitment_assistant/platforms/zhilian/adapter.py" "app/pages/06_智联采集.py" "app/components/layout.py"
+```
+
 ## 2026-05-11
 
 ### V0.74 智联聊天附件采集去重与附件归属修复

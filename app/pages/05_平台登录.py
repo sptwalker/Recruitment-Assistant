@@ -1,3 +1,5 @@
+import time
+
 import streamlit as st
 
 from components.layout import inject_vibe_style, page_header
@@ -17,16 +19,27 @@ with tabs[0]:
     account_name = st.text_input("账号标识", value="default", help="仅用于区分本地登录态文件，不需要填写真实密码。")
     adapter = ZhilianAdapter(account_name=account_name or "default")
     c1, c2 = st.columns(2)
-    c1.code(str(adapter.state_path))
-    c2.metric("登录态文件", "存在" if adapter.state_path.exists() else "不存在")
+    user_data_dir = getattr(adapter, "user_data_dir", adapter.state_path.with_name(f"{adapter.state_path.stem}_profile"))
+    c1.code(f"登录态文件：{adapter.state_path}\n浏览器档案：{user_data_dir}")
+    login_status_key = f"zhilian_login_status_{account_name or 'default'}"
+    login_status = st.session_state.get(login_status_key)
+    login_artifact_saved = adapter.state_path.exists() or user_data_dir.exists()
+    c2.metric("登录态状态", login_status or ("已保存" if login_artifact_saved else "未保存"))
     if st.button("检测是否已登录"):
         with st.spinner("正在打开无头浏览器检测登录态..."):
-            st.success("已登录") if adapter.is_logged_in() else st.error("未登录或登录态已失效")
+            is_logged_in = adapter.is_logged_in()
+        st.session_state[login_status_key] = "已登录" if is_logged_in else "未登录或已失效"
+        st.success("已登录") if is_logged_in else st.error("未登录或登录态已失效")
+        st.rerun()
     wait_seconds = st.number_input("等待人工登录秒数", min_value=30, max_value=600, value=180, step=30)
     if st.button("打开智联招聘登录并保存登录态"):
-        with st.spinner("请在弹出的浏览器中完成人工登录..."):
-            state_path = adapter.login_manually(wait_seconds=int(wait_seconds), keep_open=True)
-        st.success(f"登录态已保存：{state_path}")
+        with st.spinner("请在弹出的智联企业端双扫码登录页完成人工登录，系统会自动保存登录态..."):
+            state_path = adapter.login_manually(wait_seconds=int(wait_seconds), keep_open=False)
+            is_logged_in = adapter.is_logged_in()
+        st.session_state[login_status_key] = "已登录" if is_logged_in else "已保存，待验证"
+        st.session_state.zhilian_login_state_updated_at = time.time()
+        st.success(f"登录态已保存：{state_path}\n浏览器档案：{user_data_dir}")
+        st.rerun()
     st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="vibe-card"><h3>开发工具</h3>', unsafe_allow_html=True)

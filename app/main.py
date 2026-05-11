@@ -42,8 +42,10 @@ def new_task_dialog() -> None:
         "间隔秒": "5-15" if speed_mode.startswith("快速") else "10-45",
     }
     adapter = ZhilianAdapter(account_name=task_config["账号标识"])
-    has_login_state = adapter.state_path.exists()
-    button_label = "已登录开始任务" if has_login_state else "登录开始任务"
+    login_artifact_saved = adapter.state_path.exists() or getattr(adapter, "user_data_dir", adapter.state_path.with_name(f"{adapter.state_path.stem}_profile")).exists()
+    has_login_state = bool(login_artifact_saved)
+
+    button_label = "已登录开始任务" if has_login_state else "请登录开始任务"
 
     if st.button(button_label, type="primary"):
         st.session_state.pending_collect_task = {
@@ -88,7 +90,7 @@ with col2:
   <div class="vibe-icon">☷</div>
   <h3>简历管理</h3>
   <p class="vibe-muted">解析候选人资料、技能标签与岗位匹配信息。</p>
-  <div class="vibe-btn-row"><a class="vibe-primary-btn" href="/简历下载解析" target="_self">解析简历</a><a class="vibe-outline-btn" href="/候选人管理" target="_self">候选人库</a></div>
+  <div class="vibe-btn-row"><a class="vibe-primary-btn" href="/简历管理" target="_self">解析简历</a><a class="vibe-outline-btn" href="/简历管理" target="_self">候选人库</a></div>
   <p class="vibe-muted" style="margin-top:18px;">总简历 1,284 · 待处理 42</p>
 </div>
 """,
@@ -99,9 +101,9 @@ with col3:
         """
 <div class="vibe-card">
   <div class="vibe-icon">⇩</div>
-  <h3>数据导出</h3>
-  <p class="vibe-muted">按范围、字段和格式生成可交付 Excel。</p>
-  <div class="vibe-btn-row"><a class="vibe-primary-btn" href="/导出中心" target="_self">立即导出</a><a class="vibe-outline-btn" href="/导出中心" target="_self">导出历史</a></div>
+  <h3>系统设置</h3>
+  <p class="vibe-muted">管理账号登录态、采集策略和运行参数。</p>
+  <div class="vibe-btn-row"><a class="vibe-primary-btn" href="/平台登录" target="_self">打开设置</a><a class="vibe-outline-btn" href="/平台登录" target="_self">登录态</a></div>
   <p class="vibe-muted" style="margin-top:18px;">本周导出 18 · 成功率 98%</p>
 </div>
 """,

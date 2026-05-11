@@ -2,6 +2,43 @@
 
 ## 2026-05-11
 
+### V0.74 智联聊天附件采集去重与附件归属修复
+
+#### 已完成内容
+
+- 修复 `V0.73` 日志暴露的附件链接未捕获统计缺口：
+  - `recruitment_assistant/platforms/zhilian/adapter.py` 在候选人点击 `要附件简历` / `查看附件简历` 后仍未捕获 `pending_urls` 或 `pending_downloads` 时，不再只输出诊断日志。
+  - 新增 `skip_stage="attachment_url_not_captured"`，通过 `on_resume_skipped` 计入跳过统计。
+  - `app/pages/06_智联采集.py` 新增跳过原因展示：`附件链接未捕获`。
+- 修复附件 URL / 下载内容归属污染风险：
+  - 不再将非当前候选人页面的下载请求、下载响应、浏览器原生下载事件自动补入当前候选人范围。
+  - 对来源页不属于当前候选人的附件请求/响应/下载事件直接丢弃并记录诊断日志。
+  - 新增本轮 `content_hash` 归属保护：若不同候选人下载到相同附件内容 hash，判定为疑似归属污染，删除本地临时附件并拒绝保存为成功候选人。
+- 修复历史同名但年龄漂移导致重复下载的问题：
+  - 保留强去重键 `姓名 + 年龄 + 学历`。
+  - 新增弱去重键 `姓名 + 学历`，当年龄变化但姓名和学历一致时，通过 `weak_hit=True` 拦截。
+  - 采集日志新增 `weak_hit`、`weak_key_hash`，便于判断是否由弱去重命中。
+- 增强下载前个人信息历史诊断：
+  - `历史同名` 不再只展示 `pre_key`，改为展示姓名、年龄、学历、key 前缀和 `task_id`。
+  - `platform_candidate_record` 写入时补充 `candidate_signature`、`job_title`、`phone`、`resume_file_name`、`content_hash`，便于后续排查重复与附件归属问题。
+- 同步更新页面版本号：`app/components/layout.py` 中 `APP_VERSION` 更新为 `V0.74`。
+
+#### 验证状态
+
+- 已通过编译检查：
+
+```powershell
+python -m py_compile "d:/Users/walker/Documents/walker/Videcode/Recruitment-Assistant/recruitment_assistant/platforms/zhilian/adapter.py" "d:/Users/walker/Documents/walker/Videcode/Recruitment-Assistant/app/pages/06_智联采集.py" "d:/Users/walker/Documents/walker/Videcode/Recruitment-Assistant/app/components/layout.py"
+```
+
+- `read_lints` 检查 `adapter.py`、`06_智联采集.py`、`layout.py` 无新增错误。
+
+#### 下一轮验证重点
+
+- 观察是否出现 `weak_hit=True` 并正确拦截历史同名年龄漂移候选人。
+- 观察 `附件链接未捕获` 是否正确进入累计跳过数。
+- 观察是否仍出现不同候选人相同 `content_hash` 或相同电话的附件归属异常。
+
 ### 简历管理页、解析入库与调试清库
 
 #### 已完成内容

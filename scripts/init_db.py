@@ -3,12 +3,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from recruitment_assistant.storage.db import Base, engine
-from recruitment_assistant.storage import models  # noqa: F401
+from recruitment_assistant.storage.db import init_database
 
 
 def main() -> None:
-    Base.metadata.create_all(bind=engine)
+    init_database()
     print("Database tables created or already exist.")
 
 

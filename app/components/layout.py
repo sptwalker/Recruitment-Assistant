@@ -5,12 +5,12 @@ BG = "#F5F7FA"
 WHITE = "#FFFFFF"
 SUCCESS_BG = "#E6F4EA"
 ACCENT = "#FF9F43"
-APP_VERSION = "V0.36"
+APP_VERSION = "V0.74"
 
 MENU_ITEMS = [
     ("首页", "⌂", "/"),
     ("采集任务", "◌", "/智联采集"),
-    ("简历管理", "◫", "/简历下载解析"),
+    ("简历管理", "◫", "/简历管理"),
     ("系统设置", "⚙", "/平台登录"),
 ]
 
@@ -30,7 +30,16 @@ def inject_vibe_style(active: str = "首页") -> None:
 * {{ font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }}
 html, body, [data-testid="stAppViewContainer"] {{ background: var(--bg); color: var(--text); }}
 [data-testid="stHeader"] {{ height: 0; background: transparent; }}
-[data-testid="stSidebar"] {{ display:none; }}
+[data-testid="stSidebar"],
+[data-testid="stSidebarNav"],
+[data-testid="collapsedControl"],
+button[kind="header"],
+a[href="/首页看板"],
+a[href="/候选人管理"],
+a[href="/岗位管理"],
+a[href="/导出中心"] {{ display:none !important; }}
+section[data-testid="stSidebar"] {{ width:0 !important; min-width:0 !important; }}
+[data-testid="stAppViewContainer"] {{ margin-left:0 !important; }}
 .block-container {{ max-width: 1680px; padding: 84px 28px 48px 248px !important; }}
 .vibe-topbar {{ position:fixed; top:0; left:0; right:0; z-index:9999; height:60px; background:rgba(255,255,255,.96); backdrop-filter:blur(16px); box-shadow:0 8px 24px rgba(31,41,55,.06); display:flex; align-items:center; justify-content:space-between; padding:0 28px; }}
 .vibe-brand {{ display:flex; align-items:center; gap:12px; font-size:18px; font-weight:800; letter-spacing:.2px; }}
@@ -81,7 +90,7 @@ div.stButton > button:disabled {{ background:#D1D5DB !important; border-color:#D
 </style>
 <div class="vibe-topbar">
   <div class="vibe-brand"><div class="vibe-logo">⌁</div><span>简历智采助手 {APP_VERSION}</span></div>
-  <div class="vibe-actions"><a href="/智联采集" target="_self">⌁ 采集任务</a><a href="/简历下载解析" target="_self">☷ 简历管理</a><a href="/平台登录" target="_self">⚙ 系统设置</a><div class="vibe-avatar">HR</div></div>
+  <div class="vibe-actions"><a href="/智联采集" target="_self">⌁ 采集任务</a><a href="/简历管理" target="_self">☷ 简历管理</a><a href="/平台登录" target="_self">⚙ 系统设置</a><div class="vibe-avatar">HR</div></div>
 </div>
 <aside class="vibe-sidebar">{menu_html}<div class="vibe-version">Resume AI Collector<br/>{APP_VERSION}</div></aside>
 """,

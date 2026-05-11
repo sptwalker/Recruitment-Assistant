@@ -183,6 +183,7 @@ def clean_candidate_signature(signature: str) -> tuple[str | None, str | None]:
     if not signature:
         return None, None
     text = re.sub(r"\s+", " ", signature).strip()
+    text = re.sub(r"^\s*\d+\s+", "", text)
     text = re.sub(r"pos:\d+:\d+:\d+:\d+", " ", text)
     parts = split_resume_tokens(text)
     parts = [part for part in parts if part and not is_noise_token(part)]
@@ -242,6 +243,7 @@ def first_valid_name(*values: str | None) -> str | None:
         if not value:
             continue
         text = str(value).strip()
+        text = re.sub(r"^[A-Za-z](?=[\u4e00-\u9fa5·]{2,8}$)", "", text)
         labeled = re.search(r"(?:姓\s*名|姓名)\s*[:：]?\s*([\u4e00-\u9fa5·]{2,8})", text)
         if labeled:
             text = labeled.group(1)

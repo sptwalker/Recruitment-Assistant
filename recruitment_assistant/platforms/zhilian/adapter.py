@@ -9,7 +9,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 
 from loguru import logger
-from playwright.sync_api import BrowserContext, Download, Error as PlaywrightError, Page, Request, Route, TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import BrowserContext, Download, Error as PlaywrightError, Page, Request, Response, Route, TimeoutError as PlaywrightTimeoutError
 
 
 
@@ -24,37 +24,124 @@ from recruitment_assistant.utils.snapshot_utils import safe_filename, save_text_
 
 class ZhilianAdapter(BasePlatformAdapter):
     platform_code = "zhilian"
-    login_url = "https://passport.zhaopin.com/login"
+    login_url = "https://passport.zhaopin.com/org/login?bkurl=https%3A%2F%2Frd6.zhaopin.com%2F"
     home_url = "https://rd5.zhaopin.com/"
 
     def __init__(self, account_name: str = "default") -> None:
         self.account_name = account_name
         self.state_path = get_state_path(self.platform_code, account_name)
+        self.user_data_dir = self.state_path.with_name(f"{self.state_path.stem}_profile")
+
+    def _has_persistent_profile(self) -> bool:
+        if not self.user_data_dir.exists() or not self.user_data_dir.is_dir():
+            return False
+        try:
+            return any(self.user_data_dir.iterdir())
+        except OSError:
+            return False
+
+    def _open_stateful_session(self, headless: bool = False, force_profile: bool = False, force_storage_state: bool = False):
+        use_profile = (force_profile or self._has_persistent_profile()) and not force_storage_state
+        try:
+            if use_profile:
+                return open_browser_session(state_path=self.state_path, headless=headless, user_data_dir=self.user_data_dir)
+            return open_browser_session(state_path=self.state_path, headless=headless)
+        except TypeError:
+            return open_browser_session(state_path=self.state_path, headless=headless)
+
+    def _is_login_or_security_page(self, page: Page) -> bool:
+        try:
+            current_url = page.url.lower()
+        except Exception:
+            current_url = ""
+        try:
+            title = page.title().lower()
+        except Exception:
+            title = ""
+        try:
+            text = page.locator("body").inner_text(timeout=3000).lower()
+        except Exception:
+            text = ""
+        full_text = " ".join([current_url, title, text])
+        invalid_markers = [
+            "passport.zhaopin.com",
+            "/login",
+            "org/login",
+            "登录页",
+            "扫码登录",
+            "账号登录",
+            "security verification",
+            "验证连接安全性",
+            "tencent cloud edgeone",
+            "protected by tencent cloud edgeone",
+            "请勾选下方复选框",
+        ]
+        return any(marker in full_text for marker in invalid_markers)
+
+    def _open_authenticated_session(self, target_url: str | None = None, headless: bool = False):
+        url = target_url or self.home_url
+        last_session = None
+        attempts = []
+        if self._has_persistent_profile():
+            attempts.append(("profile", {"force_profile": True}))
+        if self.state_path.exists():
+            attempts.append(("storage_state", {"force_storage_state": True}))
+        if not attempts:
+            raise RuntimeError("智联招聘登录态不存在，请先完成登录。")
+        for label, kwargs in attempts:
+            session = self._open_stateful_session(headless=headless, **kwargs)
+            last_session = session
+            try:
+                session.page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                session.page.wait_for_timeout(5000)
+                if not self._is_login_or_security_page(session.page):
+                    logger.info("智联自动登录通道可用：{}，当前页面={}", label, session.page.url)
+                    return session
+                logger.warning("智联自动登录通道无效：{}，当前页面={}，将尝试下一通道。", label, session.page.url)
+            except Exception as exc:
+                logger.warning("智联自动登录通道打开失败：{}，原因={}", label, exc)
+            try:
+                session.close()
+            except Exception:
+                pass
+            last_session = None
+        raise RuntimeError("智联自动登录未成功：浏览器档案和 JSON 登录态均未进入已登录页面，请重新保存登录态。")
 
     def login(self) -> None:
         self.login_manually(wait_seconds=180)
 
     def login_manually(self, wait_seconds: int = 180, keep_open: bool = False, enter_home: bool = True) -> Path:
-        session = open_browser_session(headless=False)
+        session = self._open_stateful_session(headless=False, force_profile=True)
         try:
             page = session.page
             page.goto(self.login_url, wait_until="domcontentloaded")
-            logger.info("请在打开的浏览器中完成人工扫码/短信登录。")
-            try:
-                page.wait_for_url(lambda url: "login" not in url.lower(), timeout=wait_seconds * 1000)
-                page.wait_for_timeout(3000)
-            except PlaywrightTimeoutError:
-                logger.warning("等待登录跳转超时，将尝试进入智联系统首页后保存当前登录态。")
-            except PlaywrightError as exc:
-                raise RuntimeError("登录窗口已关闭或登录流程已取消") from exc
+            logger.info("请在打开的智联企业端登录页完成人工扫码登录。")
+            deadline = time.monotonic() + wait_seconds
+            logged_in = False
+            while time.monotonic() < deadline:
+                try:
+                    page.wait_for_timeout(2000)
+                    current_url = page.url.lower()
+                    if "passport" not in current_url and "login" not in current_url and not self._is_login_or_security_page(page):
+                        logged_in = True
+                        save_storage_state(session.context, self.state_path)
+                        logger.info("检测到智联登录跳转完成：{}", page.url)
+                        break
+                except PlaywrightError as exc:
+                    raise RuntimeError("登录窗口已关闭或登录流程已取消") from exc
+            if not logged_in:
+                raise RuntimeError("智联登录未完成：仍停留在登录/验证页面，未保存无效登录态。")
             if enter_home:
                 try:
                     page.goto(self.home_url, wait_until="domcontentloaded", timeout=30000)
-                    page.wait_for_timeout(5000)
-                    if "login" in page.url.lower() or "passport" in page.url.lower():
-                        logger.warning("进入系统首页后仍在登录页，请确认是否已完成登录。")
-                    else:
-                        logger.info("已进入智联系统首页：{}", page.url)
+                    page.wait_for_timeout(8000)
+                    if self._is_login_or_security_page(page):
+                        raise RuntimeError("进入系统首页后仍在登录/验证页面，未覆盖已保存登录态。")
+                    logged_in = True
+                    save_storage_state(session.context, self.state_path)
+                    logger.info("已进入智联系统首页：{}", page.url)
+                except RuntimeError:
+                    raise
                 except Exception as exc:
                     logger.warning("登录后进入智联系统首页失败：{}", exc)
             save_storage_state(session.context, self.state_path)
@@ -65,17 +152,29 @@ class ZhilianAdapter(BasePlatformAdapter):
         finally:
             session.close()
 
-    def is_logged_in(self) -> bool:
-        if not self.state_path.exists():
+
+    def is_logged_in(self, headless: bool = True) -> bool:
+        if not self.state_path.exists() and not self.user_data_dir.exists():
             return False
-        session = open_browser_session(state_path=self.state_path, headless=True)
+        session = self._open_stateful_session(headless=headless, force_profile=True)
+
         try:
             page = session.page
             page.goto(self.home_url, wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(3000)
             current_url = page.url.lower()
+            title = page.title().lower()
             content = page.content().lower()
-            login_markers = ["passport", "login"]
-            return not any(marker in current_url or marker in content for marker in login_markers)
+            text = ""
+            try:
+                text = page.locator("body").inner_text(timeout=5000).lower()
+            except Exception:
+                text = ""
+            full_text = " ".join([current_url, title, content, text])
+            if self._is_login_or_security_page(page):
+                return False
+            valid_markers = ["rd5.zhaopin.com", "rd6.zhaopin.com", "/app/", "app-menu", "智联招聘"]
+            return any(marker in full_text for marker in valid_markers)
         except Exception as exc:
             logger.warning("智联招聘登录态检测失败：{}", exc)
             return False
@@ -83,10 +182,10 @@ class ZhilianAdapter(BasePlatformAdapter):
             session.close()
 
     def capture_current_page(self, target_url: str | None = None, wait_seconds: int = 30) -> dict:
-        if not self.state_path.exists():
+        if not self.state_path.exists() and not self._has_persistent_profile():
             raise RuntimeError("智联招聘登录态不存在，请先完成登录。")
 
-        session = open_browser_session(state_path=self.state_path, headless=False)
+        session = self._open_stateful_session(headless=False)
         try:
             page = session.page
             page.goto(target_url or self.home_url, wait_until="domcontentloaded", timeout=30000)
@@ -109,10 +208,10 @@ class ZhilianAdapter(BasePlatformAdapter):
             session.close()
 
     def capture_manual_resume_pages(self, target_url: str | None = None, max_pages: int = 5) -> list[dict]:
-        if not self.state_path.exists():
+        if not self.state_path.exists() and not self._has_persistent_profile():
             raise RuntimeError("智联招聘登录态不存在，请先完成登录。")
 
-        session = open_browser_session(state_path=self.state_path, headless=False)
+        session = self._open_stateful_session(headless=False)
         results = []
         try:
             page = session.page
@@ -284,7 +383,12 @@ class ZhilianAdapter(BasePlatformAdapter):
                     "file_name": target_path.name,
                     "file_path": str(target_path),
                     "file_ext": suffix,
-                    "mime_type": "application/pdf" if suffix == ".pdf" else None,
+                    "mime_type": (
+                        "application/pdf" if suffix == ".pdf"
+                        else "application/vnd.openxmlformats-officedocument.wordprocessingml.document" if suffix == ".docx"
+                        else "application/msword" if suffix == ".doc"
+                        else None
+                    ),
                     "file_size": target_path.stat().st_size,
                     "file_hash": file_hash,
                     "suggested_filename": download.suggested_filename,
@@ -312,10 +416,10 @@ class ZhilianAdapter(BasePlatformAdapter):
     def download_manual_chat_attachment_resumes(
         self, target_url: str | None = None, max_resumes: int = 5, wait_seconds: int = 180
     ) -> list[dict]:
-        if not self.state_path.exists():
+        if not self.state_path.exists() and not self._has_persistent_profile():
             raise RuntimeError("智联招聘登录态不存在，请先完成登录。")
 
-        session = open_browser_session(state_path=self.state_path, headless=False)
+        session = self._open_stateful_session(headless=False)
         results = []
         try:
             page = session.page
@@ -375,7 +479,12 @@ class ZhilianAdapter(BasePlatformAdapter):
             return ".pdf"
         if content.startswith(b"PK\x03\x04"):
             return ".docx"
-        if content.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
+        lower_content = content[:4096].lower().lstrip()
+        if lower_content.startswith((b"<html", b"<?xml")) and (
+            b"schemas-microsoft-com:office:word" in lower_content
+            or b"microsoft word" in lower_content
+            or b"urn:schemas-microsoft-com:office:word" in lower_content
+        ):
             return ".doc"
         if suffix in {".pdf", ".doc", ".docx"}:
             return suffix
@@ -391,11 +500,67 @@ class ZhilianAdapter(BasePlatformAdapter):
         if suffix == ".docx":
             return content.startswith(b"PK\x03\x04")
         if suffix == ".doc":
-            return content.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1")
+            lower_content = content[:4096].lower()
+            return (
+                content.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1")
+                or (
+                    lower_content.lstrip().startswith((b"<html", b"<?xml"))
+                    and (
+                        b"schemas-microsoft-com:office:word" in lower_content
+                        or b"microsoft word" in lower_content
+                        or b"urn:schemas-microsoft-com:office:word" in lower_content
+                    )
+                )
+            )
         return False
 
     def _is_resume_attachment_download_url(self, url: str) -> bool:
-        return "attachment.zhaopin.com" in url and "downloadFileTemporary" in url
+        url_lower = (url or "").lower()
+        if not url_lower.startswith(("http://", "https://")):
+            return False
+        host = urlparse(url_lower).netloc
+        path_query = f"{urlparse(url_lower).path}?{urlparse(url_lower).query}"
+        if "attachment.zhaopin.com" in host and "downloadfiletemporary" in path_query:
+            return True
+        if "zhaopin.com" not in host:
+            return False
+        return any(
+            token in path_query
+            for token in [
+                "downloadfiletemporary",
+                "downloadfile",
+                "downfile",
+                "downloadresume",
+                "resume/download",
+                "resumeattachment",
+                "attachment/download",
+                "download/attachment",
+                "file/download",
+                "downloadurl",
+            ]
+        )
+
+    def _is_resume_attachment_response(self, response: Response) -> bool:
+        url = response.url or ""
+        if self._is_resume_attachment_download_url(url):
+            return True
+        if "zhaopin.com" not in url.lower():
+            return False
+        headers = response.headers or {}
+        content_type = (headers.get("content-type") or "").lower()
+        disposition = (headers.get("content-disposition") or "").lower()
+        if "attachment" in disposition and any(ext in disposition for ext in [".pdf", ".doc", ".docx"]):
+            return True
+        return any(
+            mime in content_type
+            for mime in [
+                "application/pdf",
+                "application/msword",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "application/octet-stream",
+            ]
+        ) and any(token in url.lower() for token in ["resume", "attach", "file", "download"])
+
 
     def _download_attachment_with_context(
         self,
@@ -421,7 +586,7 @@ class ZhilianAdapter(BasePlatformAdapter):
         response = context.request.get(
             download_url,
             headers=headers,
-            timeout=60000,
+            timeout=18000,
         )
         if not response.ok:
             preview = ""
@@ -477,13 +642,19 @@ class ZhilianAdapter(BasePlatformAdapter):
         script = r"""
             () => {
                 const values = [];
-                const attrs = ['href', 'src', 'data-url', 'data-href'];
-                for (const el of Array.from(document.querySelectorAll('a, iframe, embed, object, [href], [src], [data-url], [data-href]'))) {
+                const attrs = ['href', 'src', 'data-url', 'data-href', 'data-download-url', 'data-file-url', 'data-src', 'title', 'aria-label', 'download'];
+                const push = (value) => { if (value) values.push(value); };
+                for (const el of Array.from(document.querySelectorAll('a, iframe, embed, object, [href], [src], [data-url], [data-href], [data-download-url], [data-file-url], [data-src], [download], [title], [aria-label]'))) {
                     for (const attr of attrs) {
-                        const value = el.getAttribute(attr);
-                        if (value) values.push(value);
+                        push(el.getAttribute(attr));
                     }
+                    push(el.innerText);
+                    push(el.textContent);
                 }
+                const html = document.documentElement ? document.documentElement.innerHTML : '';
+                for (const match of html.matchAll(/https?:\\/\\/[^'"<>\\s]+/g)) values.push(match[0]);
+                for (const match of html.matchAll(/\/[^'"<>\\s]*(?:downloadFileTemporary|downloadFile|downFile|downloadResume|resumeAttachment|attachment|resume|file\/download|download\/file|downloadUrl)[^'"<>\\s]*/ig)) values.push(match[0]);
+
                 return values;
             }
         """
@@ -515,10 +686,10 @@ class ZhilianAdapter(BasePlatformAdapter):
     def auto_capture_chat_attachment_resumes(
         self, target_url: str | None = None, max_resumes: int = 5, wait_seconds: int = 600
     ) -> list[dict]:
-        if not self.state_path.exists():
+        if not self.state_path.exists() and not self._has_persistent_profile():
             raise RuntimeError("智联招聘登录态不存在，请先完成登录。")
 
-        session = open_browser_session(state_path=self.state_path, headless=False)
+        session = self._open_stateful_session(headless=False)
         results = []
         captured_urls: set[str] = set()
         pending_urls: list[str] = []
@@ -566,10 +737,10 @@ class ZhilianAdapter(BasePlatformAdapter):
             session.close()
 
     def download_attachment_by_url(self, download_url: str, filename: str | None = None) -> dict:
-        if not self.state_path.exists():
+        if not self.state_path.exists() and not self._has_persistent_profile():
             raise RuntimeError("智联招聘登录态不存在，请先完成登录。")
 
-        session = open_browser_session(state_path=self.state_path, headless=True)
+        session = self._open_stateful_session(headless=False)
         try:
             return self._download_attachment_with_context(
                 session.context,
@@ -892,20 +1063,34 @@ class ZhilianAdapter(BasePlatformAdapter):
         for result in targets:
             signature = result["signature"]
             normalized_signature = re.sub(r"\s+", " ", signature).strip()
-            if normalized_signature in emitted_skips:
+            identity_key = self._candidate_identity_key(signature)
+            if normalized_signature in emitted_skips or identity_key in emitted_skips:
                 continue
             position_key = result["positionKey"]
             stable_id = result.get("stableId") or ""
             skip_hit = should_skip_candidate_signature(signature) if should_skip_candidate_signature else False
-            logger.info("点击前候选人判定：skip_hit={}，stable_id={}，signature={}", skip_hit, stable_id, signature[:120])
-            if skip_hit:
+            internal_seen_hit = bool(not skip_hit and identity_key in seen_signatures)
+            logger.info(
+                "点击前候选人判定：skip_hit={}，internal_seen={}，stable_id={}，identity_key={}，signature={}",
+                skip_hit,
+                internal_seen_hit,
+                stable_id,
+                identity_key,
+                signature[:120],
+            )
+            if skip_hit or internal_seen_hit:
                 emitted_skips.add(normalized_signature)
+                emitted_skips.add(identity_key)
                 seen_signatures.add(signature)
+                seen_signatures.add(identity_key)
 
-                skipped_count += 1
-                print(f"已快速跳过重复候选人：{signature[:80]}")
-                if on_skipped_signature:
-                    on_skipped_signature(signature)
+                if skip_hit:
+                    skipped_count += 1
+                    print(f"已快速跳过重复候选人：{signature[:80]}")
+                    if on_skipped_signature:
+                        on_skipped_signature(signature)
+                else:
+                    logger.info("已内部略过本轮已处理候选人，不计入跳过统计：{}", signature[:80])
                 continue
             page.mouse.click(result["x"], result["y"])
             elapsed_ms = int((time.monotonic() - started) * 1000)
@@ -1010,6 +1195,66 @@ class ZhilianAdapter(BasePlatformAdapter):
                 print(f"Frame {frame_index}: {frame.url}")
             for index, item in enumerate(candidates, start=1):
                 print(f"{index}. ({item['x']},{item['y']},{item['w']}x{item['h']}) text={item.get('text', '')} class={item.get('cls', '')} bg={item.get('bg', '')} color={item.get('color', '')}")
+
+    def _candidate_identity_key(self, signature: str) -> str:
+        name, _job_title = clean_candidate_signature(signature or "")
+        name = self._clean_candidate_name(name or signature or "")
+        text = re.sub(r"\s+", " ", str(signature or "")).strip()
+        age_match = re.search(r"(\d{2})\s*岁", text)
+        education_match = re.search(r"(博士|硕士|本科|大专|专科|高中|中专)", text)
+        if name and name != "待识别":
+            parts = ["candidate", name]
+            if age_match:
+                parts.append(age_match.group(1))
+            if education_match:
+                parts.append(education_match.group(1))
+            return ":".join(parts)
+        normalized = re.sub(r"^(?:\d+|[一二三四五六七八九十]+)[\.、\)）\s]+", "", text)
+        normalized = re.sub(r"(已向对方要附件简历|这是我的附件简历|附件简历[，,。 ]*请查收|要附件简历|查看附件简历|下载附件简历)", " ", normalized)
+        return "sig:" + re.sub(r"\s+", " ", normalized).strip()[:80]
+
+    def _get_request_attachment_button_state(self, page: Page) -> str:
+        script = r"""
+            () => {
+                const isVisible = (el) => {
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none' && style.opacity !== '0';
+                };
+                const normalize = (text) => (text || '').replace(/\s+/g, ' ').trim();
+                const allText = (el) => normalize([el.innerText, el.textContent, el.getAttribute('title'), el.getAttribute('aria-label')].filter(Boolean).join(' '));
+                const nodes = Array.from(document.querySelectorAll('button, a, [role="button"], [tabindex], span, div, [class*="button"], [class*="btn"]'));
+                const hasKeyword = (text) => /要附件简历|索要附件简历|请求附件简历|获取附件简历|要简历/.test(text) && !/已向对方要附件简历|已要附件简历|已索要/.test(text);
+                const disabledLike = (el) => {
+                    const cls = String(el.className || '').toLowerCase();
+                    return el.disabled === true || el.getAttribute('disabled') !== null || el.getAttribute('aria-disabled') === 'true' || cls.includes('is-disabled') || /(^|[-_\s])disabled($|[-_\s])/.test(cls);
+                };
+                for (const el of nodes) {
+                    if (!isVisible(el)) continue;
+                    const rect = el.getBoundingClientRect();
+                    if (rect.left <= 420 || rect.top <= 70 || rect.width > 760 || rect.height > 260) continue;
+                    const text = allText(el);
+                    if (!hasKeyword(text)) continue;
+                    let cur = el;
+                    for (let i = 0; cur && i < 5; i += 1, cur = cur.parentElement) {
+                        if (disabledLike(cur)) return 'disabled';
+                    }
+                    return 'enabled';
+                }
+                return 'missing';
+            }
+        """
+        for frame in page.frames:
+            try:
+                state = frame.evaluate(script)
+            except Exception:
+                continue
+            if state in {"enabled", "disabled"}:
+                return state
+        return "missing"
+
+    def _has_disabled_request_attachment_button(self, page: Page) -> bool:
+        return self._get_request_attachment_button_state(page) == "disabled"
 
     def _click_text_in_chat_detail(
         self,
@@ -1166,30 +1411,316 @@ class ZhilianAdapter(BasePlatformAdapter):
             exclude_texts=["已向对方要附件简历", "已要附件简历", "已索要"],
         )
 
+    def _has_view_attachment_resume(self, page: Page) -> bool:
+        script = r"""
+            () => {
+                const viewportW = window.innerWidth || document.documentElement.clientWidth || 0;
+                const viewportH = window.innerHeight || document.documentElement.clientHeight || 0;
+                const chatLeft = Math.max(420, Math.round(viewportW * 0.34));
+                const bottomTop = Math.max(70, Math.round(viewportH * 0.50));
+                const isVisible = (el) => {
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none' && style.opacity !== '0';
+                };
+                const normalize = (text) => (text || '').replace(/\s+/g, ' ').trim();
+                const textOf = (el) => normalize([el.innerText, el.textContent, el.getAttribute('title'), el.getAttribute('aria-label')].filter(Boolean).join(' '));
+                const disabledLike = (el) => {
+                    const cls = String(el.className || '').toLowerCase();
+                    const style = window.getComputedStyle(el);
+                    return el.disabled || el.hasAttribute('disabled') || el.getAttribute('aria-disabled') === 'true' || cls.includes('disabled') || cls.includes('disable') || style.pointerEvents === 'none';
+                };
+                for (const el of Array.from(document.querySelectorAll('button, a, [role="button"], [tabindex], span, div, [class*="button"], [class*="btn"], [class*="attach"], [class*="resume"]'))) {
+                    if (!isVisible(el) || disabledLike(el)) continue;
+                    const rect = el.getBoundingClientRect();
+                    if (rect.left <= chatLeft || rect.top <= bottomTop || rect.top >= viewportH - 8 || rect.width > 900 || rect.height > 320) continue;
+                    const text = textOf(el);
+                    if (/查看附件简历|查看简历附件|下载附件简历|下载简历附件/.test(text) && !/要附件简历|索要附件简历|请求附件简历|获取附件简历/.test(text)) return true;
+                }
+                return false;
+            }
+        """
+        for frame in page.frames:
+            try:
+                if frame.evaluate(script):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _has_attachment_message_hint(self, page: Page) -> bool:
+        pattern = re.compile(r"这是我的附件简历|附件简历[，,。 ]*请查收|查看附件简历|查看简历附件|下载附件简历|下载简历附件")
+        for frame in page.frames:
+            try:
+                text = frame.locator("body").inner_text(timeout=1000)
+            except Exception:
+                continue
+            if pattern.search(text or ""):
+                return True
+        return False
+
+    def _wait_for_requested_attachment_ready(self, page: Page, wait_seconds: int, can_continue: Callable[[], bool] | None = None) -> bool:
+        deadline = time.monotonic() + max(1, wait_seconds)
+        while time.monotonic() < deadline:
+            if can_continue and not can_continue():
+                return False
+            if self._has_view_attachment_resume(page) or self._has_attachment_message_hint(page):
+                return True
+            page.wait_for_timeout(500)
+        return False
+
+    def _click_attachment_message_card(self, page: Page) -> bool:
+        script = r"""
+            () => {
+                const isVisible = (el) => {
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none' && style.opacity !== '0';
+                };
+                const normalize = (text) => (text || '').replace(/\s+/g, ' ').trim();
+                const allText = (el) => normalize([
+                    el.innerText,
+                    el.textContent,
+                    el.getAttribute('title'),
+                    el.getAttribute('aria-label'),
+                    el.getAttribute('href'),
+                    el.getAttribute('download'),
+                    el.getAttribute('data-url'),
+                    el.getAttribute('data-href'),
+                ].filter(Boolean).join(' '));
+                const hasAttachmentHint = (text) => /这是我的附件简历|附件简历[，,。 ]*请查收|查看简历附件|查看附件简历|下载附件简历|下载简历附件|附件简历|简历附件|\.pdf|\.docx?|pdf|docx?/i.test(text);
+                const hasRequestOnly = (text) => /已向对方要附件简历|要附件简历|索要附件简历|请求附件简历|获取附件简历|要简历/.test(text) && !/这是我的附件简历|请查收|查看|下载|\.pdf|\.doc/i.test(text);
+                const clickableAncestor = (el) => {
+                    let best = el;
+                    let cur = el;
+                    for (let i = 0; cur && i < 10; i += 1, cur = cur.parentElement) {
+                        if (!isVisible(cur)) continue;
+                        const rect = cur.getBoundingClientRect();
+                        if (rect.left <= 420 || rect.top <= 70 || rect.width > 880 || rect.height > 360) continue;
+                        const tag = cur.tagName ? cur.tagName.toLowerCase() : '';
+                        const role = cur.getAttribute('role') || '';
+                        const cls = String(cur.className || '').toLowerCase();
+                        const style = window.getComputedStyle(cur);
+                        const text = allText(cur);
+                        if (hasRequestOnly(text)) continue;
+                        if (tag === 'a' || tag === 'button' || role === 'button' || typeof cur.onclick === 'function' || cls.includes('file') || cls.includes('attach') || cls.includes('resume') || cls.includes('message') || cls.includes('bubble') || style.cursor === 'pointer' || cur.hasAttribute('tabindex')) {
+                            best = cur;
+                            if (tag === 'a' || tag === 'button' || hasAttachmentHint(text)) break;
+                        }
+                    }
+                    return best;
+                };
+                const nodes = Array.from(document.querySelectorAll('a, button, [role="button"], [tabindex], [download], [href], [data-url], [data-href], [class*="file"], [class*="attach"], [class*="resume"], [class*="message"], [class*="bubble"], div, span, p, li, section, article'));
+                const candidates = [];
+                for (const el of nodes) {
+                    if (!isVisible(el)) continue;
+                    const ownText = allText(el);
+                    if (!hasAttachmentHint(ownText) || hasRequestOnly(ownText)) continue;
+                    const target = clickableAncestor(el);
+                    const rect = target.getBoundingClientRect();
+                    if (rect.left <= 420 || rect.top <= 70 || rect.width > 880 || rect.height > 360) continue;
+                    const text = allText(target) || ownText;
+                    if (!hasAttachmentHint(text) || hasRequestOnly(text)) continue;
+                    const tag = target.tagName ? target.tagName.toLowerCase() : '';
+                    const href = target.getAttribute('href') || el.getAttribute('href') || target.getAttribute('data-url') || el.getAttribute('data-url') || '';
+                    const cls = String(target.className || '');
+                    const score = (href ? 50 : 0) + (tag === 'a' ? 35 : tag === 'button' ? 30 : 0) + (/查看|下载|\.pdf|\.doc/i.test(text) ? 35 : 0) + (/这是我的附件简历|请查收/.test(text) ? 25 : 0) - rect.top / 2000;
+                    candidates.push({ el: target, rect, text, tag, href, cls, score });
+                }
+                candidates.sort((a, b) => b.score - a.score || a.rect.top - b.rect.top || a.rect.left - b.rect.left);
+                const item = candidates[0];
+                if (!item) return null;
+                item.el.scrollIntoView({ block: 'center', inline: 'center' });
+                const rect = item.el.getBoundingClientRect();
+                const x = rect.left + Math.min(Math.max(rect.width * 0.5, 8), Math.max(rect.width - 8, 8));
+                const y = rect.top + Math.min(Math.max(rect.height * 0.5, 8), Math.max(rect.height - 8, 8));
+                for (const type of ['pointerover', 'mouseover', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+                    const eventOptions = { bubbles: true, cancelable: true, clientX: x, clientY: y, button: 0, buttons: type.includes('down') ? 1 : 0, pointerType: 'mouse' };
+                    const event = type.startsWith('pointer') ? new PointerEvent(type, eventOptions) : new MouseEvent(type, eventOptions);
+                    item.el.dispatchEvent(event);
+                }
+                if (typeof item.el.click === 'function') item.el.click();
+                return { text: item.text.slice(0, 180), x, y, tag: item.tag, href: item.href || '', cls: String(item.cls || '').slice(0, 80), score: item.score };
+            }
+        """
+        for frame in page.frames:
+            try:
+                result = frame.evaluate(script)
+            except Exception:
+                continue
+            if result:
+                page.mouse.move(result["x"], result["y"])
+                page.mouse.click(result["x"], result["y"], click_count=2, delay=80)
+                logger.info(
+                    "已点击附件消息卡片：text={} tag={} href={} score={} class={}",
+                    result.get("text"),
+                    result.get("tag"),
+                    result.get("href"),
+                    result.get("score"),
+                    result.get("cls"),
+                )
+                return True
+        return False
+
+    def _click_bottom_view_attachment_resume(self, page: Page) -> bool:
+        script = r"""
+            () => {
+                const viewportW = window.innerWidth || document.documentElement.clientWidth || 0;
+                const viewportH = window.innerHeight || document.documentElement.clientHeight || 0;
+                const chatLeft = Math.max(420, Math.round(viewportW * 0.34));
+                const bottomTop = Math.max(70, Math.round(viewportH * 0.54));
+                const isVisible = (el) => {
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none' && style.opacity !== '0';
+                };
+                const normalize = (text) => (text || '').replace(/\s+/g, ' ').trim();
+                const allText = (el) => normalize([
+                    el.innerText,
+                    el.textContent,
+                    el.getAttribute('title'),
+                    el.getAttribute('aria-label'),
+                    el.getAttribute('href'),
+                    el.getAttribute('download'),
+                ].filter(Boolean).join(' '));
+                const hasViewAttachment = (text) => /查看附件简历|查看简历附件|下载附件简历|下载简历附件/.test(text);
+                const requestOnly = (text) => /已向对方要附件简历|要附件简历|索要附件简历|请求附件简历|获取附件简历|要简历/.test(text) && !/查看|下载/.test(text);
+                const disabledLike = (el) => {
+                    const cls = String(el.className || '').toLowerCase();
+                    const ariaDisabled = el.getAttribute('aria-disabled') === 'true';
+                    const disabledAttr = el.disabled || el.hasAttribute('disabled');
+                    const style = window.getComputedStyle(el);
+                    return disabledAttr || ariaDisabled || cls.includes('disabled') || cls.includes('disable') || style.pointerEvents === 'none';
+                };
+                const inRightBottom = (rect) => rect.left > chatLeft && rect.top > bottomTop && rect.top < viewportH - 12 && rect.width <= 900 && rect.height <= 320;
+                const clickableAncestor = (el) => {
+                    let best = el;
+                    let cur = el;
+                    for (let i = 0; cur && i < 8; i += 1, cur = cur.parentElement) {
+                        if (!isVisible(cur)) continue;
+                        const rect = cur.getBoundingClientRect();
+                        if (!inRightBottom(rect)) continue;
+                        const tag = cur.tagName ? cur.tagName.toLowerCase() : '';
+                        const role = cur.getAttribute('role') || '';
+                        const cls = String(cur.className || '').toLowerCase();
+                        const style = window.getComputedStyle(cur);
+                        if (tag === 'button' || tag === 'a' || role === 'button' || typeof cur.onclick === 'function' || cls.includes('button') || cls.includes('btn') || cls.includes('link') || style.cursor === 'pointer' || cur.hasAttribute('tabindex')) {
+                            best = cur;
+                            if (tag === 'button' || tag === 'a') break;
+                        }
+                    }
+                    return best;
+                };
+                const nodes = Array.from(document.querySelectorAll('button, a, [role="button"], [tabindex], [download], [href], span, div, p, [class*="button"], [class*="btn"], [class*="link"], [class*="attach"], [class*="resume"]'));
+                const candidates = [];
+                for (const el of nodes) {
+                    if (!isVisible(el)) continue;
+                    const ownText = allText(el);
+                    if (!hasViewAttachment(ownText) || requestOnly(ownText)) continue;
+                    const target = clickableAncestor(el);
+                    if (!isVisible(target) || disabledLike(target)) continue;
+                    const rect = target.getBoundingClientRect();
+                    if (!inRightBottom(rect)) continue;
+                    const text = allText(target) || ownText;
+                    if (!hasViewAttachment(text) || requestOnly(text)) continue;
+                    let cur = target;
+                    let disabled = false;
+                    for (let i = 0; cur && i < 4; i += 1, cur = cur.parentElement) {
+                        if (disabledLike(cur)) {
+                            disabled = true;
+                            break;
+                        }
+                    }
+                    if (disabled) continue;
+                    const tag = target.tagName ? target.tagName.toLowerCase() : '';
+                    const href = target.getAttribute('href') || el.getAttribute('href') || '';
+                    const cls = String(target.className || '');
+                    const exactScore = /查看附件简历|查看简历附件/.test(text) ? 90 : 60;
+                    const clickableScore = tag === 'button' ? 35 : tag === 'a' ? 32 : target.getAttribute('role') === 'button' ? 26 : 0;
+                    const bottomScore = Math.max(0, Math.round(rect.top - bottomTop) / 20);
+                    candidates.push({ el: target, rect, text, tag, href, cls, score: exactScore + clickableScore + bottomScore });
+                }
+                candidates.sort((a, b) => b.score - a.score || b.rect.top - a.rect.top || a.rect.left - b.rect.left);
+                const item = candidates[0];
+                if (!item) return null;
+                item.el.scrollIntoView({ block: 'center', inline: 'center' });
+                const rect = item.el.getBoundingClientRect();
+                const x = rect.left + Math.min(Math.max(rect.width * 0.5, 8), Math.max(rect.width - 8, 8));
+                const y = rect.top + Math.min(Math.max(rect.height * 0.5, 8), Math.max(rect.height - 8, 8));
+                for (const type of ['pointerover', 'mouseover', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+                    const eventOptions = { bubbles: true, cancelable: true, clientX: x, clientY: y, button: 0, buttons: type.includes('down') ? 1 : 0, pointerType: 'mouse' };
+                    const event = type.startsWith('pointer') ? new PointerEvent(type, eventOptions) : new MouseEvent(type, eventOptions);
+                    item.el.dispatchEvent(event);
+                }
+                if (typeof item.el.click === 'function') item.el.click();
+                return { text: item.text.slice(0, 180), x, y, tag: item.tag, href: item.href || '', cls: String(item.cls || '').slice(0, 80), score: item.score };
+            }
+        """
+        for frame in page.frames:
+            try:
+                result = frame.evaluate(script)
+            except Exception:
+                continue
+            if result:
+                page.mouse.move(result["x"], result["y"])
+                page.mouse.down()
+                page.wait_for_timeout(80)
+                page.mouse.up()
+                page.wait_for_timeout(120)
+                page.mouse.click(result["x"], result["y"], click_count=2, delay=80)
+                logger.info(
+                    "已优先点击右侧底部查看附件简历按钮：text={} tag={} href={} score={} class={}",
+                    result.get("text"),
+                    result.get("tag"),
+                    result.get("href"),
+                    result.get("score"),
+                    result.get("cls"),
+                )
+                return True
+        return False
+
     def _click_view_attachment_resume(self, page: Page) -> bool:
-        return self._click_text_in_chat_detail(
+        if self._click_bottom_view_attachment_resume(page):
+            return True
+        clicked = self._click_text_in_chat_detail(
             page,
-            ["查看简历附件", "查看附件简历", "查看简历", "下载附件简历", "下载简历附件", "附件简历", "简历附件", "下载", "查看", "PDF", "pdf", "DOC", "doc"],
+            ["查看简历附件", "查看附件简历", "查看简历", "下载附件简历", "下载简历附件", "附件简历", "简历附件", "下载", "查看", "PDF", "pdf", "DOC", "doc", "docx", "请查收"],
             timeout=12000,
             exclude_texts=["已向对方要附件简历", "要附件简历", "索要附件简历", "请求附件简历", "获取附件简历", "要简历"],
         )
+        if clicked:
+            return True
+        return self._click_attachment_message_card(page)
+
 
     def _clean_candidate_name(self, value: str) -> str:
         text = re.sub(r"\s+", " ", str(value or "")).strip()
         if not text:
             return ""
+        exact_noise = {"请查收", "这是我的", "附件简历", "简历附件", "要附件简历", "查看附件简历", "下载附件简历"}
+        job_noise_tokens = [
+            "运营", "电商", "视频", "剪辑", "主播", "客服", "销售", "产品", "设计", "开发", "工程师",
+            "经理", "主管", "专员", "顾问", "助理", "总监", "算法", "测试", "前端", "后端",
+            "架构", "实施", "运维", "财务", "出纳", "法务", "分析师", "采购", "招聘", "人事", "行政",
+        ]
         stop_tokens = [
             "沟通", "聊天", "附件", "简历", "查看", "下载", "电话", "手机号", "求职", "职位", "岗位",
             "未读", "已读", "在线", "打招呼", "要附件", "本科", "专科", "硕士", "博士", "经验",
             "岁", "性别", "工作", "学历", "平台", "快捷", "发送", "复制", "不合适", "约面试",
-            "设置备注", "已向对方要附件简历", "待识别",
+            "设置备注", "已向对方要附件简历", "待识别", "请查收", "这是我的", "新招呼", "快速处理",
+            *job_noise_tokens,
         ]
         text = re.sub(r"(姓名|候选人|联系人)[:：]", " ", text)
+        text = re.sub(r"^(?:\d+|[一二三四五六七八九十]+)[\.、\)）\s]+", "", text)
         for part in re.split(r"[｜|/\\,，;；:：\n\r\t ]+", text):
+            part = re.sub(r"^(?:\d+|[一二三四五六七八九十]+)[\.、\)）\s]+", "", part)
+            part = re.sub(r"^[A-Za-z](?=[\u4e00-\u9fa5]{2,4}$)", "", part)
             part = part.strip(" ·-—_()（）[]【】")
-            if not part or any(token in part for token in stop_tokens):
+            if not part or part in exact_noise or any(token in part for token in stop_tokens):
                 continue
-            if re.search(r"\d|岁|年|男|女", part):
+            if re.fullmatch(r"[\u4e00-\u9fa5]{1,3}(?:先生|女士)", part):
+                return part
+            if re.fullmatch(r"男|女|男性|女性", part) or re.search(r"\d|岁|年", part):
                 continue
             if re.fullmatch(r"[\u4e00-\u9fa5]{2,4}", part) or re.fullmatch(r"[A-Za-z][A-Za-z .·-]{1,30}", part):
                 return part
@@ -1234,16 +1765,21 @@ class ZhilianAdapter(BasePlatformAdapter):
         return text if 2 <= len(text) <= 40 else ""
 
     def _parse_candidate_signature(self, signature: str) -> dict:
+        raw_signature = re.sub(r"\s+", " ", str(signature or "")).strip()
+        direct_name = ""
+        direct_match = re.match(r"^(?:\d+|[一二三四五六七八九十]+)?[\.、\)）\s]*(?:[A-Za-z])?([\u4e00-\u9fa5]{2,4})(?=\s|$)", raw_signature)
+        if direct_match:
+            direct_name = self._clean_candidate_name(direct_match.group(1))
         name, job_title = clean_candidate_signature(signature or "")
-        name = self._clean_candidate_name(name or "")
-        job_title = self._clean_candidate_job_title(job_title or "", name)
+        name = direct_name or self._clean_candidate_name(name or "")
+        job_title = self._clean_candidate_job_title(job_title or raw_signature, name)
         return {"name": name or "待识别", "job_title": job_title or "待识别", "extractor": "candidate_signature"}
 
     def _is_unknown_or_noise(self, value: str) -> bool:
         text = re.sub(r"\s+", " ", str(value or "")).strip()
         return not text or text == "待识别" or any(
             token in text
-            for token in ["设置备注", "不合适", "已向对方要附件简历", "要附件简历", "查看附件简历"]
+            for token in ["设置备注", "不合适", "已向对方要附件简历", "要附件简历", "查看附件简历", "请查收", "这是我的", "附件简历"]
         )
 
     def _candidate_info_score(self, info: dict) -> int:
@@ -1532,18 +2068,20 @@ class ZhilianAdapter(BasePlatformAdapter):
         on_diagnostic: Callable[[str], None] | None = None,
         on_download_failed: Callable[[dict], None] | None = None,
     ) -> list[dict]:
-        if not self.state_path.exists():
+        if not self.state_path.exists() and not self._has_persistent_profile():
             raise RuntimeError("智联招聘登录态不存在，请先完成登录。")
 
-        session = open_browser_session(state_path=self.state_path, headless=False)
+        session = self._open_authenticated_session(target_url or self.home_url, headless=False)
         results = []
         captured_urls: set[str] = set()
         downloaded_urls: set[str] = set()
         pending_urls: list[dict] = []
         ignored_attachment_urls: set[str] = set()
+        failed_download_urls: set[str] = set()
         pending_downloads: list[dict] = []
         bound_download_pages: set[int] = set()
         seen_candidates: set[str] = set()
+        seen_content_hashes: dict[str, str] = {}
         last_download_monotonic = 0.0
         active_candidate_started_at = 0.0
         active_candidate_page_ids: set[int] = set()
@@ -1566,6 +2104,7 @@ class ZhilianAdapter(BasePlatformAdapter):
                 and not any(item.get("url") == url for item in pending_urls)
                 and url not in downloaded_urls
                 and url not in ignored_attachment_urls
+                and url not in failed_download_urls
                 and active_candidate_started_at
                 and now >= active_candidate_started_at
             ):
@@ -1576,15 +2115,59 @@ class ZhilianAdapter(BasePlatformAdapter):
                     source_page = None
                 page_id = id(source_page) if source_page and not source_page.is_closed() else 0
                 if active_candidate_page_ids and page_id and page_id not in active_candidate_page_ids:
-                    active_candidate_page_ids.add(page_id)
                     diag(
-                        "已将下载请求来源页补入当前候选人范围："
+                        "已丢弃非当前候选人页面的下载请求："
                         f"page_id={page_id}，url_hash={text_hash(url)[:10] if text_hash(url) else '空'}"
                     )
+                    return
                 add_pending_url(url, now, page_id, dict(request.headers))
                 print(f"已从网络请求捕获当前候选人附件下载链接：{url}")
 
+        def handle_response(response: Response) -> None:
+            now = time.monotonic()
+            if not active_candidate_started_at or now < active_candidate_started_at:
+                return
+            try:
+                if not self._is_resume_attachment_response(response):
+                    return
+            except Exception:
+                return
+            url = response.url or ""
+            if (
+                not url
+                or any(item.get("url") == url for item in pending_urls)
+                or url in downloaded_urls
+                or url in ignored_attachment_urls
+                or url in failed_download_urls
+            ):
+                return
+            source_page = None
+            request_headers = {}
+            try:
+                source_page = response.request.frame.page
+            except Exception:
+                source_page = None
+            try:
+                request_headers = dict(response.request.headers)
+            except Exception:
+                request_headers = {}
+            page_id = id(source_page) if source_page and not source_page.is_closed() else 0
+            if active_candidate_page_ids and page_id and page_id not in active_candidate_page_ids:
+                diag(
+                    "已丢弃非当前候选人页面的附件响应："
+                    f"page_id={page_id}，url_hash={text_hash(url)[:10] if text_hash(url) else '空'}"
+                )
+                return
+            add_pending_url(url, now, page_id, request_headers)
+            diag(
+                "已从网络响应捕获疑似附件下载链接："
+                f"status={response.status}，url_hash={text_hash(url)[:10] if text_hash(url) else '空'}，"
+                f"content-type={(response.headers or {}).get('content-type', '')}，"
+                f"content-disposition={(response.headers or {}).get('content-disposition', '')[:80]}"
+            )
+
         def handle_route(route: Route, request: Request) -> None:
+
             url = request.url
             now = time.monotonic()
             if self._is_resume_attachment_download_url(url):
@@ -1593,6 +2176,7 @@ class ZhilianAdapter(BasePlatformAdapter):
                     and now >= active_candidate_started_at
                     and url not in downloaded_urls
                     and url not in ignored_attachment_urls
+                    and url not in failed_download_urls
                 ):
                     source_page = None
                     try:
@@ -1601,16 +2185,19 @@ class ZhilianAdapter(BasePlatformAdapter):
                         source_page = None
                     page_id = id(source_page) if source_page and not source_page.is_closed() else 0
                     if active_candidate_page_ids and page_id and page_id not in active_candidate_page_ids:
-                        active_candidate_page_ids.add(page_id)
                         diag(
-                            "已将拦截下载请求来源页补入当前候选人范围："
+                            "已丢弃非当前候选人页面的拦截下载请求："
                             f"page_id={page_id}，url_hash={text_hash(url)[:10] if text_hash(url) else '空'}"
                         )
+                        route.continue_()
+                        return
                     add_pending_url(url, now, page_id, dict(request.headers))
                     diag(
-                        "已拦截浏览器原生附件下载，改由系统内保存："
+                        "已捕获当前候选人附件下载请求，允许浏览器原生下载以兼容 DOC/DOCX："
                         f"url_hash={text_hash(url)[:10] if text_hash(url) else '空'}"
                     )
+                    route.continue_()
+                    return
                 else:
                     diag(
                         "已阻止非当前候选人附件下载，避免浏览器下载气泡堆积："
@@ -1718,6 +2305,7 @@ class ZhilianAdapter(BasePlatformAdapter):
                 url
                 and url not in downloaded_urls
                 and url not in ignored_attachment_urls
+                and url not in failed_download_urls
                 and not any(item.get("url") == url for item in pending_urls)
             ):
                 pending_urls.append({"url": url, "created_at": created_at, "page_id": page_id, "headers": request_headers or {}})
@@ -1751,7 +2339,9 @@ class ZhilianAdapter(BasePlatformAdapter):
         try:
             session.context.route("**/*", handle_route)
             session.context.on("request", handle_request)
+            session.context.on("response", handle_response)
             session.context.on("page", handle_new_page)
+
             page = session.page
             bind_existing_download_pages()
             page.goto(target_url or self.home_url, wait_until="domcontentloaded", timeout=30000)
@@ -1843,7 +2433,13 @@ class ZhilianAdapter(BasePlatformAdapter):
 
 
                 seen_candidates.update(signature.splitlines())
-                display_signature = signature.splitlines()[0]
+                normalized_signature = re.sub(r"\s+", " ", signature).strip()
+                if normalized_signature:
+                    seen_candidates.add(normalized_signature)
+                candidate_identity_key = self._candidate_identity_key(signature)
+                if candidate_identity_key:
+                    seen_candidates.add(candidate_identity_key)
+                display_signature = re.sub(r"^(?:\d+|[一二三四五六七八九十]+)[\.、\)）\s]+", "", signature.splitlines()[0]).strip()
                 print(f"已选择候选人：{display_signature[:80]}")
                 page.wait_for_timeout(300)
                 profile_info_before_download = self._extract_current_candidate_info(
@@ -1881,11 +2477,23 @@ class ZhilianAdapter(BasePlatformAdapter):
                     break
                 request_started = time.monotonic()
                 signature_has_attachment_hint = bool(re.search(r"这是我的附件简历|附件简历[，,。 ]*请查收|已向对方要附件简历", display_signature))
+                request_button_state = "skipped_attachment_hint" if signature_has_attachment_hint else self._get_request_attachment_button_state(page)
                 request_clicked = False if signature_has_attachment_hint else self._click_request_attachment_resume(page)
+                if request_clicked and request_button_state == "disabled":
+                    request_button_state = "clicked_despite_disabled_hint"
                 diag(
-                    f"要附件简历按钮查找完成：clicked={request_clicked}，耗时={time.monotonic() - request_started:.2f}s，"
+                    f"要附件简历按钮查找完成：clicked={request_clicked}，button_state={request_button_state}，耗时={time.monotonic() - request_started:.2f}s，"
                     f"signature_has_attachment_hint={signature_has_attachment_hint}"
                 )
+                if request_clicked:
+                    ready_wait_seconds = min(max(per_candidate_wait_seconds, 8), 30)
+                    ready_started = time.monotonic()
+                    attachment_ready = self._wait_for_requested_attachment_ready(page, ready_wait_seconds, can_continue)
+                    signature_has_attachment_hint = signature_has_attachment_hint or attachment_ready
+                    diag(
+                        f"新联系人索要附件后等待结果：ready={attachment_ready}，耗时={time.monotonic() - ready_started:.2f}s，"
+                        f"等待上限={ready_wait_seconds}s"
+                    )
                 if not request_clicked and not signature_has_attachment_hint:
                     logger.warning("当前候选人未找到可点击的'要附件简历'按钮，可能已经收到附件，继续尝试点击'查看简历附件'。")
                 page.wait_for_timeout(300)
@@ -1897,17 +2505,36 @@ class ZhilianAdapter(BasePlatformAdapter):
                     nonlocal last_download_monotonic
                     last_download_monotonic = time.monotonic()
                     attachment = row.setdefault("raw_json", {}).setdefault("attachment", {})
-                    candidate_info = self._extract_current_candidate_info(
+                    downloaded_candidate_info = self._extract_current_candidate_info(
                         page,
                         display_signature,
                         attachment.get("file_path"),
                         use_scrapling=False,
                     )
-                    candidate_info = self._merge_candidate_info(candidate_info, profile_info_before_download)
+                    candidate_info = self._merge_candidate_info(profile_info_before_download, downloaded_candidate_info)
                     candidate_info["resume_file_name"] = attachment.get("file_name")
+                    content_hash = str(row.get("content_hash") or attachment.get("file_hash") or "")
+                    current_identity = self._candidate_identity_key(display_signature) or re.sub(r"\s+", " ", display_signature).strip()
+                    if content_hash:
+                        previous_identity = seen_content_hashes.get(content_hash)
+                        if previous_identity and previous_identity != current_identity:
+                            try:
+                                file_path = attachment.get("file_path")
+                                if file_path:
+                                    Path(file_path).unlink(missing_ok=True)
+                            except Exception:
+                                pass
+                            diag(
+                                "已丢弃疑似归属污染附件："
+                                f"content_hash={content_hash[:12]}，当前候选人={display_signature[:40]}，"
+                                f"此前候选人={previous_identity[:40]}，source={source_label}"
+                            )
+                            return False
                     row["raw_json"]["candidate_signature"] = display_signature
                     row["raw_json"]["pre_download_candidate_info"] = profile_info_before_download
                     row["raw_json"]["candidate_info"] = candidate_info
+                    if content_hash:
+                        seen_content_hashes[content_hash] = current_identity
                     results.append(row)
                     if on_resume_saved:
                         on_resume_saved(row)
@@ -1941,6 +2568,10 @@ class ZhilianAdapter(BasePlatformAdapter):
                 if not view_clicked:
                     logger.warning("当前候选人未找到'查看附件简历'按钮，等待可能的自动链接。")
                     self._print_chat_detail_actions(page)
+                for url in self._find_attachment_urls_from_pages([page], captured_urls, mark_captured=False):
+                    add_pending_url(url, time.monotonic(), id(page))
+                if not view_clicked and pending_urls:
+                    diag(f"未点击到附件按钮，但已从当前聊天DOM兜底捕获附件链接：pending_urls={len(pending_urls)}")
 
                 wait_started = time.monotonic()
                 initial_pages = candidate_pages()
@@ -1949,13 +2580,14 @@ class ZhilianAdapter(BasePlatformAdapter):
                         add_pending_url(url, time.monotonic(), id(item_page))
                 effective_wait_seconds = per_candidate_wait_seconds
                 if pending_urls or pending_downloads:
-                    effective_wait_seconds = min(per_candidate_wait_seconds, 8)
-                elif view_clicked:
-                    effective_wait_seconds = min(per_candidate_wait_seconds, 8)
-                elif request_clicked or signature_has_attachment_hint:
                     effective_wait_seconds = min(per_candidate_wait_seconds, 12)
+                elif view_clicked:
+                    effective_wait_seconds = min(per_candidate_wait_seconds, 15)
+                elif request_clicked or signature_has_attachment_hint:
+                    effective_wait_seconds = min(per_candidate_wait_seconds, 15)
                 else:
-                    effective_wait_seconds = min(per_candidate_wait_seconds, 5)
+                    effective_wait_seconds = min(per_candidate_wait_seconds, 8)
+
                 candidate_deadline = time.monotonic() + effective_wait_seconds
                 saved_current_candidate = False
                 skipped_or_failed_current_candidate = False
@@ -1975,11 +2607,11 @@ class ZhilianAdapter(BasePlatformAdapter):
                         if download_item.get("created_at", 0) < candidate_download_started:
                             continue
                         if download_page_id and download_page_id not in active_candidate_page_ids:
-                            active_candidate_page_ids.add(download_page_id)
                             diag(
-                                "已将浏览器下载来源页补入当前候选人范围："
+                                "已丢弃非当前候选人页面的浏览器下载事件："
                                 f"filename={download_item.get('suggested_filename') or '空'}，page_id={download_page_id}"
                             )
+                            continue
                         elapsed_since_download = time.monotonic() - last_download_monotonic if last_download_monotonic else min_download_interval_seconds
                         remaining_interval = min_download_interval_seconds - elapsed_since_download
                         if remaining_interval > 0:
@@ -2038,15 +2670,23 @@ class ZhilianAdapter(BasePlatformAdapter):
                                 "error": str(exc),
                                 "candidate_signature": display_signature,
                             }
-                            if on_download_failed:
-                                on_download_failed(error_payload)
-                            skipped_or_failed_current_candidate = True
+                            failed_download_urls.add(download_url)
+                            ignored_attachment_urls.add(download_url)
+                            pending_urls[:] = [item for item in pending_urls if item.get("url") != download_url]
                             diag(
-                                "附件系统内下载失败："
-                                f"候选人={display_signature[:60]}，url_hash={error_payload['url_hash'] or '空'}，原因={exc}"
+                                "附件系统内下载失败，继续尝试当前候选人的其他附件链接："
+                                f"候选人={display_signature[:60]}，url_hash={error_payload['url_hash'] or '空'}，"
+                                f"剩余链接={len(pending_urls)}，原因={exc}"
                             )
-                            logger.warning("自动下载附件失败：{}", exc)
-                            break
+                            logger.warning("自动下载附件失败，继续尝试其他链接：{}", exc)
+                            if not pending_urls:
+                                if on_download_failed:
+                                    on_download_failed(error_payload)
+                                if display_signature:
+                                    seen_candidates.add(re.sub(r"\s+", " ", display_signature).strip())
+                                skipped_or_failed_current_candidate = True
+                                break
+                            continue
                         downloaded_urls.add(download_url)
                         result_saved = process_downloaded_row(row, "url_capture", download_url)
                         if result_saved:
@@ -2060,9 +2700,26 @@ class ZhilianAdapter(BasePlatformAdapter):
                     diag(
                         f"附件按钮点击后未捕获下载链接，快速跳过当前候选人："
                         f"等待耗时={time.monotonic() - wait_started:.2f}s，计划等待={effective_wait_seconds:.2f}s，"
-                        f"request_clicked={request_clicked}，view_clicked={view_clicked}，pending_urls={len(pending_urls)}，pending_downloads={len(pending_downloads)}"
+                        f"request_clicked={request_clicked}，button_state={request_button_state}，view_clicked={view_clicked}，"
+                        f"pending_urls={len(pending_urls)}，pending_downloads={len(pending_downloads)}"
                     )
                     logger.warning("当前候选人在快速等待窗口内未捕获到附件下载链接。")
+                    if on_resume_skipped:
+                        skip_stage = "request_attachment_disabled" if request_button_state == "disabled" else "attachment_url_not_captured"
+                        on_resume_skipped({
+                            "platform_code": self.platform_code,
+                            "source_url": page.url,
+                            "raw_json": {
+                                "candidate_signature": display_signature,
+                                "pre_download_candidate_info": profile_info_before_download,
+                                "candidate_info": profile_info_before_download,
+                                "attachment": {},
+                                "skip_stage": skip_stage,
+                            },
+                            "raw_html_path": None,
+                            "content_hash": "",
+                        })
+                    skipped_or_failed_current_candidate = True
 
                 else:
                     diag(f"候选人处理完成：总耗时={time.monotonic() - iter_started:.2f}s，下载等待耗时={time.monotonic() - wait_started:.2f}s")

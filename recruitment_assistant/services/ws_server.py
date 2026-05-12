@@ -9,7 +9,7 @@ from loguru import logger
 
 
 class BossWSServer:
-    def __init__(self, host: str = "localhost", port: int = 8765):
+    def __init__(self, host: str = "127.0.0.1", port: int = 8765):
         self.host = host
         self.port = port
         self.extension_ws = None
@@ -18,6 +18,15 @@ class BossWSServer:
         self._thread: threading.Thread | None = None
         self._server = None
         self._command_queue: asyncio.Queue | None = None
+        self._startup_error: str = ""
+
+    @property
+    def is_listening(self) -> bool:
+        return self._server is not None and self._thread is not None and self._thread.is_alive()
+
+    @property
+    def startup_error(self) -> str:
+        return self._startup_error
 
     @property
     def is_extension_connected(self) -> bool:
@@ -26,14 +35,22 @@ class BossWSServer:
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
             return
+        self._startup_error = ""
+        self._server = None
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
         deadline = threading.Event()
         for _ in range(50):
-            if self._loop is not None and self._loop.is_running():
+            if self.is_listening or self._startup_error:
                 break
             deadline.wait(0.1)
-        logger.info("Boss WS 服务已启动: ws://{}:{}", self.host, self.port)
+        if self._startup_error:
+            logger.error("Boss WS 服务启动失败: {}", self._startup_error)
+        elif self.is_listening:
+            logger.info("Boss WS 服务已启动: ws://{}:{}", self.host, self.port)
+        else:
+            self._startup_error = "启动超时：未能确认端口监听"
+            logger.error("Boss WS 服务启动失败: {}", self._startup_error)
 
     def stop(self) -> None:
         if self._loop and self._loop.is_running():
@@ -57,7 +74,13 @@ class BossWSServer:
         asyncio.set_event_loop(self._loop)
         self._command_queue = asyncio.Queue()
         self._shutdown_event = asyncio.Event()
-        self._loop.run_until_complete(self._serve())
+        try:
+            self._loop.run_until_complete(self._serve())
+        except Exception as exc:
+            self._startup_error = str(exc)
+            logger.exception("Boss WS 服务线程异常")
+        finally:
+            self._server = None
 
     async def _serve(self) -> None:
         import websockets

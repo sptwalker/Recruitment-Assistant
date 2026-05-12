@@ -5,11 +5,12 @@ BG = "#F5F7FA"
 WHITE = "#FFFFFF"
 SUCCESS_BG = "#E6F4EA"
 ACCENT = "#FF9F43"
-APP_VERSION = "V0.91"
+APP_VERSION = "V1.23"
 
 MENU_ITEMS = [
     ("首页", "⌂", "/"),
     ("采集任务", "◌", "/智联采集"),
+    ("BOSS采集", "◇", "/BOSS采集"),
     ("简历管理", "◫", "/简历管理"),
     ("系统设置", "⚙", "/平台登录"),
 ]
@@ -90,7 +91,7 @@ div.stButton > button:disabled {{ background:#D1D5DB !important; border-color:#D
 </style>
 <div class="vibe-topbar">
   <div class="vibe-brand"><div class="vibe-logo">⌁</div><span>简历智采助手 {APP_VERSION}</span></div>
-  <div class="vibe-actions"><a href="/智联采集" target="_self">⌁ 采集任务</a><a href="/简历管理" target="_self">☷ 简历管理</a><a href="/平台登录" target="_self">⚙ 系统设置</a><div class="vibe-avatar">HR</div></div>
+  <div class="vibe-actions"><a href="/智联采集" target="_self">⌁ 采集任务</a><a href="/BOSS采集" target="_self">◇ BOSS采集</a><a href="/简历管理" target="_self">☷ 简历管理</a><a href="/平台登录" target="_self">⚙ 系统设置</a><div class="vibe-avatar">HR</div></div>
 </div>
 <aside class="vibe-sidebar">{menu_html}<div class="vibe-version">Resume AI Collector<br/>{APP_VERSION}</div></aside>
 """,

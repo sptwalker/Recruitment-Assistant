@@ -2,6 +2,157 @@
 
 ## 2026-05-12
 
+### V1.23 BOSS Adapter/CDP 旧链路清理
+
+#### 已完成内容
+
+- 清理 BOSS 旧 Adapter/CDP 方案残留：
+  - 删除 `recruitment_assistant/core/cdp_browser.py`。
+  - 删除 `recruitment_assistant/platforms/boss/adapter.py` 与空包入口。
+  - 删除 `scripts/boss_login.py`、`scripts/check_boss_login.py`、`scripts/download_boss_chat_resumes.py`。
+  - 删除 `tests/test_cdp_browser.py`。
+
+- 收敛 BOSS 当前架构到 Chrome Extension + WebSocket：
+  - `recruitment_assistant/services/boss_ws_bridge.py` 移除 `BossAdapter` 注入与导入。
+  - BOSS 简历保存继续由 `BossWSBridge` 根据扩展回传的 Chrome 下载路径完成。
+
+- 清理配置残留：
+  - 删除 `chrome_executable_path` 与 `boss_cdp_port` 配置项。
+  - 删除根目录误生成空文件 `12.0`。
+
+- 验证残留：
+  - Python/JS/TOML 代码中已无 `BossAdapter`、`core.cdp_browser`、`connect_over_cdp`、`boss_cdp_port`、`chrome_executable_path`、`boss_login`、`check_boss_login`、`download_boss_chat_resumes` 残留引用。
+  - 保留仍在使用的智联 `ZhilianAdapter` 与 Playwright 链路，不纳入本次 BOSS 旧链路删除范围。
+
+- 同步页面版本号：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.23`。
+
+### V1.22 BOSS WebSocket 单例化与端口占用修复
+
+#### 已完成内容
+
+- 修复 `app/pages/08_BOSS采集.py` 中 WebSocket 服务按 Streamlit 会话重复创建的问题：
+  - 将 `BossWSServer` / `BossWSBridge` 初始化从 `st.session_state` 改为 `st.cache_resource` 全局单例。
+  - 避免多个浏览器会话或页面刷新时重复绑定 `127.0.0.1:8765`。
+  - 修复页面显示 `WebSocket 服务：启动失败 [Errno 10048]`，但 Chrome 扩展实际显示“服务端已连接”的状态不一致问题。
+
+- 同步页面版本号：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.22`。
+
+### V1.21 BOSS采集页面紧凑布局优化
+
+#### 已完成内容
+
+- 优化 `app/pages/08_BOSS采集.py` 页面展示样式：
+  - 去掉标题区域可能呈现的白色 banner 背景、边框和阴影。
+  - 放大 `BOSS直聘采集` 标题字体，增强页面主标题识别度。
+  - 所有信息区统一白色卡片背景。
+  - 缩小指标、状态、日志、路径、说明文字字号。
+  - 收紧卡片 padding、margin、按钮高度和日志区高度，提升单屏信息密度。
+  - 在各栏目标题下增加分隔线，并在相邻栏目之间增加视觉分隔。
+
+- 同步页面版本号：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.21`。
+
+### V1.20 BOSS WebSocket 真实监听状态与扩展连接修复
+
+#### 已完成内容
+
+- 修复 `recruitment_assistant/services/ws_server.py`：
+  - WebSocket 服务默认绑定从 `localhost` 改为 `127.0.0.1`，避免 Windows/Chrome 在 IPv6 `::1` 与 IPv4 `127.0.0.1` 间解析不一致。
+  - 新增 `is_listening` 与 `startup_error`，用于区分“线程已创建”和“端口真实监听”。
+  - `start()` 会等待端口服务真正创建，启动失败或超时会记录明确错误。
+  - 服务线程异常会保存到 `startup_error`，便于页面诊断。
+
+- 修复 `chrome_extension/background.js`：
+  - WebSocket 地址从 `ws://localhost:8765` 改为 `ws://127.0.0.1:8765`。
+  - 扩展连接上报版本升级为 `1.2.0`。
+
+- 修复 `app/pages/08_BOSS采集.py`：
+  - WebSocket 服务状态不再固定显示“运行中”。
+  - 改为显示真实状态：`监听中` / `启动失败` / `未监听`，并展示 `127.0.0.1:8765` 或启动错误。
+
+- 同步版本：
+  - `chrome_extension/manifest.json` 更新为 `1.2.0`。
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.20`。
+
+#### 测试提示
+
+需要刷新 `BOSS采集` 页面让新的 WebSocket 服务对象初始化，再到 `chrome://extensions/` 重新加载扩展。页面应显示 `WebSocket 服务：监听中 127.0.0.1:8765`，随后显示 `扩展已连接`。
+
+### V1.19 BOSS采集入口补全与连接故障说明
+
+#### 已完成内容
+
+- 修复 `app/components/layout.py` 左侧菜单缺少 `BOSS采集` 页面入口的问题。
+- 顶部快捷导航新增 `BOSS采集` 链接，便于直接进入 Extension 测试页面。
+- 明确 Extension 图标 `!` 与 `ws://localhost:8765` 连接拒绝的原因：必须先进入 `BOSS采集` 页面，页面初始化后才会启动本地 WebSocket 服务。
+- 同步页面版本号：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.19`。
+
+#### 测试提示
+
+进入 `http://localhost:8501/BOSS采集` 后等待 WebSocket 服务启动，再在 `chrome://extensions/` 重新加载 `Boss直聘采集助手`，图标 `!` 应自动消失并显示扩展已连接。
+
+### V1.18 Boss直聘 Extension 下载归属与识别增强
+
+#### 已完成内容
+
+- 增强 `chrome_extension/background.js`：
+  - 扩展版本升级为 `1.1.0`。
+  - 透传 Streamlit 下发的 `run_id`，使每轮测试的浏览器事件可归属到同一轮日志。
+  - 增加 `download_intent` 登记机制，在页面点击下载前记录候选人上下文。
+  - 接入 `chrome.downloads.onCreated` 和 `chrome.downloads.onChanged`，记录 Chrome 真实下载创建、完成和失败事件。
+  - 下载完成后向 Python 回传 `download_id`、`download_path`、文件名、URL、MIME 和文件大小。
+
+- 增强 `chrome_extension/content.js`：
+  - 候选人列表扫描增加可见性、文本长度、候选人特征评分，降低误选聊天消息/页面元素的概率。
+  - 附件简历按钮细分为 `view`、`request`、`requested`、`unknown_resume` 状态。
+  - 对“要附件简历/索要附件简历”走跳过并记录 `resume_requested` 或 `resume_request_clicked`，避免误当成已下载。
+  - 下载前先发送 `download_intent`，再点击下载按钮，由 background 监听真实下载完成。
+  - 新增 `candidate_list_scanned`、`resume_button_found` 等诊断事件，方便通过 JSONL 分析页面识别问题。
+
+- 增强 `recruitment_assistant/services/boss_ws_bridge.py`：
+  - 识别并记录候选人列表扫描、附件按钮识别、下载意图登记和 Chrome 下载创建事件。
+  - 对外部下载记录补充 `download_id` 和 `url`，便于排查真实下载归属。
+  - 进度事件不再覆盖 Python 端已保存的真实下载计数，避免下载完成回调与页面预估计数竞争。
+
+- 同步页面版本号：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.18`。
+
+#### 当前状态
+
+已完成进入真实页面测试前的主要开发准备。下一步需要在 Chrome 中重新加载扩展，并在 Boss 沟通页用“单步采集1人”验证 DOM 选择器、附件按钮状态和 `chrome.downloads` 回传路径是否符合预期。
+
+### V1.17 Boss直聘 Extension 测试闭环与结构化日志
+
+#### 已完成内容
+
+- 增强 `recruitment_assistant/services/boss_ws_bridge.py`：
+  - 每轮测试自动生成 `run_id`、开始时间、事件序号和 JSONL 日志文件。
+  - 日志路径为 `logs/boss_extension/YYYYMMDD/run_<run_id>.jsonl`，记录命令下发、扩展事件、UI 日志、候选人跳过、简历保存和本轮摘要。
+  - 增加 `reset_run()` 和 `get_run_summary()`，支持每轮测试快速重置与摘要分析。
+  - 运行态增加扩展版本、Boss 页面 URL、最近事件时间、跳过原因统计等字段。
+
+- 完善 `app/pages/08_BOSS采集.py`：
+  - 新增“测试轮次”面板，展示 Run ID、开始时间、最近事件、日志事件数和 JSONL 日志文件路径。
+  - 新增“重置本轮测试”和“生成本轮摘要”按钮。
+  - 新增“单步采集1人”测试模式，便于逐个验证候选人点击、跳过和下载链路。
+  - 新增“测试操作循环”清单，明确每轮测试的执行顺序。
+  - 展示扩展版本、Boss 页面 URL 和跳过原因统计，便于快速定位问题。
+
+- 同步页面版本号：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.17`。
+
+#### 建议测试循环
+
+1. 点击“重置本轮测试”，生成新的 Run ID 与 JSONL 日志。
+2. 打开 Boss 沟通页，确认扩展连接和页面就绪。
+3. 先使用“单步采集1人”，验证事件链路是否完整。
+4. 点击“生成本轮摘要”，根据下载数、跳过原因和最后事件定位问题。
+5. 修改问题后重新加载扩展或刷新 Boss 页面，进入下一轮 Run ID。
+6. 单步稳定后切换连续采集，并逐步扩大最大采集数量。
+
 ### V1.16 Boss直聘 Chrome Extension 采集方案
 
 #### 背景

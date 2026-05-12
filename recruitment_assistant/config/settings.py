@@ -20,6 +20,10 @@ class Settings(BaseSettings):
     snapshot_dir: Path = Field(default=Path("data/snapshots"))
     log_level: str = "INFO"
 
+    # Boss CDP browser settings
+    chrome_executable_path: str | None = None
+    boss_cdp_port: int = 9222
+
     def ensure_local_dirs(self) -> None:
         for path in [
             self.export_dir,

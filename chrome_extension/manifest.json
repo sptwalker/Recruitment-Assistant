@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "Boss直聘采集助手",
+  "description": "配合招聘助手系统，在Boss直聘页面内自动采集附件简历。",
+  "version": "1.0.0",
+  "permissions": ["activeTab", "downloads", "storage"],
+  "host_permissions": ["https://www.zhipin.com/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.zhipin.com/web/chat*", "https://www.zhipin.com/web/geek/chat*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

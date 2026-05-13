@@ -24,6 +24,10 @@
   - Python/JS/TOML 代码中已无 `BossAdapter`、`core.cdp_browser`、`connect_over_cdp`、`boss_cdp_port`、`chrome_executable_path`、`boss_login`、`check_boss_login`、`download_boss_chat_resumes` 残留引用。
   - 保留仍在使用的智联 `ZhilianAdapter` 与 Playwright 链路，不纳入本次 BOSS 旧链路删除范围。
 
+- 合并远端提交后的二次清理：
+  - `app/pages/05_平台登录.py` 移除合并带回的 BOSS 登录态、Cookie 导入、诊断与 `BossAdapter` 引用，仅保留智联登录设置。
+  - `app/pages/06_智联采集.py` 移除合并带回的 BOSS Adapter 采集入口，采集任务页仅保留智联 Adapter 任务；BOSS 继续使用独立“BOSS采集”Chrome Extension + WebSocket 页面。
+
 - 同步页面版本号：
   - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.23`。
 

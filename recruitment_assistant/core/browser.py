@@ -50,14 +50,30 @@ def open_browser_session(
     context_kwargs = {
         "viewport": viewport or {"width": 1440, "height": 900},
         "accept_downloads": True,
+        "locale": "zh-CN",
+        "timezone_id": "Asia/Shanghai",
+        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     }
+    launch_kwargs = {
+        "headless": browser_headless,
+        "args": [
+            "--disable-blink-features=AutomationControlled",
+            "--disable-infobars",
+            "--no-default-browser-check",
+            "--no-first-run",
+        ],
+    }
+    try:
+        launch_kwargs["channel"] = "chrome"
+    except Exception:
+        pass
 
     if user_data_dir:
         user_data_dir.mkdir(parents=True, exist_ok=True)
         try:
             context = playwright.chromium.launch_persistent_context(
                 user_data_dir=str(user_data_dir),
-                headless=browser_headless,
+                **launch_kwargs,
                 **context_kwargs,
             )
             page = context.pages[0] if context.pages else context.new_page()
@@ -67,7 +83,7 @@ def open_browser_session(
             raise
 
     try:
-        browser = playwright.chromium.launch(headless=browser_headless)
+        browser = playwright.chromium.launch(**launch_kwargs)
         if state_path and state_path.exists():
             context_kwargs["storage_state"] = str(state_path)
         context = browser.new_context(**context_kwargs)

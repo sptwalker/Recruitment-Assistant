@@ -10,7 +10,7 @@ from recruitment_assistant.services.ws_server import BossWSServer
 
 st.set_page_config(page_title="BOSS采集", layout="wide", initial_sidebar_state="collapsed")
 inject_vibe_style("BOSS采集")
-page_header("BOSS直聘采集", "通过 Chrome 扩展在页面内自动采集附件简历，完全绕过反检测。")
+page_header("BOSS直聘采集（测试功能）", "通过 Chrome 扩展在页面内自动采集附件简历，完全绕过反检测。")
 
 st.markdown(
     """

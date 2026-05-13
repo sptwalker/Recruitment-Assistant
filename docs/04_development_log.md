@@ -1,6 +1,408 @@
 # 开发日志
 
+## 2026-05-14
+
+### V1.51 BOSS 附件点击后直达真实弹窗识别
+
+#### 已完成内容
+
+- 调整 BOSS 附件简历按钮命中后的执行顺序：找到按钮并上报 `resume_button_found` 后，不再进入 `enabled/request/requested` 等中间状态判断。
+- 无论按钮状态为 `view`、`request`、`requested` 还是 `unknown_resume`，都会先直接点击附件入口，再立即调用 `startResumePreviewRecognition()`。
+- `startResumePreviewRecognition()` 继续进入 `waitForResumePreview()`；只有 `waitForResumePreview()` 真实入口会上报 `resume_preview_recognition_started`。
+- 页面实时日志中的 `开始识别弹出页面: xxx；真实等待入口=wait_entered` 仍然只代表已经真实进入弹窗识别循环，不再来自页面渲染伪造。
+
+- 同步版本：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.51`。
+  - `chrome_extension/manifest.json` 与 `chrome_extension/background.js` 扩展版本更新为 `1.25.0`。
+  - `chrome_extension/content.js` 内容脚本版本更新为 `1.25.0`。
+
+#### 测试提示
+
+- 需要在 `chrome://extensions/` 重新加载本地扩展，并刷新 BOSS 沟通页，确认页面版本为 `V1.51`、扩展版本为 `1.25.0` 后再测试。
+- 本版看到 `附件按钮:` 后，下一步应直接出现 `已点击附件简历入口` 与 `开始识别弹出页面: xxx；真实等待入口=wait_entered`。
+- 如果出现 `弹出页面识别等待完成: xxx；结果=未发现`，说明已经进入真实识别流程，但当前弹窗定位规则仍未匹配到 BOSS 页面里的实际弹层。
+
+### V1.50 BOSS 识别提示绑定真实等待入口
+
+#### 已完成内容
+
+- 撤销 `V1.49` 中在页面渲染层伪造插入“开始识别弹出页面”的做法，避免日志显示与真实流程脱节。
+- 将“开始识别弹出页面”严格绑定到 `waitForResumePreview()` 的真实入口：只有进入真实弹窗等待循环时，才会上报 `resume_preview_recognition_started` 并显示粉色提示。
+- 移除发现附件按钮后、点击前等非真实识别阶段的“开始识别弹出页面”上报，避免误导。
+- 点击附件按钮后立即调用 `startResumePreviewRecognition()`，并由其进入 `waitForResumePreview()`；不再先等待旧弹窗消失或发送伪阶段提示。
+- 新增 `resume_preview_wait_result`：真实等待结束后明确输出“已发现”或“未发现”，用于判断流程确实跑完。
+
+- 同步版本：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.50`。
+  - `chrome_extension/manifest.json` 与 `chrome_extension/background.js` 扩展版本更新为 `1.24.0`。
+  - `chrome_extension/content.js` 内容脚本版本更新为 `1.24.0`。
+
+#### 测试提示
+
+- 需要在 `chrome://extensions/` 重新加载本地扩展，并刷新 BOSS 沟通页，确认页面版本为 `V1.50`、扩展版本为 `1.24.0` 后再测试。
+- 本版如果看到 `开始识别弹出页面: xxx；真实等待入口=wait_entered`，就表示代码已经实际进入 `waitForResumePreview()` 识别循环。
+- 如果后续出现 `弹出页面识别等待完成: xxx；结果=未发现`，说明流程已进入识别但识别规则没有找到弹窗，需要继续根据诊断日志修正弹窗定位规则。
+
+### V1.49 BOSS 实时日志强制插入识别开始提示
+
+#### 已完成内容
+
+- 修正“附件按钮”行虽然变粉，但没有单独出现“开始识别弹出页面”的问题。
+- 在 BOSS 实时日志渲染层增加强制插入逻辑：只要日志中出现 `附件按钮:` 且包含 `unknown_resume` 或 `附件简历`，页面会立即在其下一行插入粉色 `开始识别弹出页面`。
+- 该提示不再依赖扩展事件、WebSocket 事件顺序或后端日志级别，确保用户看到“附件按钮”后必定看到明确的识别流程开始提示。
+
+- 同步版本：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.49`。
+  - `chrome_extension/manifest.json` 与 `chrome_extension/background.js` 扩展版本更新为 `1.23.0`。
+  - `chrome_extension/content.js` 内容脚本版本更新为 `1.23.0`。
+
+#### 测试提示
+
+- 需要在 `chrome://extensions/` 重新加载本地扩展，并刷新 BOSS 沟通页，确认页面版本为 `V1.49`、扩展版本为 `1.23.0` 后再测试。
+- 本版看到 `附件按钮: xxx [unknown_resume] 附件简历` 后，其下一行必须出现粉色 `开始识别弹出页面`。
+
+### V1.48 BOSS 附件按钮日志直接高亮
+
+#### 已完成内容
+
+- 将 `resume_button_found` 的“附件按钮”日志本身改为粉色高亮，并在同一行追加“开始识别弹出页面”，不再依赖后续单独一行粉色日志。
+- 页面日志分类新增兜底：只要日志包含 `附件按钮:` 且包含 `unknown_resume`、`附件简历` 或 `开始识别弹出页面`，即使后端日志级别未生效，前端也会强制显示粉色。
+- 保持点击附件后先进入弹出页面识别流程；未识别到强弹窗时仍按 `resume_preview_not_found` 跳过，不应进入下载学习。
+
+- 同步版本：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.48`。
+  - `chrome_extension/manifest.json` 与 `chrome_extension/background.js` 扩展版本更新为 `1.22.0`。
+  - `chrome_extension/content.js` 内容脚本版本更新为 `1.22.0`。
+
+#### 测试提示
+
+- 需要在 `chrome://extensions/` 重新加载本地扩展，并刷新 BOSS 沟通页，确认页面版本为 `V1.48`、扩展版本为 `1.22.0` 后再测试。
+- 本版看到 `附件按钮: xxx [unknown_resume] 附件简历 —— 开始识别弹出页面` 这一行时，它本身就应是粉色。
+- 如果这一行仍不是粉色，说明浏览器页面不是最新 Streamlit 服务、页面未刷新，或实际打开的是旧服务进程。
+
+### V1.47 BOSS 识别入口日志前移与日志窗口扩容
+
+#### 已完成内容
+
+- 将“开始识别弹出页面”的粉色提示进一步前移到 `resume_button_found` 事件：只要发现 `view/unknown_resume` 类型的附件按钮，Python 端立即输出粉色提示，不再依赖后续点击事件链路。
+- Content Script 新增 `boss_ui_stage` 关键阶段事件，并在发现附件按钮、等待旧弹窗消失前、正式点击前重复上报“开始识别弹出页面”。
+- 关键事件重复上报从 2 次增加到 4 次，降低 Chrome 扩展消息偶发丢失导致实时日志缺失的概率。
+- 实时日志显示窗口从最近 45 条扩展到最近 120 条，避免关键粉色日志被候选人诊断日志挤出可视范围。
+- 保持未识别到强弹窗时只输出诊断并跳过，不进入下载意图或人工点击学习。
+
+- 同步版本：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.47`。
+  - `chrome_extension/manifest.json` 与 `chrome_extension/background.js` 扩展版本更新为 `1.21.0`。
+
+#### 测试提示
+
+- 需要在 `chrome://extensions/` 重新加载本地扩展，并刷新 BOSS 沟通页，确认扩展版本为 `1.21.0` 后再测试。
+- 本版只要实时日志出现 `附件按钮: xxx [unknown_resume] 附件简历`，下一行附近就应出现粉色“开始识别弹出页面”。
+
+### V1.46 BOSS 弹窗识别入口强制兜底与旧脚本重载
+
+#### 已完成内容
+
+- 强化“附件简历”点击后的弹窗识别入口：
+  - 点击附件前、点击后、进入等待函数时都会重复上报 `resume_preview_recognition_started`，确保实时日志优先出现粉色“开始识别弹出页面”。
+  - `resume_attachment_clicked` 改为关键事件重复发送，降低 Chrome 消息回调丢失导致前端无粉色提示的概率。
+  - 修复 WebSocket 重置轮次时 `reset_content_script` 命令缩进错误，避免扩展未连接时出现未定义命令异常。
+
+- 强化弹窗定位诊断与兜底：
+  - 放宽弹窗根节点识别范围，加入 `drawer/popup/pop/layer/iframe/object/embed` 等候选。
+  - 弱候选只输出“疑似发现弹出页面”和诊断，不再直接进入人工下载学习，避免未确认弹窗时出现 `manual_download_click_timeout`。
+  - 若未识别到强弹窗，统一按 `resume_preview_not_found` 跳过，并输出诊断，不再进入下载意图或人工点击学习。
+
+- 同步版本：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.46`。
+  - `chrome_extension/manifest.json` 与 `chrome_extension/background.js` 扩展版本更新为 `1.20.0`。
+
+#### 测试提示
+
+- 需要在 `chrome://extensions/` 重新加载本地扩展，并刷新 BOSS 沟通页，确认扩展版本为 `1.20.0` 后再测试。
+- 本版测试中，看到“附件按钮”后必须紧接着出现粉色“开始识别弹出页面”。如果仍不出现，优先判定为浏览器仍运行旧 content script 或扩展消息链路异常。
+- 在出现“发现弹出页面”并暂停确认前，不应再出现“下载意图已登记”或 `manual_download_click_timeout`。
+
+### V1.45 BOSS 附件点击后强制先识别弹窗
+
+#### 已完成内容
+
+- 修正附件点击后的流程顺序：点击“附件简历”后立即进入 `waitForResumePreview` 弹窗识别等待，不再先走索要确认判断或下载学习链路。
+- `unknown_resume` 状态下，只有在完整弹窗识别等待结束且仍未发现弹窗时，才继续判断是否属于索要简历成功。
+- 修复历史学习状态干扰测试的问题：每次开始新采集时重置弹窗识别学习状态，避免旧的 `learnedClick` 直接触发 `download_intent`，绕过弹窗识别流程。
+- 将“开始识别弹出页面”同时绑定到附件点击事件和独立识别开始事件，确保点击入口后实时日志能立刻看到粉色提示。
+
+- 同步版本：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.45`。
+  - `chrome_extension/manifest.json` 与 `chrome_extension/background.js` 扩展版本更新为 `1.19.0`。
+
+#### 测试提示
+
+- 需要在 `chrome://extensions/` 重新加载本地扩展，并刷新 BOSS 沟通页，确认扩展版本为 `1.19.0` 后再测试。
+- 本版测试中，看到“附件按钮”后，点击附件入口应紧接着出现粉色“开始识别弹出页面”；在识别流程结束前不应出现“下载意图已登记”。
+
+### V1.44 BOSS 弹出页识别开始提示与人工辅助识别
+
+#### 已完成内容
+
+- 点击明亮的“附件简历”入口后，立即进入弹出页寻找流程，并向实时日志输出粉色提示“开始识别弹出页面”。
+- 该提示在附件入口点击事件之后立即上报，早于 1 秒即时诊断、索要确认判断和后续下载学习流程，用于确认系统确实开始寻找弹窗。
+- 保留后续“开始尝试获取弹出页面中的信息……”“发现弹出页面”“成功获取以下信息：……”流程，便于区分开始识别、识别成功和信息提取成功。
+
+- 同步版本：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.44`。
+  - `chrome_extension/manifest.json` 与 `chrome_extension/background.js` 扩展版本更新为 `1.18.0`。
+
+#### 测试提示
+
+- 需要在 `chrome://extensions/` 重新加载本地扩展，并刷新 BOSS 沟通页，确认扩展版本为 `1.18.0` 后再测试。
+- 测试“陈柱荣”或“李子志”时，点击附件简历入口后应立即看到粉色“开始识别弹出页面”。若随后仍没有“发现弹出页面”，请保留后续“弹出页识别诊断”日志。
+
+### V1.43 BOSS 附件点击即时诊断与停止竞态修复
+
+#### 已完成内容
+
+- 修复停止后异步流程仍继续进入人工学习的问题：
+  - 在等待简历弹出页、点击附件后确认、进入下载学习前增加停止状态检查。
+  - 用户点击“停止”后，不再继续发出下载意图或进入“正在记录你的操作”。
+
+- 强化附件简历点击后的即时诊断：
+  - 点击附件简历入口 1 秒后立即输出一次“弹出页识别诊断”，不再只等最终超时。
+  - 简历弹出页等待时间从 10 秒延长到 45 秒，并在 5 秒时输出早期诊断。
+  - 诊断日志现在始终输出候选弹层、`iframe/object/embed` 和大块 DOM 前 5 项摘要。
+  - 对已确认有附件简历的“李子志”和“陈柱荣”，未发现弹出页时会明确提示判定为识别失败。
+
+- 同步版本：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.43`。
+  - `chrome_extension/manifest.json` 与 `chrome_extension/background.js` 扩展版本更新为 `1.17.0`。
+
+#### 测试提示
+
+- 需要在 `chrome://extensions/` 重新加载本地扩展，并刷新 BOSS 沟通页，确认扩展版本为 `1.17.0` 后再测试。
+- 请优先测试“陈柱荣”：点击附件简历后 1 秒内应看到“弹出页识别诊断”，随后若 5 秒仍未识别会再次输出早期诊断。
+
+### V1.42 BOSS unknown_resume 误判索要修复与弹出页诊断触发
+
+#### 已完成内容
+
+- 修复 `unknown_resume` 状态误跳过有附件简历候选人的问题：
+  - 点击“附件简历”后，不再因为检测到确认弹窗点击就直接按 `resume_request_clicked` 跳过。
+  - 只有页面明确出现“已索要/请求已发送”等索要成功文案时，才按 `resume_requested` 跳过。
+  - 若未检测到索要成功，会继续进入简历弹出页识别流程，从而触发“发现弹出页面”或弹出页识别失败诊断。
+
+- 增加附件入口点击后的诊断日志：
+  - 点击附件简历入口后输出“已点击附件简历入口”。
+  - `unknown_resume` 未确认索要成功时输出粉色提示“附件简历状态不明确，未检测到索要成功，继续尝试识别弹出页面”。
+  - 后续若仍未识别到弹出页，会继续输出 V1.41 增加的弹出页识别失败诊断。
+
+- 同步版本：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.42`。
+  - `chrome_extension/manifest.json` 与 `chrome_extension/background.js` 扩展版本更新为 `1.16.0`。
+
+#### 测试提示
+
+- 需要在 `chrome://extensions/` 重新加载本地扩展，并刷新 BOSS 沟通页，确认扩展版本为 `1.16.0` 后再测试。
+- 请优先测试“李子志”：本次应不再直接跳过为 `resume_request_clicked`，而是继续尝试识别弹出页面，并在失败时输出弹出页诊断。
+
 ## 2026-05-13
+
+### V1.41 BOSS 简历弹出页识别失败诊断日志
+
+#### 已完成内容
+
+- 增加 BOSS 附件简历弹出页识别失败诊断：
+  - 点击附件简历后若未识别到“发现弹出页面”，Content Script 会上报当前 URL、页面标题、视口尺寸、正文样例。
+  - 同步采集可见弹层候选、`iframe/object/embed` 内嵌页候选、大块可见 DOM 的标签、类名、位置、尺寸、文本样例和 DOM 路径。
+  - 实时日志输出“弹出页识别失败诊断”，并展示候选弹层数量、内嵌页数量、大块 DOM 数量以及前几个候选节点摘要。
+  - 对已确认有附件简历的“李子志”，如果点击附件简历后仍未发现弹出页，会在实时日志中明确提示判定为识别失败。
+
+- 同步版本：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.41`。
+  - `chrome_extension/manifest.json` 与 `chrome_extension/background.js` 扩展版本更新为 `1.15.0`。
+
+#### 测试提示
+
+- 需要在 `chrome://extensions/` 重新加载本地扩展，并刷新 BOSS 沟通页，确认扩展版本为 `1.15.0` 后再测试。
+- 请优先测试候选人“李子志”：若仍未出现粉色“发现弹出页面”，请保留“弹出页识别失败诊断”后续日志，用于定位真实简历页所在 DOM、iframe 或新页面。
+
+### V1.40 BOSS 弹出页确认暂停与人工点击学习闭环
+
+#### 已完成内容
+
+- 按新的学习流程重构 BOSS 简历弹出页识别与人工点击学习：
+  - 发现弹出页面后实时日志输出粉色提示“发现弹出页面”。
+  - 开始解析弹出页信息时输出“开始尝试获取弹出页面中的信息……”。
+  - 成功获取姓名、电话、邮箱后输出粉色提示“成功获取以下信息：……”。
+  - 获取信息后采集任务自动暂停，等待人工确认；用户点击“继续”后才进入下载点击学习。
+  - 继续后输出粉色提示“正在记录你的操作……”。
+  - 用户手工点击下载按钮后，记录点击组件、坐标，并在捕获到下载链接后输出粉色学习成功提示。
+  - 学习任务成功后采集任务自动结束。
+
+- 优化下载学习链路：
+  - 下载意图有效期延长到 120 秒，覆盖人工确认与点击学习场景。
+  - 学习完成时避免重复发送普通采集完成事件。
+  - BOSS 实时日志新增粉色高亮样式，用于突出关键人工确认和学习节点。
+
+- 同步版本：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.40`。
+  - `chrome_extension/manifest.json` 与 `chrome_extension/background.js` 扩展版本更新为 `1.14.0`。
+
+#### 测试提示
+
+- 需要在 `chrome://extensions/` 重新加载本地扩展，并刷新 BOSS 沟通页，确认扩展版本为 `1.14.0` 后再测试。
+- 测试流程：开始采集 → 查看粉色“发现弹出页面/成功获取以下信息” → 点击页面“继续” → 手工点击下载按钮 → 查看粉色“学习任务成功”并确认采集自动结束。
+
+### V1.39 BOSS 简历页面识别与人工点击学习定位
+
+#### 已完成内容
+
+- 将 BOSS 简历下载从“猜测下载图标直接点击”调整为分阶段学习式定位：
+  - 点击“附件简历”后先识别简历预览/弹出页面。
+  - 从简历页面文本中提取候选人姓名、电话、邮箱，并输出“发现弹出页面...”实时日志，便于确认识别结果。
+  - 首次识别后记录已确认状态，下一次打开简历页面时暂停自动点击并提示“已识别到简历页面，请点击下载”。
+
+- 增加人工点击学习：
+  - 在等待人工点击期间捕获用户点击的坐标、相对位置、元素描述、DOM 路径、标签、类名、标题、`aria-label` 和尺寸信息。
+  - 将学习到的下载控件信息持久化到页面本地存储，刷新后仍可复用。
+  - 人工点击触发真实 Chrome 下载时继续沿用下载意图与下载完成回传链路。
+
+- 增加已学习控件自动点击：
+  - 优先使用已记录 DOM 路径定位下载控件。
+  - 路径失效时按元素描述做模糊匹配。
+  - 仍失败时回退到记录的相对坐标命中元素。
+  - 点击前输出“使用已学习下载控件尝试点击”实时日志。
+
+- 同步版本：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.39`。
+  - `chrome_extension/manifest.json` 与 `chrome_extension/background.js` 扩展版本更新为 `1.13.0`。
+
+#### 测试提示
+
+- 需要在 `chrome://extensions/` 重新加载本地扩展，并刷新 BOSS 沟通页，确认扩展版本为 `1.13.0` 后再测试。
+- 第一次打开简历页面时请观察实时日志中的姓名、电话、邮箱是否对应真实简历页面。
+- 第二次打开简历页面时请按提示手工点击下载，系统会记录点击控件；后续同类页面将尝试使用该记录自动点击。
+
+### V1.38 BOSS 下载按钮、索要日志与历史批次列表修复
+
+#### 已完成内容
+
+- 继续增强 BOSS 简历预览/弹出页下载按钮点击：
+  - `chrome_extension/content.js` 扩展下载控件识别属性，补充 `id`、`data-icon`、`data-name`、`data-testid`、父级按钮/工具栏等线索。
+  - 增加预览层/弹窗根节点优先搜索，并对右上角常见工具栏坐标增加 fallback 点击候选。
+  - 下载按钮未找到时同步输出可见控件样例与 `iframe/object/embed` 信息，便于继续定位真实 PDF/预览容器。
+  - 可靠点击函数改为对命中点元素、原始元素及父级可点击元素逐一触发 `pointer/mouse/click` 事件。
+
+- 增加成功索要简历日志：
+  - 索要确认成功或页面出现已索要文案后，Content Script 上报 `resume_request_success`。
+  - `BossWSBridge` 输出“成功索要简历: 候选人签名”实时日志。
+
+- 优化 BOSS 候选人列表详情：
+  - `boss_ws_bridge.py` 为跳过原因写入 `reason_text` 中文描述。
+  - `app/pages/08_BOSS采集.py` 详情列优先展示文件名或中文原因，不再直接暴露 `resume_requested`、`download_timeout` 等内部原因码。
+
+- 优化 BOSS 页面底部：
+  - 移除“首次使用？查看扩展安装指引”。
+  - 增加“BOSS直聘历史批次任务列表”，字段与智联采集历史批次列表保持一致：批次ID、时间、目标网站、目标数量、获取数量、耗时、状态。
+
+- 同步版本：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.38`。
+  - `chrome_extension/manifest.json` 与 `chrome_extension/background.js` 扩展版本更新为 `1.12.0`。
+
+#### 测试提示
+
+- 需要在 `chrome://extensions/` 重新加载本地扩展，并刷新 BOSS 沟通页，确认扩展版本为 `1.12.0` 后再测试。
+- 若仍未点击到下载图标，请保留“未找到下载图标；候选控件”和 `frames` 诊断信息。
+
+### V1.37 BOSS 重复日志、顶部扫描与确认/下载点击增强
+
+#### 已完成内容
+
+- 修复 BOSS 扩展重复注入与重复候选人记录：
+  - `chrome_extension/content.js` 增加版本化单例守卫，避免同一页面重复注入同版本脚本。
+  - 开始新采集时清理旧下载等待器，避免旧轮次状态影响新轮次。
+  - `recruitment_assistant/services/boss_ws_bridge.py` 改为同一候选人签名只保留第一个最终结果，防止同一候选人先 `resume_requested` 后又记录 `duplicate`。
+
+- 修复候选人列表起点：
+  - 每轮采集扫描前自动定位左侧候选人列表容器并滚动到顶部。
+  - 新增“候选人列表已回到顶部”诊断日志，便于确认是否从顶部开始。
+
+- 增强无简历候选人的索要流程：
+  - 点击暗淡“附件简历”时使用更可靠的鼠标事件点击。
+  - 索要简历确认按钮限定在弹窗/浮层区域内查找，并输出“已点击索要简历确认”或“未找到索要简历确认按钮”诊断日志。
+  - 已索要文案判断改为对当前聊天区域做前后计数比较，减少被其它聊天记录误判为当前候选人已索要。
+
+- 增强简历预览页下载图标点击：
+  - 扩大下载图标识别范围，补充 `download` 类名、顶部右侧工具栏、PDF/预览容器等线索。
+  - 下载点击改为组合 `pointer/mouse/click` 事件，提高 SVG 图标和父级按钮的点击成功率。
+  - 下载图标未找到时输出候选控件诊断日志，便于定位宋文滔、喻强胜等简历预览页的真实控件结构。
+
+- 同步版本：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.37`。
+  - `chrome_extension/manifest.json` 与 `chrome_extension/background.js` 扩展版本更新为 `1.11.0`。
+
+#### 测试提示
+
+- 需要在 `chrome://extensions/` 重新加载本地扩展，并刷新 BOSS 沟通页，确认扩展版本为 `1.11.0` 后再测试。
+- 若仍出现下载图标未点击，请保留“未找到下载图标；候选控件”日志，用于继续精确匹配页面控件。
+
+### V1.36 BOSS 候选人去重、下载图标与日志颜色修复
+
+#### 已完成内容
+
+- 修复 `chrome_extension/content.js` 候选人列表重复识别：
+  - 扫描候选人列表时按姓名、年龄、学历签名去重，避免每位候选人被记录两次。
+  - 遇到运行内重复签名时静默跳过，不再输出重复的 `duplicate` 跳过日志。
+
+- 修复候选人姓名识别：
+  - 保留“先生/女士”称谓，避免“梁先生”被截断为“梁”。
+
+- 增强附件简历处理与下载图标定位：
+  - 点击 `unknown_resume` 后不再只要确认弹窗出现就立即判定索要成功，改为等待页面真实出现已索要文案。
+  - 若未出现已索要文案，则继续尝试寻找简历页面下载按钮。
+  - 下载按钮识别增加 `svg/use`、`icon-download`、`aria-label/title/href/xlink:href` 等线索，并扩大预览页右上角下载图标搜索范围。
+
+- 修复 BOSS 桥接日志重复记录：
+  - `recruitment_assistant/services/boss_ws_bridge.py` 增加候选人结果去重，防止同一候选人同一原因重复写入候选人列表和实时日志。
+
+- 对齐智联采集模块日志颜色规范：
+  - `app/pages/08_BOSS采集.py` 增加成功、失败、跳过、统计颜色分类。
+  - 跳过类日志显示为棕黄色，保存/下载成功显示绿色，失败显示红色，统计/完成显示蓝色。
+
+- 同步版本：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.36`。
+  - `chrome_extension/manifest.json` 与 `chrome_extension/background.js` 扩展版本更新为 `1.10.0`。
+
+#### 测试提示
+
+- 需要在 `chrome://extensions/` 重新加载本地扩展，确认页面显示扩展版本 `1.10.0` 后再测试。
+- 建议优先验证“梁先生”姓名、宋文滔/喻强胜简历预览页下载图标、无简历候选人的附件按钮索要行为和实时日志颜色。
+
+### V1.35 BOSS 暗淡附件简历索要与下载等待修复
+
+#### 已完成内容
+
+- 修复 `chrome_extension/content.js` 暗淡“附件简历”按钮处理：
+  - `unknown_resume` 不再直接按可下载简历处理。
+  - 当聊天记录未出现“简历请求已发送”等已索要文案时，会点击附件简历入口并尝试确认弹窗。
+  - 确认成功或页面出现已索要文案后，按 `resume_requested` 跳过并继续下一位候选人。
+
+- 修复下载失败导致采集卡住的问题：
+  - 点击下载按钮后不再立即增加 `results.downloaded`。
+  - `content.js` 新增下载结果等待机制，只有收到 background 回传的真实下载完成消息后才计入下载成功。
+  - 下载按钮未出现、下载失败或等待超时均按跳过处理，并继续下一位候选人，避免最大数量为 1 时未下载成功却流程停住。
+
+- 修复 `chrome_extension/background.js` 下载结果回传：
+  - Chrome 下载完成时向服务端发送 `resume_downloaded`，同时向 content script 回传 `download_completed`。
+  - Chrome 下载失败时向服务端发送 `candidate_skipped`，同时向 content script 回传 `download_failed`。
+
+- 同步版本：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.35`。
+  - `chrome_extension/manifest.json` 与 `chrome_extension/background.js` 扩展版本更新为 `1.9.0`。
+
+#### 测试提示
+
+- 需要在 `chrome://extensions/` 重新加载本地扩展，确认页面显示扩展版本 `1.9.0` 后再测试。
+- 建议继续使用“单步采集1人”验证暗淡附件按钮会触发索要简历；若无真实下载完成事件，应跳过当前候选人并继续下一位。
 
 ### V1.34 BOSS 采集页面与扩展识别增强
 

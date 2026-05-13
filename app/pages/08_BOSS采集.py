@@ -6,7 +6,9 @@ import streamlit as st
 
 from components.layout import inject_vibe_style, page_header
 from recruitment_assistant.services.boss_ws_bridge import BossWSBridge
+from recruitment_assistant.services.crawl_task_service import CrawlTaskService
 from recruitment_assistant.services.ws_server import BossWSServer
+from recruitment_assistant.storage.db import create_session
 
 st.set_page_config(page_title="BOSS采集", layout="wide", initial_sidebar_state="collapsed")
 inject_vibe_style("BOSS采集")
@@ -40,13 +42,103 @@ st.markdown(
 .boss-checklist { margin:0 0 0 18px; padding:0; }
 .boss-checklist li { margin:4px 0; line-height:1.38; font-size:12px; }
 .boss-log-box { height:300px; overflow-y:auto; background:#fff; border:1px solid #E5EAF2; border-radius:12px; padding:9px 10px; font-family:Consolas,monospace; font-size:12px; line-height:1.42; white-space:pre-wrap; }
+.boss-log-highlight { color:#E85D9E; font-weight:900; font-size:14px; }
 .boss-log-info { color:#1F2937; font-size:13px; }
+.boss-log-success { color:#168A45; font-weight:700; font-size:13px; }
 .boss-log-error { color:#C73552; font-weight:700; font-size:13px; }
+.boss-log-skipped { color:#B7791F; font-weight:700; font-size:13px; }
+.boss-log-stat { color:#2563EB; font-weight:700; font-size:13px; }
+.plain-section-title { display:flex; align-items:center; justify-content:space-between; gap:12px; margin:18px 0 10px; }
+.plain-section-title h3 { margin:0; font-size:18px; line-height:1.3; color:#1F2937; }
+.collect-panel-stat { color:#4A90E2; font-size:14px; font-weight:700; white-space:nowrap; }
 [data-testid="stCaptionContainer"] { font-size:12px !important; }
 </style>
 """,
     unsafe_allow_html=True,
 )
+
+
+
+
+def classify_boss_log(message: str, level: str = "info") -> str:
+    if level == "highlight" or any(token in message for token in ["发现弹出页面", "成功获取以下信息", "正在记录你的操作", "成功记录到你的点击操作", "学习任务已完成"]):
+        return "boss-log-highlight"
+    if "附件按钮:" in message and ("unknown_resume" in message or "附件简历" in message or "开始识别弹出页面" in message):
+        return "boss-log-highlight"
+    if level == "error" or any(token in message for token in ["失败", "错误", "断开"]):
+        return "boss-log-error"
+    if any(token in message for token in ["跳过", "duplicate", "已索要", "索要简历", "resume_requested", "resume_request_clicked"]):
+        return "boss-log-skipped"
+    if any(token in message for token in ["保存", "已下载", "下载完成"]):
+        return "boss-log-success"
+    if any(token in message for token in ["统计", "采集完成", "扫描完成"]):
+        return "boss-log-stat"
+    return "boss-log-info"
+
+
+def translate_boss_detail(value: str) -> str:
+    if not value:
+        return ""
+    if value.startswith("button_disabled:"):
+        state = value.split(":", 1)[1] or "未知状态"
+        return f"附件简历按钮不可用（{state}）"
+    if value.startswith("download_error:"):
+        error = value.split(":", 1)[1] or "未知错误"
+        return f"下载失败（{error}）"
+    mapping = {
+        "resume_requested": "已成功索要简历，等待候选人上传",
+        "resume_request_clicked": "已点击索要简历，等待确认结果",
+        "resume_request_already_sent": "简历请求已发送，等待候选人上传",
+        "resume_already_requested": "此前已索要简历，等待候选人上传",
+        "download_button_not_found": "未找到简历下载按钮",
+        "download_timeout": "下载等待超时",
+        "download_failed": "下载失败",
+        "no_resume_button": "未找到附件简历按钮",
+        "candidate_info_unrecognized": "候选人信息未识别",
+        "click_failed": "点击候选人失败",
+        "new_collect_started": "新采集任务已开始",
+        "collect_stopped": "采集已停止",
+        "unknown": "未知原因",
+    }
+    return mapping.get(value, value)
+
+
+def render_boss_history_task_table() -> None:
+    try:
+        with create_session() as session:
+            task_service = CrawlTaskService(session)
+            task_rows = task_service.list_tasks(limit=50, platform_code="boss")
+            success_task_count, success_resume_count = task_service.success_summary(platform_code="boss")
+    except Exception as exc:
+        st.warning(f"历史批次任务读取失败：{exc}")
+        task_rows = []
+        success_task_count = 0
+        success_resume_count = 0
+
+    st.markdown(
+        '<div class="plain-section-title"><h3>BOSS直聘历史批次任务列表</h3><div class="collect-panel-stat">已成功执行{}次任务，共获取了{}份简历。</div></div>'.format(
+            success_task_count,
+            success_resume_count,
+        ),
+        unsafe_allow_html=True,
+    )
+    st.dataframe(
+        [
+            {
+                "批次ID": row.id,
+                "时间": row.started_at,
+                "目标网站": "BOSS直聘",
+                "目标数量": row.planned_count,
+                "获取数量": row.success_count,
+                "耗时": f"{int((row.finished_at - row.started_at).total_seconds())}秒" if row.started_at and row.finished_at else "运行中",
+                "状态": row.status,
+            }
+            for row in task_rows
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
+
 
 
 def section_title(title: str) -> None:
@@ -152,11 +244,12 @@ with st.container(border=True):
         logs = runtime.get("logs", [])
         if logs:
             log_html = ""
-            for entry in logs[-45:]:
+            for entry in logs[-120:]:
                 level = entry.get("level", "info")
-                css_class = "boss-log-error" if level == "error" else "boss-log-info"
-                msg = html.escape(entry.get("message", ""))
+                raw_msg = entry.get("message", "")
+                msg = html.escape(raw_msg)
                 at = html.escape(entry.get("at", ""))
+                css_class = classify_boss_log(raw_msg, level)
                 log_html += f'<div class="{css_class}">[{at}] {msg}</div>'
             st.markdown(f'<div class="boss-log-box">{log_html}</div>', unsafe_allow_html=True)
         else:
@@ -175,32 +268,16 @@ with st.container(border=True):
                     "年龄": parts[1] if len(parts) > 1 else "",
                     "学历": parts[2] if len(parts) > 2 else "",
                     "状态": "已下载" if "download" in c.get("status", "") else "已跳过",
-                    "详情": c.get("file", "") or c.get("reason", ""),
+                    "详情": c.get("file", "") or c.get("reason_text", "") or translate_boss_detail(c.get("reason", "")),
                     "时间": c.get("at", ""),
                 })
             st.dataframe(rows, use_container_width=True, hide_index=True, height=300)
         else:
             st.markdown('<div class="boss-log-box"><span style="color:#94A3B8">暂无候选人。采集后会自动出现在这里。</span></div>', unsafe_allow_html=True)
 
-# --- Setup Guide ---
-with st.expander("首次使用？查看扩展安装指引"):
-    st.markdown("""
-### 安装 Chrome 扩展
-
-1. 打开 Chrome，访问 `chrome://extensions/`
-2. 开启右上角「开发者模式」
-3. 点击「加载已解压的扩展程序」
-4. 选择项目目录下的 `chrome_extension/` 文件夹
-5. 扩展安装完成后，打开 Boss直聘沟通页面
-6. 扩展会自动连接本页面的 WebSocket 服务
-
-### 使用流程
-
-1. 确保本页面已打开（WebSocket 服务随页面启动）
-2. 在 Chrome 中打开 `https://www.zhipin.com/web/chat/index`
-3. 确认上方显示「扩展已连接」和「Boss页面就绪」
-4. 配置采集参数后点击「开始采集」
-""")
+# --- History Tasks ---
+if not is_running:
+    render_boss_history_task_table()
 
 # Auto-refresh when collecting
 if is_running:

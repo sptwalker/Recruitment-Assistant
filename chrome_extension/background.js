@@ -1,5 +1,5 @@
 const WS_URL = "ws://127.0.0.1:8765";
-const EXTENSION_VERSION = "1.8.0";
+const EXTENSION_VERSION = "1.25.0";
 const HEARTBEAT_INTERVAL_MS = 15000;
 let ws = null;
 let heartbeatTimer = null;
@@ -58,6 +58,9 @@ function handleServerCommand(msg) {
     case "stop_collect":
       collectState = "idle";
       sendToContentScript({ type: "stop_collect", run_id: activeRunId });
+      break;
+    case "reset_content_script":
+      sendToContentScript({ type: "reset_content_script", run_id: activeRunId });
       break;
     case "probe_page":
       sendToContentScript({ type: "probe_page", run_id: activeRunId });
@@ -140,8 +143,16 @@ function rememberDownloadIntent(data) {
 
 function getFreshDownloadIntent() {
   if (!lastDownloadIntent) return null;
-  if (Date.now() - lastDownloadIntent.at > 30000) return null;
+  if (Date.now() - lastDownloadIntent.at > 120000) return null;
   return lastDownloadIntent;
+}
+
+function notifyDownloadResult(type, data) {
+  chrome.tabs.query({ url: bossChatUrlPatterns() }, (tabs) => {
+    for (const tab of tabs.filter((tab) => isBossCandidatePage(tab.url || ""))) {
+      chrome.tabs.sendMessage(tab.id, { type, data }, () => {});
+    }
+  });
 }
 
 chrome.downloads.onCreated.addListener((item) => {
@@ -162,25 +173,23 @@ chrome.downloads.onChanged.addListener((delta) => {
     chrome.downloads.search({ id: delta.id }, (items) => {
       const item = items?.[0] || {};
       pendingDownloads.delete(delta.id);
-      sendToServer({
-        type: "resume_downloaded",
-        data: {
-          ...pending,
-          download_id: delta.id,
-          filename: item.filename || pending.filename || "",
-          download_path: item.filename || "",
-          url: item.url || "",
-          mime: item.mime || "",
-          file_size: item.fileSize || 0,
-        },
-      });
+      const data = {
+        ...pending,
+        download_id: delta.id,
+        filename: item.filename || pending.filename || "",
+        download_path: item.filename || "",
+        url: item.url || "",
+        mime: item.mime || "",
+        file_size: item.fileSize || 0,
+      };
+      sendToServer({ type: "resume_downloaded", data });
+      notifyDownloadResult("download_completed", data);
     });
   } else if (delta.error?.current) {
     pendingDownloads.delete(delta.id);
-    sendToServer({
-      type: "candidate_skipped",
-      data: { ...pending, reason: `download_error:${delta.error.current}` },
-    });
+    const data = { ...pending, reason: `download_error:${delta.error.current}` };
+    sendToServer({ type: "candidate_skipped", data });
+    notifyDownloadResult("download_failed", data);
   }
 });
 

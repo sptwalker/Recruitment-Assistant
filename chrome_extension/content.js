@@ -1,6 +1,12 @@
 (function () {
   "use strict";
 
+  const CONTENT_SCRIPT_VERSION = "1.25.0";
+  if (window.__bossResumeCollectorVersion === CONTENT_SCRIPT_VERSION) {
+    return;
+  }
+  window.__bossResumeCollectorVersion = CONTENT_SCRIPT_VERSION;
+
   const CANDIDATE_SELECTORS = [
     ".chat-list li",
     ".chat-list .item",
@@ -46,6 +52,23 @@
   let results = { downloaded: 0, skipped: 0, currentIndex: 0 };
   let pauseResolve = null;
   let activeRunId = "";
+  let collectFinishedEmitted = false;
+  const pendingDownloadWaiters = new Map();
+  const STORAGE_KEYS = {
+    learningStage: "boss_resume_learning_stage",
+    learnedClick: "boss_resume_download_learned_click",
+  };
+  const resumePreviewLearnState = {
+    learningStage: localStorage.getItem(STORAGE_KEYS.learningStage) || "detect_preview",
+    waitingManualClick: false,
+    learnedClick: null,
+  };
+  try {
+    const savedClick = localStorage.getItem(STORAGE_KEYS.learnedClick);
+    if (savedClick) resumePreviewLearnState.learnedClick = JSON.parse(savedClick);
+  } catch {
+    resumePreviewLearnState.learnedClick = null;
+  }
 
   function sleep(ms) {
     return new Promise((r) => setTimeout(r, ms));
@@ -57,7 +80,24 @@
 
   function emit(event) {
     const payload = { ...event, data: { ...(event.data || {}), run_id: activeRunId } };
-    chrome.runtime.sendMessage({ target: "background", event: payload });
+    try {
+      chrome.runtime.sendMessage({ target: "background", event: payload }, () => {
+        void chrome.runtime.lastError;
+      });
+    } catch {}
+  }
+
+  function emitCritical(event) {
+    emit(event);
+    try {
+      setTimeout(() => emit(event), 120);
+      setTimeout(() => emit(event), 600);
+      setTimeout(() => emit(event), 1500);
+    } catch {}
+  }
+
+  function emitUiStage(message, data = {}) {
+    emitCritical({ type: "boss_ui_stage", data: { message, ...data } });
   }
 
   function isAuthenticated() {
@@ -112,8 +152,36 @@
     return score;
   }
 
+  function candidateKeyFromText(text) {
+    const info = parseContactText(text);
+    if (info && (info.name !== "待识别" || info.age !== "待识别" || info.education !== "待识别")) {
+      return `${info.name}/${info.age}/${info.education}`;
+    }
+    return stripActivityText(text).replace(/\s+/g, " ").slice(0, 80);
+  }
+
+  function findBestListContainer() {
+    return LIST_CONTAINER_SELECTORS
+      .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
+      .filter((el) => isVisible(el) && isInLeftCandidateArea(el))
+      .map((el) => ({ el, score: el.scrollHeight - el.clientHeight + el.querySelectorAll("li, [class*='item'], [class*='card'], [class*='user']").length * 20 }))
+      .sort((a, b) => b.score - a.score)[0]?.el || null;
+  }
+
+  async function resetCandidateListScroll() {
+    const container = findBestListContainer();
+    if (container) {
+      container.scrollTop = 0;
+      container.dispatchEvent(new Event("scroll", { bubbles: true }));
+    }
+    window.scrollTo(0, 0);
+    await sleep(800);
+    emit({ type: "candidate_list_scroll_reset", data: { reset: Boolean(container), scroll_top: container?.scrollTop || 0 } });
+  }
+
   function getCandidateItems() {
     const seen = new Set();
+    const seenKeys = new Set();
     const items = [];
     const containers = LIST_CONTAINER_SELECTORS
       .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
@@ -125,7 +193,11 @@
         if (seen.has(el)) continue;
         seen.add(el);
         const score = scoreCandidateItem(el);
-        if (score >= 2) items.push({ el, score, top: el.getBoundingClientRect().top });
+        if (score < 2) continue;
+        const key = candidateKeyFromText(textOf(el));
+        if (!key || seenKeys.has(key)) continue;
+        seenKeys.add(key);
+        items.push({ el, score, top: el.getBoundingClientRect().top });
       }
       if (items.length > 0) break;
     }
@@ -136,7 +208,11 @@
           if (seen.has(el)) continue;
           seen.add(el);
           const score = scoreCandidateItem(el);
-          if (score >= 2) items.push({ el, score, top: el.getBoundingClientRect().top });
+          if (score < 2) continue;
+          const key = candidateKeyFromText(textOf(el));
+          if (!key || seenKeys.has(key)) continue;
+          seenKeys.add(key);
+          items.push({ el, score, top: el.getBoundingClientRect().top });
         }
         if (items.length > 0) break;
       }
@@ -165,8 +241,9 @@
     const nameMatches = Array.from(beforeAge.matchAll(/[\u4e00-\u9fa5]{2,4}(?:先生|女士)?/g)).map((m) => m[0]);
     const blacklist = new Set(["沟通", "在线", "附件简历", "交换微信", "常用语", "招聘者", "职位管理", "推荐牛人", "搜索", "刚刚", "刚刚活跃", "今日", "今日活跃", "昨日", "昨日活跃", "活跃"]);
     for (let i = nameMatches.length - 1; i >= 0; i--) {
-      const value = nameMatches[i].replace(/先生|女士/g, "");
-      if (!blacklist.has(value)) {
+      const value = nameMatches[i];
+      const baseValue = value.replace(/先生|女士/g, "");
+      if (!blacklist.has(value) && !blacklist.has(baseValue)) {
         name = value;
         break;
       }
@@ -212,8 +289,23 @@
     return { name: "待识别", age: "待识别", education: "待识别", raw_text: "" };
   }
 
-  function hasResumeRequestSent() {
-    return (document.body?.innerText || "").includes("简历请求已发送");
+  function hasResumeRequestSent(scope = document) {
+    const text = scope?.innerText || scope?.textContent || "";
+    return RESUME_REQUESTED_TEXT.some((k) => text.includes(k));
+  }
+
+  function getChatDetailRoot() {
+    const candidates = Array.from(document.querySelectorAll("[class*='chat'], [class*='dialog'], [class*='conversation'], [class*='message'], [class*='content']"))
+      .filter((el) => isVisible(el))
+      .map((el) => ({ el, rect: el.getBoundingClientRect(), text: textOf(el) }))
+      .filter(({ rect, text }) => rect.left > window.innerWidth * 0.25 && rect.width > 240 && text.length > 20)
+      .sort((a, b) => b.rect.width * b.rect.height - a.rect.width * a.rect.height);
+    return candidates[0]?.el || document.body;
+  }
+
+  function getResumeRequestSentCount() {
+    const text = getChatDetailRoot()?.innerText || "";
+    return RESUME_REQUESTED_TEXT.reduce((sum, k) => sum + (text.split(k).length - 1), 0);
   }
 
   function classifyResumeButtonText(text) {
@@ -259,52 +351,638 @@
     return matches[0] || null;
   }
 
-  async function confirmRequestIfNeeded() {
-    await sleep(500);
-    const nodes = document.querySelectorAll("button, a, div, span");
-    for (const el of nodes) {
-      const text = textOf(el);
-      if (!/确定|确认|发送|索要/.test(text)) continue;
-      if (!isVisible(el) || isDisabled(el)) continue;
-      el.click();
-      return true;
+  async function waitForResumeRequestSent(timeoutMs = 1800, previousCount = null) {
+    const baseline = previousCount ?? getResumeRequestSentCount();
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const current = getResumeRequestSentCount();
+      if (current > baseline) return true;
+      await sleep(200);
     }
     return false;
   }
 
-  function findDownloadButton() {
-    const nodes = document.querySelectorAll("button, a, [role='button'], div, span, i, svg");
-    const keywords = ["下载附件", "下载简历", "下载", "download", "Download"];
-    for (const el of nodes) {
-      const text = `${textOf(el)} ${el.className || ""}`;
-      if (!keywords.some((k) => text.includes(k))) continue;
-      if (!isVisible(el) || isDisabled(el)) continue;
-      const areaText = textOf(el.closest("[class*='resume'], [class*='attachment'], [class*='dialog'], [class*='modal']") || el);
-      if (!/简历|附件|resume|download/i.test(`${text} ${areaText}`)) continue;
-      return el.closest("button, a, [role='button']") || el;
+  function clickElementReliably(el) {
+    if (!el) return false;
+    el.scrollIntoView?.({ block: "center", inline: "center" });
+    const rect = el.getBoundingClientRect();
+    const x = Math.max(1, Math.min(window.innerWidth - 1, rect.left + rect.width / 2));
+    const y = Math.max(1, Math.min(window.innerHeight - 1, rect.top + rect.height / 2));
+    const target = document.elementFromPoint(x, y) || el;
+    const clickTargets = Array.from(new Set([target, el, target.closest?.("button, a, [role='button'], [class*='btn'], [class*='icon'], [class*='download']"), el.closest?.("button, a, [role='button'], [class*='btn'], [class*='icon'], [class*='download']")].filter(Boolean)));
+    for (const node of clickTargets) {
+      for (const type of ["pointerover", "mouseover", "pointermove", "mousemove", "pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+        node.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, clientX: x, clientY: y, view: window }));
+      }
+      node.click?.();
     }
-
-    const topButtons = Array.from(document.querySelectorAll("button, a, [role='button'], i, svg"))
-      .filter((el) => isVisible(el) && !isDisabled(el))
-      .map((el) => {
-        const rect = el.getBoundingClientRect();
-        const text = `${textOf(el)} ${el.className || ""}`;
-        return { el: el.closest("button, a, [role='button']") || el, rect, text };
-      })
-      .filter(({ rect, text }) => rect.top >= 0 && rect.top <= 95 && rect.left > window.innerWidth * 0.6 && !/关闭|close|取消|×|✕/i.test(text));
-
-    topButtons.sort((a, b) => b.rect.left - a.rect.left);
-    return topButtons[0]?.el || null;
+    return true;
   }
 
-  async function waitForDownloadButton(timeoutMs = 6000) {
+  function clickPointReliably(x, y) {
+    const target = document.elementFromPoint(x, y);
+    if (!target) return false;
+    return clickElementReliably(target);
+  }
+
+  async function confirmRequestIfNeeded(candidateId = "", signature = "") {
+    await sleep(700);
+    const dialogs = Array.from(document.querySelectorAll("[class*='dialog'], [class*='modal'], [role='dialog'], [class*='pop'], [class*='confirm'], [class*='layer']"))
+      .filter((el) => isVisible(el))
+      .map((el) => ({ el, rect: el.getBoundingClientRect(), text: textOf(el) }))
+      .filter(({ text }) => /附件|简历|索要|发送|确认|确定/.test(text));
+    const roots = dialogs.length ? dialogs.map((x) => x.el) : [document.body];
+    const candidates = [];
+    for (const root of roots) {
+      const nodes = root.querySelectorAll("button, a, [role='button'], div, span");
+      for (const el of nodes) {
+        const text = textOf(el);
+        if (!/确定|确认|发送|索要/.test(text)) continue;
+        if (!isVisible(el) || isDisabled(el)) continue;
+        const rect = el.getBoundingClientRect();
+        if (rect.top < 60 || rect.width < 20 || rect.height < 18) continue;
+        const areaText = textOf(el.closest("[class*='dialog'], [class*='modal'], [role='dialog'], [class*='pop'], [class*='confirm'], [class*='layer']") || root);
+        let score = 0;
+        if (/附件|简历|索要/.test(areaText)) score += 6;
+        if (/确认|确定/.test(text)) score += 4;
+        if (/发送|索要/.test(text)) score += 2;
+        if (rect.left > window.innerWidth * 0.35 && rect.top > 80) score += 1;
+        candidates.push({ el: el.closest("button, a, [role='button']") || el, score, text, left: rect.left, top: rect.top });
+      }
+    }
+    candidates.sort((a, b) => b.score - a.score || b.left - a.left || b.top - a.top);
+    if (candidates[0]) {
+      clickElementReliably(candidates[0].el);
+      emit({ type: "resume_request_confirm_clicked", data: { candidate_id: candidateId, candidate_signature: signature, button_text: candidates[0].text } });
+      return true;
+    }
+    emit({ type: "resume_request_confirm_not_found", data: { candidate_id: candidateId, candidate_signature: signature } });
+    return false;
+  }
+
+  function getElementDescriptor(el) {
+    if (!el) return "";
+    const attrs = ["class", "id", "href", "xlink:href", "aria-label", "title", "data-icon", "data-name", "data-testid"];
+    const attrText = attrs.map((name) => el.getAttribute?.(name) || "").join(" ");
+    return `${textOf(el)} ${attrText} ${el.className || ""}`.replace(/\s+/g, " ").trim();
+  }
+
+  function getElementDomPath(el) {
+    if (!el || el.nodeType !== Node.ELEMENT_NODE) return "";
+    const parts = [];
+    let node = el;
+    while (node && node.nodeType === Node.ELEMENT_NODE && node !== document.body) {
+      let part = node.tagName.toLowerCase();
+      const id = node.getAttribute("id");
+      if (id && !/\s/.test(id)) {
+        part += `#${CSS.escape(id)}`;
+        parts.unshift(part);
+        break;
+      }
+      const cls = Array.from(node.classList || []).filter(Boolean).slice(0, 2);
+      if (cls.length) part += cls.map((x) => `.${CSS.escape(x)}`).join("");
+      const parent = node.parentElement;
+      if (parent) {
+        const siblings = Array.from(parent.children).filter((x) => x.tagName === node.tagName);
+        if (siblings.length > 1) part += `:nth-of-type(${siblings.indexOf(node) + 1})`;
+      }
+      parts.unshift(part);
+      node = parent;
+    }
+    return parts.slice(-8).join(" > ");
+  }
+
+  function getElementSnapshot(el, x = null, y = null) {
+    const node = el?.closest?.("button, a, [role='button'], [class*='btn'], [class*='icon'], [class*='download'], [class*='toolbar'] span, [class*='toolbar'] div") || el;
+    const rect = node?.getBoundingClientRect?.();
+    return {
+      x,
+      y,
+      relative_x: x == null ? null : x / Math.max(1, window.innerWidth),
+      relative_y: y == null ? null : y / Math.max(1, window.innerHeight),
+      window_width: window.innerWidth,
+      window_height: window.innerHeight,
+      tag: node?.tagName || "",
+      id: node?.getAttribute?.("id") || "",
+      class_name: `${node?.className || ""}`,
+      title: node?.getAttribute?.("title") || "",
+      aria_label: node?.getAttribute?.("aria-label") || "",
+      descriptor: getElementDescriptor(node).slice(0, 260),
+      path: getElementDomPath(node),
+      rect: rect ? { left: rect.left, top: rect.top, width: rect.width, height: rect.height } : null,
+    };
+  }
+
+  function extractResumePreviewInfo(root, fallbackInfo = {}) {
+    const text = (root?.innerText || root?.textContent || "").replace(/\s+/g, " ").trim();
+    const emailMatch = text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+    const phoneMatch = text.match(/(?:\+?86[-\s]?)?1[3-9]\d[-\s]?\d{4}[-\s]?\d{4}/);
+    const candidateNames = Array.from(text.slice(0, 260).matchAll(/[\u4e00-\u9fa5]{2,4}(?:先生|女士)?/g)).map((m) => m[0]);
+    const blacklist = new Set(["附件简历", "下载简历", "在线简历", "个人简历", "查看简历", "简历预览", "求职意向", "工作经历", "项目经历", "教育经历"]);
+    const name = candidateNames.find((x) => !blacklist.has(x)) || fallbackInfo.name || "未识别";
+    return {
+      name,
+      phone: phoneMatch ? phoneMatch[0] : "未识别",
+      email: emailMatch ? emailMatch[0] : "未识别",
+      text_sample: text.slice(0, 240),
+    };
+  }
+
+  function getRectSnapshot(el) {
+    const rect = el.getBoundingClientRect();
+    return {
+      left: Math.round(rect.left),
+      top: Math.round(rect.top),
+      width: Math.round(rect.width),
+      height: Math.round(rect.height),
+    };
+  }
+
+  function getElementClassName(el) {
+    return `${el?.className || ""}`.replace(/\s+/g, " ").slice(0, 180);
+  }
+
+  function snapshotDiagnosticElement(el, textLimit = 180) {
+    return {
+      tag: el.tagName || "",
+      id: el.getAttribute?.("id") || "",
+      role: el.getAttribute?.("role") || "",
+      class_name: getElementClassName(el),
+      rect: getRectSnapshot(el),
+      text: textOf(el).slice(0, textLimit),
+      descriptor: getElementDescriptor(el).slice(0, 240),
+      path: getElementDomPath(el),
+    };
+  }
+
+  function collectResumePreviewDiagnostics(candidateId = "", signature = "", info = {}, lastSample = "") {
+    const overlaySelectors = [
+      "[role='dialog']",
+      "[class*='dialog']",
+      "[class*='modal']",
+      "[class*='preview']",
+      "[class*='viewer']",
+      "[class*='pdf']",
+      "[class*='resume']",
+      "[class*='attachment']",
+      "[class*='drawer']",
+      "[class*='popup']",
+      "[class*='pop']",
+      "[class*='layer']",
+    ];
+    const seen = new Set();
+    const overlays = overlaySelectors
+      .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
+      .filter((el) => {
+        if (seen.has(el)) return false;
+        seen.add(el);
+        try { return isVisible(el); } catch { return false; }
+      })
+      .map((el) => snapshotDiagnosticElement(el, 220))
+      .sort((a, b) => (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height))
+      .slice(0, 14);
+
+    const frames = Array.from(document.querySelectorAll("iframe, object, embed"))
+      .filter((el) => {
+        try { return isVisible(el); } catch { return false; }
+      })
+      .map((el) => ({
+        ...snapshotDiagnosticElement(el, 120),
+        src: el.getAttribute("src") || el.getAttribute("data") || "",
+        type: el.getAttribute("type") || "",
+      }))
+      .slice(0, 10);
+
+    const largeBlocks = Array.from(document.querySelectorAll("body *"))
+      .filter((el) => {
+        try {
+          if (!isVisible(el)) return false;
+          const rect = el.getBoundingClientRect();
+          if (rect.width < 260 || rect.height < 120) return false;
+          if (rect.top < -30 || rect.left < -30) return false;
+          if (rect.left < window.innerWidth * 0.12 && rect.width < window.innerWidth * 0.65) return false;
+          return true;
+        } catch {
+          return false;
+        }
+      })
+      .map((el) => snapshotDiagnosticElement(el, 160))
+      .sort((a, b) => (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height))
+      .slice(0, 18);
+
+    return {
+      candidate_id: candidateId,
+      candidate_signature: signature,
+      candidate_name: info.name || "",
+      url: location.href,
+      title: document.title,
+      viewport: { width: window.innerWidth, height: window.innerHeight },
+      body_sample: lastSample || (document.body?.innerText || "").replace(/\s+/g, " ").slice(0, 600),
+      overlays,
+      frames,
+      large_blocks: largeBlocks,
+    };
+  }
+
+  function shouldAbortAsyncStep() {
+    return state === "stopped" || state === "idle";
+  }
+
+  async function waitUntilResumePreviewGone(timeoutMs = 1200) {
     const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (!findResumePreview()) return true;
+      await sleep(150);
+    }
+    return !findResumePreview();
+  }
+
+  function emitResumePreviewDiagnostics(candidateId = "", signature = "", info = {}, sample = "", reason = "manual_probe") {
+    const diagnostics = collectResumePreviewDiagnostics(candidateId, signature, info, sample);
+    emit({ type: "resume_preview_diagnostics", data: { ...diagnostics, reason } });
+  }
+
+  function findResumePreview(fallbackInfo = {}) {
+    const roots = getPreviewRoots();
+    const matches = [];
+    for (const root of roots) {
+      const rect = root.getBoundingClientRect?.();
+      const text = (root.innerText || root.textContent || "").replace(/\s+/g, " ").trim();
+      if (!rect || rect.width < 220 || rect.height < 120) continue;
+      let score = 0;
+      if (/简历|附件|预览|PDF|pdf|resume/i.test(text + " " + getElementDescriptor(root))) score += 5;
+      if (/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i.test(text)) score += 3;
+      if (/(?:\+?86[-\s]?)?1[3-9]\d[-\s]?\d{4}[-\s]?\d{4}/.test(text)) score += 3;
+      if (rect.left > window.innerWidth * 0.15) score += 1;
+      if (!/聊天|常用语|发送/.test(text.slice(0, 120))) score += 1;
+      if (score >= 4) matches.push({ root, rect, score, info: extractResumePreviewInfo(root, fallbackInfo) });
+    }
+    matches.sort((a, b) => b.score - a.score || b.rect.width * b.rect.height - a.rect.width * a.rect.height);
+    return matches[0] || null;
+  }
+
+  async function waitForResumePreview(candidateId = "", signature = "", info = {}, timeoutMs = 12000) {
+    emitCritical({ type: "resume_preview_recognition_started", data: { candidate_id: candidateId, candidate_signature: signature, stage: "wait_entered", timeout_ms: timeoutMs, real_wait_started: true } });
+    const deadline = Date.now() + timeoutMs;
+    let lastSample = "";
+    let emittedEarlyDiagnostic = false;
+    while (Date.now() < deadline) {
+      if (shouldAbortAsyncStep()) {
+        emitResumePreviewDiagnostics(candidateId, signature, info, lastSample, "aborted_before_preview_detected");
+        return null;
+      }
+      const preview = findResumePreview(info);
+      if (preview) {
+        emit({ type: "resume_preview_wait_result", data: { candidate_id: candidateId, candidate_signature: signature, found: true, stage: "wait_found", elapsed_ms: timeoutMs - Math.max(0, deadline - Date.now()) } });
+        return preview;
+      }
+      lastSample = (document.body?.innerText || "").replace(/\s+/g, " ").slice(0, 260) || lastSample;
+      if (!emittedEarlyDiagnostic && Date.now() > deadline - timeoutMs + 2500) {
+        emittedEarlyDiagnostic = true;
+        emitResumePreviewDiagnostics(candidateId, signature, info, lastSample, "early_preview_probe_2_5s");
+      }
+      await sleep(250);
+    }
+    const weakPreview = makeResumePreviewFromLargestRoot(info);
+    if (weakPreview) {
+      emitResumePreviewDiagnostics(candidateId, signature, info, lastSample, "weak_preview_candidate_found_but_not_accepted");
+      emit({ type: "resume_preview_weak_candidate_used", data: { candidate_id: candidateId, candidate_signature: signature, rect: getRectSnapshot(weakPreview.root), descriptor: getElementDescriptor(weakPreview.root).slice(0, 180) } });
+      emit({ type: "resume_preview_wait_result", data: { candidate_id: candidateId, candidate_signature: signature, found: false, weak_candidate: true, stage: "wait_timeout" } });
+      emit({ type: "resume_preview_not_found", data: { candidate_id: candidateId, candidate_signature: signature, sample: lastSample, weak_candidate: true } });
+      return null;
+    }
+    emitResumePreviewDiagnostics(candidateId, signature, info, lastSample, "preview_wait_timeout");
+    emit({ type: "resume_preview_wait_result", data: { candidate_id: candidateId, candidate_signature: signature, found: false, stage: "wait_timeout" } });
+    emit({ type: "resume_preview_not_found", data: { candidate_id: candidateId, candidate_signature: signature, sample: lastSample } });
+    return null;
+  }
+
+  function saveLearnedDownloadClick(snapshot) {
+    resumePreviewLearnState.learnedClick = snapshot;
+    try {
+      localStorage.setItem(STORAGE_KEYS.learnedClick, JSON.stringify(snapshot));
+    } catch {}
+  }
+
+  function captureNextManualDownloadClick(candidateId = "", signature = "", timeoutMs = 60000) {
+    resumePreviewLearnState.waitingManualClick = true;
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        cleanup();
+        emit({ type: "manual_download_click_timeout", data: { candidate_id: candidateId, candidate_signature: signature } });
+        resolve(null);
+      }, timeoutMs);
+
+      const handler = (event) => {
+        if (!resumePreviewLearnState.waitingManualClick) return;
+        const target = document.elementFromPoint(event.clientX, event.clientY) || event.target;
+        const snapshot = getElementSnapshot(target, event.clientX, event.clientY);
+        snapshot.candidate_id = candidateId;
+        snapshot.candidate_signature = signature;
+        saveLearnedDownloadClick(snapshot);
+        emit({ type: "manual_download_click_captured", data: snapshot });
+        cleanup();
+        resolve(snapshot);
+      };
+
+      function cleanup() {
+        resumePreviewLearnState.waitingManualClick = false;
+        clearTimeout(timer);
+        window.removeEventListener("pointerdown", handler, true);
+        window.removeEventListener("mousedown", handler, true);
+        window.removeEventListener("click", handler, true);
+      }
+
+      window.addEventListener("pointerdown", handler, true);
+      window.addEventListener("mousedown", handler, true);
+      window.addEventListener("click", handler, true);
+    });
+  }
+
+  function isLikelyDownloadIcon(el, descriptor) {
+    const combined = `${descriptor} ${getElementDescriptor(el.parentElement)} ${getElementDescriptor(el.closest?.("button, a, [role='button'], [class*='btn'], [class*='icon'], [class*='download']"))}`;
+    if (/下载附件|下载简历|下载|download|down-load|icon[-_]?download|download[-_]?icon|resume[-_]?download|file[-_]?download|attachment[-_]?download/i.test(combined)) return true;
+    const href = el.getAttribute?.("href") || el.getAttribute?.("xlink:href") || "";
+    if (/download|xiazai|down/i.test(href)) return true;
+    const cls = `${el.className || ""}`;
+    if (/download|down|xiazai/i.test(cls)) return true;
+    return false;
+  }
+
+  function getPreviewRoots() {
+    const selectors = [
+      "[role='dialog']",
+      "[class*='dialog']",
+      "[class*='modal']",
+      "[class*='preview']",
+      "[class*='viewer']",
+      "[class*='pdf']",
+      "[class*='resume']",
+      "[class*='attachment']",
+      "[class*='drawer']",
+      "[class*='popup']",
+      "[class*='pop']",
+      "[class*='layer']",
+      "iframe",
+      "object",
+      "embed",
+    ];
+    const seen = new Set();
+    const roots = selectors.flatMap((selector) => Array.from(document.querySelectorAll(selector)))
+      .filter((el) => {
+        if (seen.has(el)) return false;
+        seen.add(el);
+        try { return isVisible(el); } catch { return false; }
+      })
+      .map((el) => ({ el, rect: el.getBoundingClientRect(), text: textOf(el) }))
+      .filter(({ rect, text }) => rect.width >= 180 && rect.height >= 90 && rect.left > window.innerWidth * 0.08 && !/聊天|常用语|发送/.test(text.slice(0, 80)))
+      .sort((a, b) => b.rect.width * b.rect.height - a.rect.width * a.rect.height)
+      .map((x) => x.el);
+    return roots;
+  }
+
+  function makeResumePreviewFromLargestRoot(fallbackInfo = {}) {
+    const roots = getPreviewRoots();
+    const root = roots[0];
+    if (!root) return null;
+    const rect = root.getBoundingClientRect();
+    return { root, rect, score: 1, info: extractResumePreviewInfo(root, fallbackInfo), weak: true };
+  }
+
+  function findDownloadButton() {
+    const matches = [];
+    const roots = getPreviewRoots();
+    const selector = "button, a, [role='button'], [class*='btn'], [class*='icon'], [class*='download'], div, span, i, svg, use";
+    for (const root of roots) {
+      for (const el of root.querySelectorAll(selector)) {
+        const clickable = el.closest("button, a, [role='button'], [class*='btn'], [class*='icon'], [class*='download'], [class*='toolbar'] span, [class*='toolbar'] div") || el.parentElement || el;
+        if (!isVisible(clickable) || isDisabled(clickable)) continue;
+        const rect = clickable.getBoundingClientRect();
+        if (rect.width < 10 || rect.height < 10 || rect.top < 0 || rect.left < 0) continue;
+        const descriptor = `${getElementDescriptor(el)} ${getElementDescriptor(clickable)} ${getElementDescriptor(clickable.parentElement)}`;
+        const combined = descriptor.toLowerCase();
+        let score = 0;
+        if (isLikelyDownloadIcon(el, descriptor)) score += 12;
+        if (/下载附件|下载简历/.test(descriptor)) score += 8;
+        if (/下载|download|down/i.test(descriptor)) score += 6;
+        if (/svg|icon|btn|button|toolbar/i.test(descriptor)) score += 2;
+        if (rect.top <= Math.min(220, window.innerHeight * 0.28)) score += 4;
+        if (rect.left > window.innerWidth * 0.55) score += 3;
+        if (rect.left > window.innerWidth * 0.75) score += 2;
+        if (rect.width <= 80 && rect.height <= 80) score += 2;
+        if (/关闭|close|取消|返回|back|delete|trash|更多|more|打印|print|zoom|放大|缩小|rotate|旋转|×|✕|esc/i.test(combined)) score -= 12;
+        if (score <= 0) continue;
+        matches.push({ el: clickable, rect, score, text: descriptor.slice(0, 160) });
+      }
+    }
+
+    if (!matches.length) {
+      const pointCandidates = [
+        { x: window.innerWidth - 92, y: 92 },
+        { x: window.innerWidth - 132, y: 92 },
+        { x: window.innerWidth - 172, y: 92 },
+        { x: window.innerWidth - 92, y: 132 },
+        { x: window.innerWidth - 132, y: 132 },
+      ];
+      for (const point of pointCandidates) {
+        const el = document.elementFromPoint(point.x, point.y);
+        const clickable = el?.closest?.("button, a, [role='button'], [class*='btn'], [class*='icon'], [class*='download'], div, span") || el;
+        if (!clickable || !isVisible(clickable) || isDisabled(clickable)) continue;
+        const rect = clickable.getBoundingClientRect();
+        const descriptor = getElementDescriptor(clickable);
+        if (/关闭|close|取消|返回|back|×|✕/i.test(descriptor)) continue;
+        matches.push({ el: clickable, rect, score: /下载|download|down/i.test(descriptor) ? 6 : 2, text: `point:${point.x},${point.y} ${descriptor}`.slice(0, 160) });
+      }
+    }
+
+    matches.sort((a, b) => b.score - a.score || b.rect.left - a.rect.left || a.rect.top - b.rect.top);
+    return matches[0]?.el || null;
+  }
+
+  async function waitForDownloadButton(candidateId = "", signature = "", timeoutMs = 10000) {
+    const deadline = Date.now() + timeoutMs;
+    let lastCandidateText = "";
+    let frameInfo = "";
     while (Date.now() < deadline) {
       const btn = findDownloadButton();
       if (btn) return btn;
+      const samples = Array.from(document.querySelectorAll("button, a, [role='button'], [class*='btn'], [class*='icon'], [class*='download'], svg, use"))
+        .filter((el) => isVisible(el))
+        .map((el) => getElementDescriptor(el))
+        .filter(Boolean)
+        .slice(0, 12)
+        .join(" | ");
+      const frames = Array.from(document.querySelectorAll("iframe, object, embed"))
+        .filter((el) => isVisible(el))
+        .map((el) => `${el.tagName}:${el.getAttribute("src") || el.getAttribute("data") || ""}`)
+        .slice(0, 4)
+        .join(" | ");
+      lastCandidateText = samples || lastCandidateText;
+      frameInfo = frames || frameInfo;
       await sleep(300);
     }
+    emit({ type: "download_button_candidates", data: { candidate_id: candidateId, candidate_signature: signature, samples: lastCandidateText, frames: frameInfo } });
     return null;
+  }
+
+  function waitForDownloadResult(candidateId, timeoutMs = 15000) {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        pendingDownloadWaiters.delete(candidateId);
+        resolve({ ok: false, reason: "download_timeout" });
+      }, timeoutMs);
+      pendingDownloadWaiters.set(candidateId, (result) => {
+        clearTimeout(timer);
+        pendingDownloadWaiters.delete(candidateId);
+        resolve(result);
+      });
+    });
+  }
+
+  async function skipCandidate(candidateId, signature, reason, extra = {}) {
+    emit({ type: "candidate_skipped", data: { candidate_id: candidateId, candidate_signature: signature, reason, ...extra } });
+    results.skipped++;
+    emitProgress();
+    await sleep(config.interval_ms);
+  }
+
+  async function requestResumeAndSkip(btn, candidateId, signature) {
+    const beforeCount = getResumeRequestSentCount();
+    clickElementReliably(btn.el);
+    const confirmed = await confirmRequestIfNeeded(candidateId, signature);
+    const requestSent = confirmed ? await waitForResumeRequestSent(3000, beforeCount) : await waitForResumeRequestSent(1200, beforeCount);
+    if (requestSent || confirmed) {
+      emit({ type: "resume_request_success", data: { candidate_id: candidateId, candidate_signature: signature, confirmed, request_sent: requestSent } });
+    }
+    await skipCandidate(candidateId, signature, requestSent ? "resume_requested" : "resume_request_clicked", { confirmed });
+  }
+
+  function findLearnedDownloadElement(learned) {
+    if (!learned) return null;
+    if (learned.path) {
+      try {
+        const el = document.querySelector(learned.path);
+        if (el && isVisible(el) && !isDisabled(el)) return el;
+      } catch {}
+    }
+
+    const descriptor = (learned.descriptor || "").replace(/\s+/g, " ").trim();
+    if (descriptor) {
+      const tokens = descriptor.split(/\s+/).filter((x) => x.length >= 2).slice(0, 8);
+      const nodes = Array.from(document.querySelectorAll("button, a, [role='button'], [class*='btn'], [class*='icon'], [class*='download'], div, span, i, svg, use"))
+        .filter((el) => isVisible(el) && !isDisabled(el));
+      const scored = nodes.map((el) => {
+        const text = `${getElementDescriptor(el)} ${getElementDescriptor(el.parentElement)}`;
+        const score = tokens.reduce((sum, token) => sum + (text.includes(token) ? 1 : 0), 0);
+        return { el, score };
+      }).filter((x) => x.score > 0).sort((a, b) => b.score - a.score);
+      if (scored[0]) return scored[0].el.closest("button, a, [role='button'], [class*='btn'], [class*='icon'], [class*='download']") || scored[0].el;
+    }
+
+    if (typeof learned.relative_x === "number" && typeof learned.relative_y === "number") {
+      const x = Math.max(1, Math.min(window.innerWidth - 1, learned.relative_x * window.innerWidth));
+      const y = Math.max(1, Math.min(window.innerHeight - 1, learned.relative_y * window.innerHeight));
+      return document.elementFromPoint(x, y);
+    }
+    return null;
+  }
+
+  async function clickLearnedDownload(candidateId, signature, info) {
+    const target = findLearnedDownloadElement(resumePreviewLearnState.learnedClick);
+    if (!target) {
+      emit({ type: "learned_download_click_failed", data: { candidate_id: candidateId, candidate_signature: signature, reason: "learned_element_not_found" } });
+      await skipCandidate(candidateId, signature, "download_button_not_found");
+      return;
+    }
+
+    emit({ type: "learned_download_click_used", data: { candidate_id: candidateId, candidate_signature: signature, ...getElementSnapshot(target) } });
+    emit({ type: "download_intent", data: { candidate_id: candidateId, candidate_signature: signature, candidate_info: info, expected_filename: `${signature}.pdf` } });
+    const resultPromise = waitForDownloadResult(candidateId);
+    clickElementReliably(target);
+    const downloadResult = await resultPromise;
+    if (downloadResult.ok) {
+      results.downloaded++;
+      emitProgress();
+      await sleep(config.interval_ms);
+    } else {
+      await skipCandidate(candidateId, signature, downloadResult.reason || "download_failed", downloadResult.data || {});
+    }
+  }
+
+  function finishLearningTask(candidateId = "", signature = "", data = {}) {
+    resumePreviewLearnState.learningStage = "learned";
+    try {
+      localStorage.setItem(STORAGE_KEYS.learningStage, "learned");
+    } catch {}
+    state = "stopped";
+    pendingDownloadWaiters.forEach((resolve) => resolve({ ok: false, reason: "learning_finished" }));
+    pendingDownloadWaiters.clear();
+    collectFinishedEmitted = true;
+    emit({ type: "download_learning_finished", data: { candidate_id: candidateId, candidate_signature: signature, ...data } });
+    emit({ type: "collect_finished", data: { total_downloaded: results.downloaded, total_skipped: results.skipped, learning_finished: true } });
+  }
+
+  async function waitForResumeLearningContinue() {
+    state = "paused";
+    emit({ type: "collect_paused_for_resume_preview_confirm", data: {} });
+    await waitForPause();
+  }
+
+  function findDownloadUrlFromResult(downloadResult) {
+    const data = downloadResult?.data || {};
+    return data.url || data.filename || data.download_path || "未捕获到下载链接";
+  }
+
+  async function startResumePreviewRecognition(candidateId, signature, info, btn, beforeUrl, stalePreviewClosed) {
+    emitCritical({ type: "resume_attachment_clicked", data: { candidate_id: candidateId, candidate_signature: signature, button_state: btn.state, button_text: btn.text, before_url: beforeUrl, stale_preview_closed: stalePreviewClosed } });
+    if (shouldAbortAsyncStep()) return null;
+    return await waitForResumePreview(candidateId, signature, info);
+  }
+
+  async function tryDownloadResume(candidateId, signature, info, preview = null, previewAlreadyWaited = false) {
+    if (shouldAbortAsyncStep()) return;
+    emit({ type: "resume_preview_info_extract_start", data: { candidate_id: candidateId, candidate_signature: signature } });
+    if (!preview && !previewAlreadyWaited) preview = await waitForResumePreview(candidateId, signature, info);
+    if (shouldAbortAsyncStep()) return;
+    if (!preview) {
+      await skipCandidate(candidateId, signature, "resume_preview_not_found");
+      return;
+    }
+
+    emit({ type: "resume_preview_detected", data: { candidate_id: candidateId, candidate_signature: signature, ...preview.info } });
+    emit({ type: "resume_preview_info_extract_success", data: { candidate_id: candidateId, candidate_signature: signature, ...preview.info } });
+
+    if (resumePreviewLearnState.learningStage === "detect_preview") {
+      resumePreviewLearnState.learningStage = "wait_manual_click";
+      try {
+        localStorage.setItem(STORAGE_KEYS.learningStage, "wait_manual_click");
+      } catch {}
+      await waitForResumeLearningContinue();
+    }
+
+    if (resumePreviewLearnState.learningStage === "wait_manual_click" || !resumePreviewLearnState.learnedClick) {
+      emit({ type: "manual_download_recording_started", data: { candidate_id: candidateId, candidate_signature: signature } });
+      emit({ type: "download_intent", data: { candidate_id: candidateId, candidate_signature: signature, candidate_info: info, expected_filename: `${signature}.pdf` } });
+      const resultPromise = waitForDownloadResult(candidateId, 65000);
+      const learned = await captureNextManualDownloadClick(candidateId, signature);
+      if (!learned) {
+        await skipCandidate(candidateId, signature, "manual_download_click_timeout");
+        return;
+      }
+      const downloadResult = await resultPromise;
+      if (downloadResult.ok) {
+        results.downloaded++;
+        emitProgress();
+        const downloadUrl = findDownloadUrlFromResult(downloadResult);
+        emit({ type: "manual_download_learning_success", data: { ...learned, download_url: downloadUrl } });
+        finishLearningTask(candidateId, signature, { download_url: downloadUrl });
+      } else {
+        await skipCandidate(candidateId, signature, downloadResult.reason || "download_failed", downloadResult.data || {});
+      }
+      return;
+    }
+
+    await clickLearnedDownload(candidateId, signature, info);
   }
 
   async function waitForPause() {
@@ -321,6 +999,7 @@
 
     emit({ type: "page_ready", data: { url: location.href } });
 
+    await resetCandidateListScroll();
     const items = getCandidateItems();
     emit({ type: "candidate_list_scanned", data: { count: items.length, samples: items.slice(0, 5).map((el) => textOf(el).slice(0, 80)) } });
     if (items.length === 0) {
@@ -355,8 +1034,6 @@
       const candidateId = `${activeRunId || "run"}_${i}_${signature}`;
 
       if (seenSignatures.has(signature)) {
-        emit({ type: "candidate_skipped", data: { candidate_id: candidateId, candidate_signature: signature, reason: "duplicate" } });
-        results.skipped++;
         continue;
       }
       seenSignatures.add(signature);
@@ -382,52 +1059,23 @@
 
       emit({ type: "resume_button_found", data: { candidate_id: candidateId, candidate_signature: signature, button_state: btn.state, button_text: btn.text } });
 
-      if (!btn.enabled) {
-        if (hasResumeRequestSent()) {
-          emit({ type: "candidate_skipped", data: { candidate_id: candidateId, candidate_signature: signature, reason: "resume_request_already_sent" } });
-        } else {
-          emit({ type: "candidate_skipped", data: { candidate_id: candidateId, candidate_signature: signature, reason: `button_disabled:${btn.state}` } });
-        }
-        results.skipped++;
-        emitProgress();
-        await sleep(config.interval_ms);
+      const beforeUrl = location.href;
+      clickElementReliably(btn.el);
+      const preview = await startResumePreviewRecognition(candidateId, signature, info, btn, beforeUrl, true);
+      emitResumePreviewDiagnostics(candidateId, signature, info, (document.body?.innerText || "").replace(/\s+/g, " ").slice(0, 260), "after_attachment_click_preview_probe");
+      if (shouldAbortAsyncStep()) break;
+      if (!preview) {
+        await skipCandidate(candidateId, signature, "resume_preview_not_found");
         continue;
       }
 
-      if (btn.state === "requested") {
-        emit({ type: "candidate_skipped", data: { candidate_id: candidateId, candidate_signature: signature, reason: "resume_already_requested" } });
-        results.skipped++;
-        emitProgress();
-        await sleep(config.interval_ms);
-        continue;
-      }
-
-      btn.el.click();
-      if (btn.state === "request") {
-        const confirmed = await confirmRequestIfNeeded();
-        emit({ type: "candidate_skipped", data: { candidate_id: candidateId, candidate_signature: signature, reason: confirmed ? "resume_requested" : "resume_request_clicked" } });
-        results.skipped++;
-        emitProgress();
-        await sleep(config.interval_ms);
-        continue;
-      }
-
-      const downloadButton = await waitForDownloadButton();
-      if (downloadButton) {
-        emit({ type: "download_intent", data: { candidate_id: candidateId, candidate_signature: signature, candidate_info: info, expected_filename: `${signature}.pdf` } });
-        downloadButton.click();
-        results.downloaded++;
-      } else {
-        emit({ type: "candidate_skipped", data: { candidate_id: candidateId, candidate_signature: signature, reason: "download_button_not_found" } });
-        results.skipped++;
-      }
-
-      emitProgress();
-      await sleep(config.interval_ms);
+      await tryDownloadResume(candidateId, signature, info, preview, true);
     }
 
     state = "idle";
-    emit({ type: "collect_finished", data: { total_downloaded: results.downloaded, total_skipped: results.skipped } });
+    if (!collectFinishedEmitted) {
+      emit({ type: "collect_finished", data: { total_downloaded: results.downloaded, total_skipped: results.skipped } });
+    }
   }
 
   function emitProgress() {
@@ -461,9 +1109,20 @@
         break;
       case "start_collect":
         if (state === "collecting") break;
+        activeRunId = msg.run_id || `${Date.now()}`;
         state = "collecting";
         config = { ...config, ...msg.config };
         results = { downloaded: 0, skipped: 0, currentIndex: 0 };
+        resumePreviewLearnState.learningStage = "detect_preview";
+        resumePreviewLearnState.waitingManualClick = false;
+        resumePreviewLearnState.learnedClick = null;
+        try {
+          localStorage.setItem(STORAGE_KEYS.learningStage, "detect_preview");
+          localStorage.removeItem(STORAGE_KEYS.learnedClick);
+        } catch {}
+        collectFinishedEmitted = false;
+        pendingDownloadWaiters.forEach((resolve) => resolve({ ok: false, reason: "new_collect_started" }));
+        pendingDownloadWaiters.clear();
         collectLoop();
         break;
       case "pause_collect":
@@ -473,10 +1132,26 @@
         state = "collecting";
         if (pauseResolve) { pauseResolve(); pauseResolve = null; }
         break;
+      case "reset_content_script":
+        window.__bossResumeCollectorVersion = "";
+        state = "stopped";
+        location.reload();
+        break;
       case "stop_collect":
         state = "stopped";
+        pendingDownloadWaiters.forEach((resolve) => resolve({ ok: false, reason: "collect_stopped" }));
+        pendingDownloadWaiters.clear();
         if (pauseResolve) { pauseResolve(); pauseResolve = null; }
         break;
+      case "download_completed":
+      case "download_failed": {
+        const data = msg.data || {};
+        const resolve = pendingDownloadWaiters.get(data.candidate_id);
+        if (resolve) {
+          resolve({ ok: msg.type === "download_completed", reason: data.reason, data });
+        }
+        break;
+      }
     }
     sendResponse({ ok: true });
     return true;

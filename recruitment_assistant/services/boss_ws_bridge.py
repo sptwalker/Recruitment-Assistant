@@ -13,6 +13,8 @@ from loguru import logger
 
 from recruitment_assistant.config.settings import get_settings
 from recruitment_assistant.services.ws_server import BossWSServer
+from recruitment_assistant.utils.snapshot_utils import safe_filename
+
 
 
 class BossWSBridge:
@@ -35,6 +37,7 @@ class BossWSBridge:
             "run_started_at": "",
             "log_file": "",
             "last_event_at": "",
+            "last_heartbeat_at": "",
             "extension_version": "",
             "page_url": "",
             "skip_reason_counts": {},
@@ -64,11 +67,12 @@ class BossWSBridge:
             "run_id": run_id,
             "run_started_at": now.isoformat(timespec="seconds"),
             "log_file": str(log_file),
-            "last_event_at": "",
             "skip_reason_counts": {},
         })
         self._write_event_log("run_started", {"run_id": run_id})
         self._log("info", f"新测试轮次已创建: {run_id}")
+        if self.ws_server.is_extension_connected:
+            self.probe_page()
 
     def start_collect(self, config: dict) -> None:
         if not self.ws_server.is_extension_connected:
@@ -109,6 +113,12 @@ class BossWSBridge:
         self._write_event_log("command_sent", command)
         self._log("info", "停止指令已下发")
 
+    def probe_page(self) -> None:
+        command = {"type": "probe_page", "run_id": self.runtime_state.get("run_id", "")}
+        self.ws_server.send_command(command)
+        self._write_event_log("command_sent", command)
+        self._log("info", "已请求扩展重新检测 Boss 页面")
+
     def get_run_summary(self) -> dict[str, Any]:
         candidates = self.runtime_state.get("candidates", [])
         statuses = Counter(c.get("status", "unknown") for c in candidates)
@@ -136,10 +146,33 @@ class BossWSBridge:
                 self.runtime_state["extension_connected"] = True
                 self.runtime_state["extension_version"] = data.get("version", "")
                 self._log("info", f"扩展已连接 v{data.get('version', '?')}")
+            case "heartbeat":
+                self.runtime_state["extension_connected"] = True
+                self.runtime_state["last_heartbeat_at"] = datetime.now().isoformat(timespec="seconds")
+                if data.get("version"):
+                    self.runtime_state["extension_version"] = data.get("version", "")
+            case "extension_disconnected":
+                self.runtime_state["extension_connected"] = False
+                self.runtime_state["page_ready"] = False
+                self.runtime_state["running"] = False
+                self.runtime_state["paused"] = False
+                self._log("error", f"扩展连接已断开: {data.get('reason', 'unknown')}")
+
             case "page_ready":
                 self.runtime_state["page_ready"] = True
                 self.runtime_state["page_url"] = data.get("url", "")
                 self._log("info", f"Boss 沟通页已就绪: {data.get('url', '')}")
+            case "page_detected":
+                self.runtime_state["page_ready"] = False
+                self.runtime_state["page_url"] = data.get("url", "")
+                self._log("info", f"已检测到 Boss 页面但未确认登录态: {data.get('url', '')}")
+            case "boss_tabs_scanned":
+                urls = data.get("urls") or []
+                self._log("info", f"扩展扫描到 Boss 标签页 {data.get('count', 0)} 个: {' | '.join(urls[:3])}")
+            case "content_script_inject_failed":
+                self._log("error", f"注入 Boss 页面脚本失败: {data.get('url', '')}")
+            case "content_script_message_failed":
+                self._log("error", f"Boss 页面脚本通信失败: {data.get('error', '')} {data.get('url', '')}")
             case "candidate_clicked":
                 sig = f"{data.get('name', '?')}/{data.get('age', '?')}/{data.get('education', '?')}"
                 self._log("info", f"点击候选人: {sig} (#{data.get('index', 0)})")
@@ -148,7 +181,10 @@ class BossWSBridge:
             case "candidate_skipped":
                 self._record_skip(data)
             case "candidate_list_scanned":
-                self._log("info", f"候选人列表扫描完成: {data.get('count', 0)} 个候选项")
+                samples = data.get("samples") or []
+                sample_text = " | ".join(str(x) for x in samples[:3])
+                suffix = f"；样例: {sample_text}" if sample_text else ""
+                self._log("info", f"候选人列表扫描完成: {data.get('count', 0)} 个候选项{suffix}")
             case "resume_button_found":
                 sig = data.get("candidate_signature", "未知")
                 state = data.get("button_state", "unknown")
@@ -173,6 +209,12 @@ class BossWSBridge:
             case _:
                 logger.debug("未处理的扩展事件: {}", event_type)
 
+    def _normalize_resume_filename_part(self, value: str | None, fallback: str) -> str:
+        text = "".join(str(value or "").split()).strip("-—_｜|/\\:：,，;；.。()（）[]【】")
+        if not text or text == "待识别":
+            text = fallback
+        return safe_filename(text, max_length=24)
+
     def _save_resume(self, data: dict) -> None:
         settings = get_settings()
         candidate_sig = data.get("candidate_signature", "未知")
@@ -191,21 +233,29 @@ class BossWSBridge:
                 file_hash = sha256(content).hexdigest()
                 suffix = source.suffix.lower() or ".pdf"
 
-                name = candidate_info.get("name", "未知")
-                age = candidate_info.get("age", "未知")
-                education = candidate_info.get("education", "未知")
+                name = self._normalize_resume_filename_part(candidate_info.get("name"), "未知姓名")
+                age = self._normalize_resume_filename_part(candidate_info.get("age"), "未知年龄")
+                education = self._normalize_resume_filename_part(candidate_info.get("education"), "未知学历")
                 seq = self.runtime_state["downloaded_count"] + 1
-                filename = f"{name}-{age}-{education}-BOSS直聘-{now.strftime('%Y%m%d')}-{now.strftime('%H%M%S')}-{seq:03d}{suffix}"
+                filename_stem = f"{name}-{age}-{education}-BOSS直聘-{now.strftime('%Y%m%d')}-{now.strftime('%H%M%S')}-{seq:03d}"
+                filename = f"{filename_stem}{suffix}"
 
                 target = target_dir / filename
+                duplicate_index = 1
+                while target.exists() and target != source:
+                    target = target_dir / f"{filename_stem}-{duplicate_index}{suffix}"
+                    duplicate_index += 1
                 shutil.move(str(source), str(target))
 
-                self._log("info", f"简历已保存: {filename}")
+
+                final_filename = target.name
+
+                self._log("info", f"简历已保存: {final_filename}")
                 self.runtime_state["downloaded_count"] = seq
                 record = {
                     "signature": candidate_sig,
                     "info": candidate_info,
-                    "file": filename,
+                    "file": final_filename,
                     "path": str(target),
                     "hash": file_hash,
                     "status": "downloaded",

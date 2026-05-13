@@ -16,7 +16,7 @@ st.markdown(
     """
 <style>
 .vibe-page-title { background:transparent !important; border:0 !important; box-shadow:none !important; padding:0 !important; margin:0 0 12px !important; }
-.vibe-page-title h1 { font-size:36px !important; line-height:1.08 !important; font-weight:900 !important; letter-spacing:-.8px !important; }
+.vibe-page-title h1 { font-size:30px !important; line-height:1.04 !important; font-weight:900 !important; letter-spacing:-.8px !important; }
 .vibe-page-title p { font-size:13px !important; margin-top:4px !important; }
 .boss-section-title { margin:14px 0 7px; padding:0 0 6px; border-bottom:2px solid #DDE7F2; color:#172033; font-size:22px; line-height:1.2; font-weight:900; letter-spacing:-.3px; background:transparent; }
 [data-testid="stVerticalBlockBorderWrapper"] { background:#FFFFFF !important; border:1px solid #E5EAF2 !important; border-radius:14px !important; box-shadow:none !important; }
@@ -26,15 +26,22 @@ st.markdown(
 [data-testid="stMetricValue"] { font-size:16px !important; line-height:1.18 !important; }
 [data-testid="stMetricDelta"] { font-size:11px !important; }
 .boss-info-text, .boss-info-text span { font-size:12px; line-height:1.45; }
+.boss-status-banner { min-height:58px; height:58px; box-sizing:border-box; background:#FFFFFF; border:1px solid #EEF2F7; border-radius:12px; padding:8px 10px; display:flex; flex-direction:column; justify-content:center; gap:3px; overflow:hidden; }
+.boss-status-banner.one-line { flex-direction:row; align-items:center; justify-content:space-between; gap:8px; }
+.boss-status-label { font-size:11px; color:#64748B; line-height:1; white-space:nowrap; }
+.boss-status-value { font-size:16px; font-weight:800; color:#172033; line-height:1.1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.boss-status-sub { font-size:11px; color:#64748B; line-height:1.1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.boss-status-pair { display:flex; flex-direction:column; gap:5px; }
+.boss-status-pair div { white-space:nowrap; }
+.stButton > button, .stLinkButton > a { min-height:32px !important; padding:6px 12px !important; font-size:12px !important; border-radius:10px !important; white-space:nowrap !important; width:100% !important; }
 .boss-status-on { color:#168A45; font-weight:700; font-size:12px; }
 .boss-status-off { color:#94A3B8; font-size:12px; }
 .boss-path { display:block; clear:both; font-family:Consolas,monospace; font-size:12px; color:#475569; background:#F8FAFC; border:1px solid #E5EAF2; border-radius:10px; padding:8px 10px; word-break:break-all; margin-top:8px; }
 .boss-checklist { margin:0 0 0 18px; padding:0; }
 .boss-checklist li { margin:4px 0; line-height:1.38; font-size:12px; }
-.boss-log-box { height:260px; overflow-y:auto; background:#fff; border:1px solid #E5EAF2; border-radius:12px; padding:11px 12px; font-family:Consolas,monospace; font-size:13px; line-height:1.55; white-space:pre-wrap; }
+.boss-log-box { height:300px; overflow-y:auto; background:#fff; border:1px solid #E5EAF2; border-radius:12px; padding:9px 10px; font-family:Consolas,monospace; font-size:12px; line-height:1.42; white-space:pre-wrap; }
 .boss-log-info { color:#1F2937; font-size:13px; }
 .boss-log-error { color:#C73552; font-weight:700; font-size:13px; }
-.stButton > button { min-height:32px !important; padding:6px 12px !important; font-size:12px !important; border-radius:10px !important; }
 [data-testid="stCaptionContainer"] { font-size:12px !important; }
 </style>
 """,
@@ -59,59 +66,68 @@ ws_connected = bridge.ws_server.is_extension_connected
 is_running = runtime.get("running", False)
 is_paused = runtime.get("paused", False)
 
-# --- Connection Status ---
-section_title("连接状态")
+# --- Status & Run ---
+section_title("运行状态")
 with st.container(border=True):
-    col1, col2, col3, col4 = st.columns(4)
     ws_listening = getattr(bridge.ws_server, "is_listening", False)
     startup_error = getattr(bridge.ws_server, "startup_error", "")
-    if ws_listening:
-        col1.metric("WebSocket 服务", "监听中", delta=f"{bridge.ws_server.host}:{bridge.ws_server.port}")
-    elif startup_error:
-        col1.metric("WebSocket 服务", "启动失败", delta=startup_error)
-    else:
-        col1.metric("WebSocket 服务", "未监听", delta=f"{bridge.ws_server.host}:{bridge.ws_server.port}")
-    if ws_connected:
-        col2.markdown('<div class="boss-info-text boss-status-on">● 扩展已连接</div>', unsafe_allow_html=True)
-    else:
-        col2.markdown('<div class="boss-info-text boss-status-off">○ 扩展未连接</div>', unsafe_allow_html=True)
     page_ready = runtime.get("page_ready", False)
-    if page_ready:
-        col3.markdown('<div class="boss-info-text boss-status-on">● Boss页面就绪</div>', unsafe_allow_html=True)
-    else:
-        col3.markdown('<div class="boss-info-text boss-status-off">○ 等待打开Boss沟通页</div>', unsafe_allow_html=True)
-    col4.metric("扩展版本", runtime.get("extension_version") or "-")
     page_url = runtime.get("page_url") or "-"
-    st.caption(f"Boss 页面：{page_url}")
 
-# --- Test Run ---
-section_title("测试轮次")
-with st.container(border=True):
-    r1, r2, r3, r4 = st.columns(4)
-    r1.metric("Run ID", runtime.get("run_id") or "-")
-    r2.metric("开始时间", runtime.get("run_started_at") or "-")
-    r3.metric("最近事件", runtime.get("last_event_at") or "-")
-    r4.metric("日志事件数", getattr(bridge, "_event_seq", 0))
-    run_cols = st.columns(2)
-    if run_cols[0].button("重置本轮测试", disabled=runtime.get("running", False)):
+    status_cols = st.columns([1.25, 1.35, 1, 1, 1])
+    if ws_listening:
+        ws_value = "监听中"
+        ws_sub = f"{bridge.ws_server.host}:{bridge.ws_server.port}"
+    elif startup_error:
+        ws_value = "启动失败"
+        ws_sub = startup_error
+    else:
+        ws_value = "未监听"
+        ws_sub = f"{bridge.ws_server.host}:{bridge.ws_server.port}"
+    status_cols[0].markdown(
+        f'<div class="boss-status-banner one-line"><span class="boss-status-label">WebSocket</span><span class="boss-status-value">{html.escape(ws_value)}</span><span class="boss-status-sub">{html.escape(ws_sub)}</span></div>',
+        unsafe_allow_html=True,
+    )
+    ext_text = "● 扩展已连接" if ws_connected else "○ 扩展未连接"
+    page_text = "● Boss页面就绪" if page_ready else "○ 等待沟通页"
+    ext_class = "boss-status-on" if ws_connected else "boss-status-off"
+    page_class = "boss-status-on" if page_ready else "boss-status-off"
+    status_cols[1].markdown(
+        f'<div class="boss-status-banner"><div class="boss-status-pair"><div class="boss-info-text {ext_class}">{ext_text}</div><div class="boss-info-text {page_class}">{page_text}</div></div></div>',
+        unsafe_allow_html=True,
+    )
+    status_cols[2].metric("扩展版本", runtime.get("extension_version") or "-")
+    status_cols[3].metric("Run ID", runtime.get("run_id") or "-")
+    status_cols[4].metric("最近事件", runtime.get("last_event_at") or "-")
+
+    action_cols = st.columns([1.25, 1.25, 1.1, 1.1, 4.3], gap="medium")
+    action_cols[0].link_button("打开 BOSS 登录页面", "https://www.zhipin.com/web/user/?ka=header-login")
+    if action_cols[1].button("重新检测 BOSS 页面", disabled=not ws_connected):
+        bridge.probe_page()
+        st.rerun()
+    if action_cols[2].button("重置本轮测试", disabled=runtime.get("running", False)):
         bridge.reset_run()
         st.rerun()
-    if run_cols[1].button("生成本轮摘要"):
+    if action_cols[3].button("生成本轮摘要"):
         st.session_state["boss_run_summary"] = bridge.get_run_summary()
-    st.markdown(f'<div class="boss-path">日志文件：{html.escape(runtime.get("log_file") or "-")}</div>', unsafe_allow_html=True)
     summary = st.session_state.get("boss_run_summary")
     if summary:
         st.code(json.dumps(summary, ensure_ascii=False, indent=2), language="json")
 
-# --- Collection Config & Controls ---
-section_title("采集配置")
+# --- Collection & Results ---
+section_title("采集与结果")
 with st.container(border=True):
-    c1, c2, c3 = st.columns(3)
-    max_resumes = c1.number_input("最大采集数量", min_value=1, max_value=100, value=5, step=1)
-    interval_ms = c2.number_input("点击间隔（毫秒）", min_value=2000, max_value=30000, value=5000, step=1000)
-    test_mode = c3.selectbox("测试模式", ["连续采集", "单步采集1人"])
+    top_cols = st.columns([1.15, 1.15, 1.1, 1, 1, 1, 1])
+    max_resumes = top_cols[0].number_input("最大采集数量", min_value=1, max_value=100, value=5, step=1)
+    interval_ms = top_cols[1].number_input("点击间隔（毫秒）", min_value=2000, max_value=30000, value=5000, step=1000)
+    test_mode = top_cols[2].selectbox("测试模式", ["连续采集", "单步采集1人"])
+    top_cols[3].metric("已下载", runtime.get("downloaded_count", 0))
+    top_cols[4].metric("已跳过", runtime.get("skipped_count", 0))
+    top_cols[5].metric("当前索引", runtime.get("current_index", 0))
+    status_text = "采集中" if is_running and not is_paused else ("已暂停" if is_paused else "空闲")
+    top_cols[6].metric("状态", status_text)
 
-    btn_cols = st.columns(4)
+    btn_cols = st.columns([1, 1, 1, 1, 5])
     if btn_cols[0].button("开始采集", disabled=is_running or not ws_connected, type="primary"):
         effective_max = 1 if test_mode == "单步采集1人" else max_resumes
         bridge.start_collect({"max_resumes": effective_max, "interval_ms": interval_ms, "test_mode": test_mode})
@@ -126,63 +142,45 @@ with st.container(border=True):
         bridge.stop_collect()
         st.rerun()
 
-# --- Progress ---
-section_title("采集进度")
-with st.container(border=True):
-    p1, p2, p3, p4 = st.columns(4)
-    p1.metric("已下载", runtime.get("downloaded_count", 0))
-    p2.metric("已跳过", runtime.get("skipped_count", 0))
-    p3.metric("当前索引", runtime.get("current_index", 0))
-    status_text = "采集中" if is_running and not is_paused else ("已暂停" if is_paused else "空闲")
-    p4.metric("状态", status_text)
     skip_counts = runtime.get("skip_reason_counts", {})
     if skip_counts:
         st.caption("跳过原因统计：" + "；".join(f"{k}={v}" for k, v in skip_counts.items()))
 
-# --- Test Checklist ---
-section_title("测试操作循环")
-with st.container(border=True):
-    st.markdown(
-        """
-<ol class="boss-checklist">
-<li>点击“重置本轮测试”，确认生成新的 Run ID 和 JSONL 日志路径。</li>
-<li>Chrome 打开 Boss 沟通页，确认“扩展已连接”和“Boss页面就绪”。</li>
-<li>先选择“单步采集1人”，观察候选人点击、跳过、下载事件是否完整写入日志。</li>
-<li>点击“生成本轮摘要”，根据下载数、跳过原因和最后事件定位问题。</li>
-<li>修复后重新加载扩展或刷新页面，再进入下一轮 Run ID 测试。</li>
-<li>单步稳定后切换“连续采集”，逐步扩大最大采集数量。</li>
-</ol>
-""",
-        unsafe_allow_html=True,
-    )
+    result_cols = st.columns([1.15, 1])
+    with result_cols[0]:
+        st.markdown("**实时日志**")
+        logs = runtime.get("logs", [])
+        if logs:
+            log_html = ""
+            for entry in logs[-45:]:
+                level = entry.get("level", "info")
+                css_class = "boss-log-error" if level == "error" else "boss-log-info"
+                msg = html.escape(entry.get("message", ""))
+                at = html.escape(entry.get("at", ""))
+                log_html += f'<div class="{css_class}">[{at}] {msg}</div>'
+            st.markdown(f'<div class="boss-log-box">{log_html}</div>', unsafe_allow_html=True)
+        else:
+            st.markdown('<div class="boss-log-box"><span style="color:#94A3B8">等待采集开始...</span></div>', unsafe_allow_html=True)
 
-# --- Logs ---
-section_title("实时日志")
-with st.container(border=True):
-    logs = runtime.get("logs", [])
-    if logs:
-        log_html = ""
-        for entry in logs[-50:]:
-            level = entry.get("level", "info")
-            css_class = "boss-log-error" if level == "error" else "boss-log-info"
-            msg = html.escape(entry.get("message", ""))
-            at = html.escape(entry.get("at", ""))
-            log_html += f'<div class="{css_class}">[{at}] {msg}</div>'
-        st.markdown(f'<div class="boss-log-box">{log_html}</div>', unsafe_allow_html=True)
-    else:
-        st.markdown('<div class="boss-log-box"><span style="color:#94A3B8">等待采集开始...</span></div>', unsafe_allow_html=True)
-
-# --- Candidates ---
-candidates = runtime.get("candidates", [])
-if candidates:
-    section_title("候选人列表")
-    with st.container(border=True):
-        for c in reversed(candidates[-20:]):
-            sig = c.get("signature", "")
-            status = c.get("status", "")
-            prefix = "已下载" if "download" in status else "已跳过"
-            detail = c.get("file", "") or c.get("reason", "")
-            st.markdown(f"**{prefix}** `{sig}` — {detail}")
+    with result_cols[1]:
+        st.markdown("**候选人列表**")
+        candidates = runtime.get("candidates", [])
+        if candidates:
+            rows = []
+            for c in reversed(candidates[-30:]):
+                sig = c.get("signature", "")
+                parts = sig.split("/")
+                rows.append({
+                    "姓名": parts[0] if len(parts) > 0 else "",
+                    "年龄": parts[1] if len(parts) > 1 else "",
+                    "学历": parts[2] if len(parts) > 2 else "",
+                    "状态": "已下载" if "download" in c.get("status", "") else "已跳过",
+                    "详情": c.get("file", "") or c.get("reason", ""),
+                    "时间": c.get("at", ""),
+                })
+            st.dataframe(rows, use_container_width=True, hide_index=True, height=300)
+        else:
+            st.markdown('<div class="boss-log-box"><span style="color:#94A3B8">暂无候选人。采集后会自动出现在这里。</span></div>', unsafe_allow_html=True)
 
 # --- Setup Guide ---
 with st.expander("首次使用？查看扩展安装指引"):

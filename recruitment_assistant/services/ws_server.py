@@ -3,6 +3,7 @@
 import asyncio
 import json
 import threading
+from datetime import datetime
 from typing import Callable
 
 from loguru import logger
@@ -19,6 +20,10 @@ class BossWSServer:
         self._server = None
         self._command_queue: asyncio.Queue | None = None
         self._startup_error: str = ""
+        self._connection_seq = 0
+        self.last_connected_at: str = ""
+        self.last_disconnected_at: str = ""
+        self.last_disconnect_reason: str = ""
 
     @property
     def is_listening(self) -> bool:
@@ -30,7 +35,17 @@ class BossWSServer:
 
     @property
     def is_extension_connected(self) -> bool:
-        return self.extension_ws is not None
+        return self.extension_ws is not None and not getattr(self.extension_ws, "closed", False)
+
+    @property
+    def connection_snapshot(self) -> dict:
+        return {
+            "connected": self.is_extension_connected,
+            "last_connected_at": self.last_connected_at,
+            "last_disconnected_at": self.last_disconnected_at,
+            "last_disconnect_reason": self.last_disconnect_reason,
+        }
+
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -90,15 +105,20 @@ class BossWSServer:
             await self._shutdown_event.wait()
 
     async def _handler(self, websocket) -> None:
-        if self.extension_ws is not None:
+        if self.extension_ws is not None and not getattr(self.extension_ws, "closed", False):
             try:
-                await self.extension_ws.close()
+                await self.extension_ws.close(code=1000, reason="replaced_by_new_connection")
             except Exception:
                 pass
         self.extension_ws = websocket
-        logger.info("Chrome 扩展已连接")
+        self._connection_seq += 1
+        connection_id = self._connection_seq
+        self.last_connected_at = datetime.now().isoformat(timespec="seconds")
+        self.last_disconnect_reason = ""
+        logger.info("Chrome 扩展已连接 #{}", connection_id)
 
         send_task = asyncio.create_task(self._send_loop(websocket))
+        disconnect_reason = "normal_close"
         try:
             async for message in websocket:
                 try:
@@ -108,12 +128,25 @@ class BossWSServer:
                 except json.JSONDecodeError:
                     logger.warning("收到无效 JSON: {}", message[:100])
         except Exception as exc:
-            logger.info("扩展连接断开: {}", exc)
+            disconnect_reason = str(exc)
+            logger.info("扩展连接断开 #{}: {}", connection_id, exc)
         finally:
             send_task.cancel()
             if self.extension_ws is websocket:
                 self.extension_ws = None
-                logger.info("Chrome 扩展已断开")
+                self.last_disconnected_at = datetime.now().isoformat(timespec="seconds")
+                self.last_disconnect_reason = disconnect_reason
+                logger.info("Chrome 扩展已断开 #{}", connection_id)
+                if self.on_event:
+                    self.on_event({
+                        "type": "extension_disconnected",
+                        "data": {
+                            "connection_id": connection_id,
+                            "reason": disconnect_reason,
+                            "at": self.last_disconnected_at,
+                        },
+                    })
+
 
     async def _send_loop(self, websocket) -> None:
         while True:

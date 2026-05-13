@@ -1,5 +1,39 @@
 # 开发日志
 
+## 2026-05-13
+
+### V1.34 BOSS 采集页面与扩展识别增强
+
+#### 已完成内容
+
+- 优化 `app/pages/08_BOSS采集.py` 页面布局：
+  - 将连接状态、测试轮次整合为“运行状态”紧凑栏目。
+  - 将采集配置、采集统计、实时日志、候选人列表整合为“采集与结果”栏目。
+  - 移除测试操作循环说明、BOSS 页面地址和日志文件名显示。
+  - 将实时日志前置到第一屏内，候选人列表改为与采集任务页一致的表格展示。
+  - 调整 WebSocket、扩展连接、BOSS 页面就绪 banner 等高展示，操作按钮等高、不换行、保持间距。
+
+- 增强 Chrome Extension 采集链路：
+  - `chrome_extension/background.js` 增加扩展版本上报、15 秒心跳、页面探测命令转发、内容脚本补注入和 Chrome 下载事件归属。
+  - `chrome_extension/content.js` 收窄候选人列表、候选人详情区、附件简历按钮和简历下载按钮的 DOM 识别范围。
+  - 增加候选人文本清洗和活跃状态过滤，降低姓名被识别为“刚刚活跃”的概率。
+  - 增强附件简历按钮状态识别，区分可查看、可索要、已请求和状态未知。
+  - 增强简历预览页右上角下载图标定位逻辑。
+
+- 增强 BOSS WebSocket 服务与桥接日志：
+  - `recruitment_assistant/services/ws_server.py` 增加连接序号、连接/断开时间、断开原因和连接快照。
+  - `recruitment_assistant/services/boss_ws_bridge.py` 增加扩展心跳、页面重检、候选人扫描样例、附件按钮状态和下载保存日志。
+  - BOSS 简历保存文件名按姓名、年龄、学历等字段规范化，继续与智联采集模块保持一致。
+
+- 同步版本：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.34`。
+  - `chrome_extension/manifest.json` 与 `chrome_extension/background.js` 扩展版本更新为 `1.8.0`。
+
+#### 后续验证事项
+
+- 需要在 `chrome://extensions/` 重新加载本地扩展，确认页面显示扩展版本 `1.8.0` 后再测试。
+- 继续通过 BOSS 沟通页实测确认候选人姓名识别和附件简历下载是否稳定。
+
 ## 2026-05-12
 
 ### V1.23 BOSS Adapter/CDP 旧链路清理

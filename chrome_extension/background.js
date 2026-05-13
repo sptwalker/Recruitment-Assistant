@@ -1,5 +1,8 @@
 const WS_URL = "ws://127.0.0.1:8765";
+const EXTENSION_VERSION = "1.8.0";
+const HEARTBEAT_INTERVAL_MS = 15000;
 let ws = null;
+let heartbeatTimer = null;
 let reconnectDelay = 1000;
 let collectState = "idle";
 let activeRunId = "";
@@ -7,12 +10,16 @@ let lastDownloadIntent = null;
 const pendingDownloads = new Map();
 
 function connect() {
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+
   ws = new WebSocket(WS_URL);
 
   ws.onopen = () => {
     reconnectDelay = 1000;
-    ws.send(JSON.stringify({ type: "extension_connected", data: { version: "1.2.0", downloads_api: true } }));
+    sendToServer({ type: "extension_connected", data: { version: EXTENSION_VERSION, downloads_api: true } });
+    startHeartbeat();
     updateBadge("on");
+    setTimeout(() => sendToContentScript({ type: "probe_page", run_id: activeRunId }), 300);
   };
 
   ws.onmessage = (event) => {
@@ -21,7 +28,8 @@ function connect() {
     handleServerCommand(msg);
   };
 
-  ws.onclose = () => {
+  ws.onclose = (event) => {
+    stopHeartbeat();
     ws = null;
     updateBadge("off");
     setTimeout(connect, reconnectDelay);
@@ -51,13 +59,48 @@ function handleServerCommand(msg) {
       collectState = "idle";
       sendToContentScript({ type: "stop_collect", run_id: activeRunId });
       break;
+    case "probe_page":
+      sendToContentScript({ type: "probe_page", run_id: activeRunId });
+      break;
+  }
+}
+
+function bossChatUrlPatterns() {
+  return ["https://www.zhipin.com/*"];
+}
+
+function isBossCandidatePage(url = "") {
+  return /^https:\/\/www\.zhipin\.com\//.test(url) && /chat|friend|geek|boss|web/.test(url);
+}
+
+async function ensureContentScript(tabId) {
+  try {
+    await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] });
+    return true;
+  } catch (error) {
+    return false;
   }
 }
 
 function sendToContentScript(msg) {
-  chrome.tabs.query({ url: "https://www.zhipin.com/web/*chat*" }, (tabs) => {
-    for (const tab of tabs) {
-      chrome.tabs.sendMessage(tab.id, msg);
+  chrome.tabs.query({ url: bossChatUrlPatterns() }, async (tabs) => {
+    const candidateTabs = tabs.filter((tab) => isBossCandidatePage(tab.url || ""));
+    sendToServer({ type: "boss_tabs_scanned", data: { count: candidateTabs.length, urls: candidateTabs.map((tab) => tab.url || "") } });
+
+    for (const tab of candidateTabs) {
+      chrome.tabs.sendMessage(tab.id, msg, async () => {
+        if (!chrome.runtime.lastError) return;
+        const injected = await ensureContentScript(tab.id);
+        if (!injected) {
+          sendToServer({ type: "content_script_inject_failed", data: { tab_id: tab.id, url: tab.url || "" } });
+          return;
+        }
+        chrome.tabs.sendMessage(tab.id, msg, () => {
+          if (chrome.runtime.lastError) {
+            sendToServer({ type: "content_script_message_failed", data: { tab_id: tab.id, url: tab.url || "", error: chrome.runtime.lastError.message } });
+          }
+        });
+      });
     }
   });
 }
@@ -65,6 +108,21 @@ function sendToContentScript(msg) {
 function sendToServer(event) {
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(event));
+  }
+}
+
+function startHeartbeat() {
+  stopHeartbeat();
+  sendToServer({ type: "heartbeat", data: { version: EXTENSION_VERSION, collect_state: collectState, at: Date.now() } });
+  heartbeatTimer = setInterval(() => {
+    sendToServer({ type: "heartbeat", data: { version: EXTENSION_VERSION, collect_state: collectState, at: Date.now() } });
+  }, HEARTBEAT_INTERVAL_MS);
+}
+
+function stopHeartbeat() {
+  if (heartbeatTimer) {
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
   }
 }
 

@@ -1609,6 +1609,7 @@ class ZhilianAdapter(BasePlatformAdapter):
         texts: list[str],
         timeout: int = 8000,
         exclude_texts: list[str] | None = None,
+        double_click: bool = False,
     ) -> bool:
         script = r"""
             ({texts, excludes}) => {
@@ -1679,12 +1680,6 @@ class ZhilianAdapter(BasePlatformAdapter):
                 const rect = item.el.getBoundingClientRect();
                 const x = rect.left + Math.min(Math.max(rect.width * 0.5, 8), Math.max(rect.width - 8, 8));
                 const y = rect.top + Math.min(Math.max(rect.height * 0.5, 8), Math.max(rect.height - 8, 8));
-                for (const type of ['pointerover', 'mouseover', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
-                    const eventOptions = { bubbles: true, cancelable: true, clientX: x, clientY: y, button: 0, buttons: type.includes('down') ? 1 : 0, pointerType: 'mouse' };
-                    const event = type.startsWith('pointer') ? new PointerEvent(type, eventOptions) : new MouseEvent(type, eventOptions);
-                    item.el.dispatchEvent(event);
-                }
-                if (typeof item.el.click === 'function') item.el.click();
                 return { text: item.text.slice(0, 160), x, y, tag: item.tag, href: item.href || '', cls: String(item.cls || '').slice(0, 80), score: item.score };
             }
         """
@@ -1699,11 +1694,11 @@ class ZhilianAdapter(BasePlatformAdapter):
                     continue
                 if result:
                     page.mouse.move(result["x"], result["y"])
-                    page.mouse.down()
-                    page.wait_for_timeout(80)
-                    page.mouse.up()
+                    page.mouse.click(result["x"], result["y"], delay=40)
+                    if double_click:
+                        page.wait_for_timeout(80)
+                        page.mouse.click(result["x"], result["y"], delay=40)
                     page.wait_for_timeout(120)
-                    page.mouse.click(result["x"], result["y"], click_count=2, delay=80)
                     logger.info(
                         "已点击聊天详情按钮：text={} tag={} href={} score={} class={}",
                         result.get("text"),
@@ -2625,11 +2620,34 @@ class ZhilianAdapter(BasePlatformAdapter):
         def can_continue() -> bool:
             return should_continue() if should_continue else True
 
-        def diag(message: str) -> None:
-            text = message
+        def diag(message) -> None:
+            text = message if isinstance(message, str) else str(message)
             logger.info(text)
             if on_diagnostic:
-                on_diagnostic(text)
+                on_diagnostic(message)
+
+        def diag_event(
+            stage: str,
+            action: str = "",
+            status: str = "",
+            cost_ms: int | float | None = None,
+            wait_ms: int | float | None = None,
+            candidate: str = "",
+            **fields,
+        ) -> None:
+            payload = {
+                "stage": stage,
+                "action": action,
+                "status": status,
+                "cost_ms": int(cost_ms) if cost_ms is not None else None,
+                "wait_ms": int(wait_ms) if wait_ms is not None else None,
+                "candidate": candidate,
+                **fields,
+            }
+            logger.info("STEP {}.{} | status={} | cost={}ms | wait={}ms | candidate={}", stage, action, status, payload.get("cost_ms"), payload.get("wait_ms"), candidate)
+            if on_diagnostic:
+                on_diagnostic(payload)
+
 
         def handle_request(request: Request) -> None:
             url = request.url
@@ -2650,13 +2668,18 @@ class ZhilianAdapter(BasePlatformAdapter):
                     source_page = None
                 page_id = id(source_page) if source_page and not source_page.is_closed() else 0
                 if active_candidate_page_ids and page_id and page_id not in active_candidate_page_ids:
-                    diag(
-                        "已丢弃非当前候选人页面的下载请求："
-                        f"page_id={page_id}，url_hash={text_hash(url)[:10] if text_hash(url) else '空'}"
+                    diag_event(
+                        "attachment",
+                        "request_event",
+                        "ignored",
+                        candidate=active_candidate_identity,
+                        reason="non_current_page",
+                        page_id=page_id,
+                        url_hash=text_hash(url)[:10] if text_hash(url) else "空",
                     )
                     return
                 add_pending_url(url, now, page_id, dict(request.headers), source="network_request")
-                print(f"已从网络请求捕获当前候选人附件下载链接：{url}")
+                logger.info("已从网络请求捕获当前候选人附件下载链接：{}", url)
 
         def handle_response(response: Response) -> None:
             now = time.monotonic()
@@ -2688,17 +2711,24 @@ class ZhilianAdapter(BasePlatformAdapter):
                 request_headers = {}
             page_id = id(source_page) if source_page and not source_page.is_closed() else 0
             if active_candidate_page_ids and page_id and page_id not in active_candidate_page_ids:
-                diag(
-                    "已丢弃非当前候选人页面的附件响应："
-                    f"page_id={page_id}，url_hash={text_hash(url)[:10] if text_hash(url) else '空'}"
+                diag_event(
+                    "attachment",
+                    "response",
+                    "ignored",
+                    candidate=active_candidate_identity,
+                    reason="non_current_page",
+                    page_id=page_id,
+                    url_hash=text_hash(url)[:10] if text_hash(url) else "空",
                 )
                 return
             add_pending_url(url, now, page_id, request_headers, source="network_response")
-            diag(
-                "已从网络响应捕获疑似附件下载链接："
-                f"status={response.status}，url_hash={text_hash(url)[:10] if text_hash(url) else '空'}，"
-                f"content-type={(response.headers or {}).get('content-type', '')}，"
-                f"content-disposition={(response.headers or {}).get('content-disposition', '')[:80]}"
+            logger.info(
+                "附件响应已捕获：candidate={}，status={}，url_hash={}，content_type={}，content_disposition={}",
+                active_candidate_identity or "空",
+                response.status,
+                text_hash(url)[:10] if text_hash(url) else "空",
+                (response.headers or {}).get("content-type", ""),
+                (response.headers or {}).get("content-disposition", "")[:80],
             )
 
         def handle_route(route: Route, request: Request) -> None:
@@ -2720,23 +2750,33 @@ class ZhilianAdapter(BasePlatformAdapter):
                         source_page = None
                     page_id = id(source_page) if source_page and not source_page.is_closed() else 0
                     if active_candidate_page_ids and page_id and page_id not in active_candidate_page_ids:
-                        diag(
-                            "已丢弃非当前候选人页面的拦截下载请求："
-                            f"page_id={page_id}，url_hash={text_hash(url)[:10] if text_hash(url) else '空'}"
+                        diag_event(
+                            "attachment",
+                            "route",
+                            "ignored",
+                            candidate=active_candidate_identity,
+                            reason="non_current_page",
+                            page_id=page_id,
+                            url_hash=text_hash(url)[:10] if text_hash(url) else "空",
                         )
                         route.continue_()
                         return
                     add_pending_url(url, now, page_id, dict(request.headers), source="route_intercept")
-                    diag(
-                        "已捕获当前候选人附件下载请求，允许浏览器原生下载以兼容 DOC/DOCX："
-                        f"url_hash={text_hash(url)[:10] if text_hash(url) else '空'}"
+                    logger.info(
+                        "附件路由已捕获：candidate={}，url_hash={}",
+                        active_candidate_identity or "空",
+                        text_hash(url)[:10] if text_hash(url) else "空",
                     )
                     route.continue_()
                     return
                 else:
-                    diag(
-                        "已阻止非当前候选人附件下载，避免浏览器下载气泡堆积："
-                        f"url_hash={text_hash(url)[:10] if text_hash(url) else '空'}"
+                    diag_event(
+                        "attachment",
+                        "route",
+                        "blocked",
+                        candidate=active_candidate_identity,
+                        reason="non_current_or_stale",
+                        url_hash=text_hash(url)[:10] if text_hash(url) else "空",
                     )
                 if request.is_navigation_request():
                     route.fulfill(
@@ -2774,10 +2814,13 @@ class ZhilianAdapter(BasePlatformAdapter):
                     "candidate_identity": active_candidate_identity,
                 }
             )
-            diag(
-                "已捕获浏览器原生下载事件："
-                f"filename={download.suggested_filename or '空'}，"
-                f"url_hash={text_hash(download.url or '')[:10] if text_hash(download.url or '') else '空'}"
+            diag_event(
+                "attachment",
+                "browser_download",
+                "captured",
+                candidate=active_candidate_identity,
+                filename=download.suggested_filename or "空",
+                url_hash=text_hash(download.url or "")[:10] if text_hash(download.url or "") else "空",
             )
 
         def bind_download_listener(target_page: Page) -> None:
@@ -2790,7 +2833,7 @@ class ZhilianAdapter(BasePlatformAdapter):
             bind_download_listener(new_page)
             if active_candidate_started_at:
                 active_candidate_page_ids.add(id(new_page))
-            diag("已监听新弹出页面的下载事件。")
+            logger.info("已监听新弹出页面的下载事件。")
 
         def bind_existing_download_pages() -> None:
             for target_page in [item for item in session.context.pages if not item.is_closed()]:
@@ -2842,29 +2885,40 @@ class ZhilianAdapter(BasePlatformAdapter):
             candidate_identity = active_candidate_identity
             url_hash = text_hash(url)[:10] if text_hash(url) else "空"
             if active_candidate_page_ids and not page_id and source in {"network_request", "network_response", "route_intercept"}:
-                diag(f"附件链接未入队：reason=missing_page_id，source={source}，identity={candidate_identity or '空'}，url_hash={url_hash}")
+                logger.info("附件链接未入队：reason=missing_page_id，source={}，identity={}，url_hash={}", source, candidate_identity or "空", url_hash)
                 return
             if active_candidate_page_ids and page_id and page_id not in active_candidate_page_ids:
-                diag(f"附件链接未入队：reason=non_current_page，source={source}，page_id={page_id}，url_hash={url_hash}")
+                logger.info("附件链接未入队：reason=non_current_page，source={}，page_id={}，url_hash={}", source, page_id, url_hash)
                 return
             if url in downloaded_urls:
-                diag(f"附件链接未入队：reason=downloaded，source={source}，page_id={page_id}，url_hash={url_hash}")
+                logger.info("附件链接未入队：reason=downloaded，source={}，page_id={}，url_hash={}", source, page_id, url_hash)
                 return
             if url in ignored_attachment_urls:
-                diag(f"附件链接未入队：reason=ignored_old_or_polluted，source={source}，page_id={page_id}，url_hash={url_hash}")
+                logger.info("附件链接未入队：reason=ignored_old_or_polluted，source={}，page_id={}，url_hash={}", source, page_id, url_hash)
                 return
             if url in failed_download_urls:
-                diag(f"附件链接未入队：reason=failed，source={source}，page_id={page_id}，url_hash={url_hash}")
+                logger.info("附件链接未入队：reason=failed，source={}，page_id={}，url_hash={}", source, page_id, url_hash)
                 return
             if any(item.get("url") == url for item in pending_urls):
-                diag(f"附件链接未入队：reason=duplicate_pending，source={source}，page_id={page_id}，url_hash={url_hash}")
+                logger.info("附件链接未入队：reason=duplicate_pending，source={}，page_id={}，url_hash={}", source, page_id, url_hash)
                 return
-            pending_urls.append({"url": url, "created_at": created_at, "page_id": page_id, "headers": request_headers or {}, "source": source, "candidate_identity": candidate_identity})
-            diag(
-                "附件链接入队："
-                f"source={source}，page_id={page_id}，identity={candidate_identity or '空'}，url_hash={url_hash}，"
-                f"pending_urls={len(pending_urls)}，pending_downloads={len(pending_downloads)}"
+            item = {"url": url, "created_at": created_at, "page_id": page_id, "headers": request_headers or {}, "source": source, "candidate_identity": candidate_identity}
+            if source in {"route_intercept", "network_response", "network_request"}:
+                pending_urls.insert(0, item)
+            else:
+                pending_urls.append(item)
+            diag_event(
+                "attachment",
+                "queue_url",
+                "queued",
+                candidate=candidate_identity or "",
+                source=source,
+                page_id=page_id,
+                url_hash=url_hash,
+                pending_urls=len(pending_urls),
+                pending_downloads=len(pending_downloads),
             )
+
 
         def cleanup_current_candidate_pages() -> int:
             closed_count = 0
@@ -2904,11 +2958,13 @@ class ZhilianAdapter(BasePlatformAdapter):
             if not self._open_chat_interface(page):
                 raise RuntimeError("未能进入智联聊天界面，请检查页面是否已登录或传入 --url 聊天页面地址。")
             save_debug_snapshot("opened_chat")
-            print("\n智联聊天候选人全自动采集已启动：")
-            print("1. 自动扫描包含'未联系'的候选人。")
-            print("2. 自动点击候选人、'要附件简历'、'查看附件简历'。")
-            print("3. 自动捕获附件下载链接并保存 PDF。")
-            print(f"4. 目标数量：{max_resumes}，最长运行：{wait_seconds} 秒。\n")
+            diag_event(
+                "collect",
+                "open_chat",
+                "ready",
+                target=max_resumes,
+                max_run_ms=wait_seconds * 1000,
+            )
 
             deadline = time.monotonic() + wait_seconds
             consecutive_not_found = 0
@@ -2939,37 +2995,57 @@ class ZhilianAdapter(BasePlatformAdapter):
                     should_skip_candidate_signature,
                     emit_skipped_candidate,
                 )
-                diag(
-                    f"候选人扫描完成：status={click_result.get('status')}，target_count={click_result.get('target_count')}，"
-                    f"targets_skip={click_result.get('skipped_count')}，scan_ms={click_result.get('elapsed_ms')}，seen={len(seen_candidates)}"
+                diag_event(
+                    "candidate",
+                    "scan",
+                    click_result.get("status") or "unknown",
+                    cost_ms=click_result.get("elapsed_ms"),
+                    target_count=click_result.get("target_count"),
+                    skipped=click_result.get("skipped_count"),
+                    seen=len(seen_candidates),
                 )
                 if click_result.get("skip_samples"):
-                    diag(f"候选人扫描跳过样本：{'; '.join(click_result.get('skip_samples') or [])}")
+                    logger.info("候选人扫描跳过样本：{}", "; ".join(click_result.get("skip_samples") or []))
                 if not can_continue():
                     break
                 status = click_result.get("status")
                 if status == "skipped_only":
-                    diag(f"本轮全部命中点击前重复，未进入按钮/下载慢路径，轮次耗时={time.monotonic() - iter_started:.2f}s")
                     scrolled = self._scroll_candidate_list(page, 900)
-                    diag(f"已滚动左侧候选列表：scrolled={scrolled}")
+                    diag_event(
+                        "candidate",
+                        "scan_round",
+                        "skipped_only",
+                        cost_ms=(time.monotonic() - iter_started) * 1000,
+                        wait_ms=300,
+                        scrolled=scrolled,
+                    )
                     page.wait_for_timeout(300)
                     continue
                 if status == "not_found":
                     consecutive_not_found += 1
                     backoff_ms = min(3000, 500 + consecutive_not_found * 300)
                     scrolled = self._scroll_candidate_list(page, 900)
-                    diag(
-                        f"未收集到候选人卡片，已尝试滚动左侧列表，scrolled={scrolled}，连续={consecutive_not_found}，"
-                        f"等待={backoff_ms}ms，轮次耗时={time.monotonic() - iter_started:.2f}s"
+                    diag_event(
+                        "candidate",
+                        "scan_round",
+                        "not_found",
+                        cost_ms=(time.monotonic() - iter_started) * 1000,
+                        wait_ms=backoff_ms,
+                        scrolled=scrolled,
+                        consecutive=consecutive_not_found,
                     )
                     logger.warning("未找到新的候选人卡片，尝试滚动左侧候选列表。")
                     page.wait_for_timeout(backoff_ms)
                     if consecutive_not_found in {4, 8, 12}:
                         self._print_candidate_candidates(page)
                     if consecutive_not_found >= 18:
-                        diag(
-                            f"连续多次未收集到候选人卡片，当前已保存 {len(results)}/{max_resumes}，"
-                            "判断左侧候选列表已无可处理新卡片，结束采集。"
+                        diag_event(
+                            "candidate",
+                            "scan_round",
+                            "exhausted",
+                            saved=len(results),
+                            target=max_resumes,
+                            consecutive=consecutive_not_found,
                         )
                         break
                     continue
@@ -2980,7 +3056,7 @@ class ZhilianAdapter(BasePlatformAdapter):
                 ignored_attachment_urls.clear()
                 closed_stale_pages = close_non_chat_pages(page)
                 if closed_stale_pages:
-                    diag(f"已关闭候选人切换前残留简历/附件页面：{closed_stale_pages} 个。")
+                    logger.info("已关闭候选人切换前残留简历/附件页面：{} 个。", closed_stale_pages)
                 ignored_attachment_urls.update(
                     self._find_latest_chat_attachment_urls(
                         page,
@@ -3001,18 +3077,27 @@ class ZhilianAdapter(BasePlatformAdapter):
                 if candidate_identity_key:
                     seen_candidates.add(candidate_identity_key)
                 previous_detail_hash = text_hash(re.sub(r"\s+", "", previous_detail_text or ""))[:10] if previous_detail_text else "空"
-                diag(
-                    "候选人点击链路："
-                    f"click=({click_result.get('click_x')},{click_result.get('click_y')})，"
-                    f"position={click_result.get('position_key') or '空'}，stable_id={click_result.get('stable_id') or '空'}，"
-                    f"identity={click_result.get('identity_key') or candidate_identity_key or '空'}，"
-                    f"before_detail_hash={previous_detail_hash}，"
-                    f"signature={display_signature[:80]}"
+                diag_event(
+                    "candidate",
+                    "click",
+                    "selected",
+                    candidate=display_signature[:80],
+                    click=f"{click_result.get('click_x')},{click_result.get('click_y')}",
+                    position=click_result.get("position_key") or "空",
+                    stable_id=click_result.get("stable_id") or "空",
+                    identity=click_result.get("identity_key") or candidate_identity_key or "空",
+                    before_detail_hash=previous_detail_hash,
                 )
-                print(f"已选择候选人：{display_signature[:80]}")
+                logger.info("已选择候选人：{}", display_signature[:80])
                 page.wait_for_timeout(300)
                 if self._dismiss_violation_candidate_dialog(page):
-                    diag(f"检测到违规候选人警告窗口，已点击'知道了'并跳过当前候选人：{display_signature[:80]}")
+                    diag_event(
+                        "candidate",
+                        "violation_dialog",
+                        "skipped",
+                        candidate=display_signature[:80],
+                        reason="violation_candidate_dialog",
+                    )
                     if on_resume_skipped:
                         on_resume_skipped({
                             "platform_code": self.platform_code,
@@ -3029,17 +3114,28 @@ class ZhilianAdapter(BasePlatformAdapter):
                     self._scroll_candidate_list(page, 520)
                     page.wait_for_timeout(300)
                     continue
+                detail_switch_started = time.monotonic()
                 detail_switch = self._wait_candidate_detail_switched(page, display_signature, timeout_ms=6000, previous_detail_text=previous_detail_text)
-                diag(
-                    "候选人详情切换诊断："
-                    f"switched={detail_switch.get('switched')}，reason={detail_switch.get('reason')}，"
-                    f"matched={detail_switch.get('matched')}，expected=({detail_switch.get('expected_name') or '空'}/"
-                    f"{detail_switch.get('expected_age') or '空'}/{detail_switch.get('expected_education') or '空'})，"
-                    f"hash={detail_switch.get('before_hash')}->{detail_switch.get('after_hash')}，"
-                    f"detail={detail_switch.get('detail_preview') or '空'}"
+                diag_event(
+                    "candidate",
+                    "detail_switch",
+                    "ok" if detail_switch.get("switched") else "skipped",
+                    cost_ms=(time.monotonic() - detail_switch_started) * 1000,
+                    wait_ms=(time.monotonic() - detail_switch_started) * 1000,
+                    candidate=display_signature[:80],
+                    reason=detail_switch.get("reason"),
+                    matched=detail_switch.get("matched"),
+                    expected=f"{detail_switch.get('expected_name') or '空'}/{detail_switch.get('expected_age') or '空'}/{detail_switch.get('expected_education') or '空'}",
+                    hash=f"{detail_switch.get('before_hash')}->{detail_switch.get('after_hash')}",
                 )
                 if not detail_switch.get("switched"):
-                    diag(f"候选人详情未确认切换到当前候选人，已跳过以避免复用上一位附件：{display_signature[:80]}")
+                    diag_event(
+                        "candidate",
+                        "detail_switch",
+                        "skipped",
+                        candidate=display_signature[:80],
+                        reason="candidate_detail_not_switched",
+                    )
                     pending_urls.clear()
                     ignored_attachment_urls.update(
                         self._find_latest_chat_attachment_urls(
@@ -3065,6 +3161,7 @@ class ZhilianAdapter(BasePlatformAdapter):
                     self._scroll_candidate_list(page, 520)
                     page.wait_for_timeout(300)
                     continue
+                profile_extract_started = time.monotonic()
                 profile_info_before_download = self._extract_current_candidate_info(
                     page,
                     display_signature,
@@ -3076,7 +3173,14 @@ class ZhilianAdapter(BasePlatformAdapter):
                     for key in ["name", "age", "education"]
                 )
                 duplicate_before_download = should_skip_candidate_profile(profile_info_before_download, display_signature) if should_skip_candidate_profile else False
-                diag(f"下载前个人信息重复拦截：duplicate={duplicate_before_download}，profile={profile_label}，候选人={display_signature[:80]}")
+                diag_event(
+                    "profile",
+                    "extract",
+                    "ok",
+                    cost_ms=(time.monotonic() - profile_extract_started) * 1000,
+                    candidate=profile_label,
+                    duplicate=duplicate_before_download,
+                )
                 if duplicate_before_download:
                     pending_urls.clear()
                     if on_resume_skipped:
@@ -3098,6 +3202,14 @@ class ZhilianAdapter(BasePlatformAdapter):
                 save_debug_snapshot(f"candidate_{len(results) + 1}_selected")
                 if not can_continue():
                     break
+                active_candidate_started_at = time.monotonic()
+                active_candidate_page_ids.clear()
+                active_candidate_page_ids.add(id(page))
+                candidate_download_started = active_candidate_started_at
+                stale_download_count = drain_stale_downloads(candidate_download_started)
+                if stale_download_count:
+                    logger.info("已丢弃候选人切换前残留浏览器下载事件：{} 个。", stale_download_count)
+                bind_existing_download_pages()
                 request_started = time.monotonic()
                 request_button_state = self._get_request_attachment_button_state(page)
                 request_clicked = False
@@ -3105,31 +3217,90 @@ class ZhilianAdapter(BasePlatformAdapter):
                 if request_button_state == "enabled":
                     request_clicked = self._click_request_attachment_resume(page)
                     if request_clicked:
-                        ready_wait_seconds = min(max(per_candidate_wait_seconds, 8), 30)
+                        ready_wait_seconds = min(per_candidate_wait_seconds, 3)
                         ready_started = time.monotonic()
                         attachment_ready = self._wait_for_requested_attachment_ready(page, ready_wait_seconds, can_continue)
-                        diag(
-                            f"新联系人索要附件后等待结果：ready={attachment_ready}，耗时={time.monotonic() - ready_started:.2f}s，"
-                            f"等待上限={ready_wait_seconds}s"
+                        diag_event(
+                            "attachment",
+                            "request_wait",
+                            "ready" if attachment_ready else "timeout",
+                            cost_ms=(time.monotonic() - ready_started) * 1000,
+                            wait_ms=(time.monotonic() - ready_started) * 1000,
+                            candidate=profile_label,
+                            wait_limit_ms=ready_wait_seconds * 1000,
                         )
                 elif request_button_state == "view":
-                    diag("右下角按钮为查看附件简历，跳过索要按钮，直接进入查看附件流程。")
+                    logger.info("右下角按钮为查看附件简历，跳过索要按钮，直接进入查看附件流程。")
                 elif request_button_state == "already_requested":
-                    diag("右下角按钮显示已索要附件简历，跳过索要按钮并短等待。")
+                    logger.info("右下角按钮显示已索要附件简历，跳过索要按钮并短等待。")
                 elif request_button_state in {"disabled", "view_disabled"}:
-                    diag(f"右下角附件按钮不可用，button_state={request_button_state}。")
+                    logger.info("右下角附件按钮不可用，button_state={}。", request_button_state)
                 else:
                     logger.warning("右下角未找到附件相关按钮，继续尝试点击'查看简历附件'。")
-                diag(
-                    f"右下角附件按钮状态检查完成：request_clicked={request_clicked}，button_state={request_button_state}，"
-                    f"attachment_ready={attachment_ready}，耗时={time.monotonic() - request_started:.2f}s"
+                diag_event(
+                    "attachment",
+                    "request_button",
+                    "ready" if attachment_ready else request_button_state or "unknown",
+                    cost_ms=(time.monotonic() - request_started) * 1000,
+                    wait_ms=(time.monotonic() - request_started) * 1000 if request_clicked else 0,
+                    candidate=profile_label,
+                    request_clicked=request_clicked,
+                    button_state=request_button_state,
+                    attachment_ready=attachment_ready,
                 )
-                page.wait_for_timeout(300)
                 save_debug_snapshot(f"candidate_{len(results) + 1}_requested")
                 if not can_continue():
                     break
 
                 current_candidate_polluted = False
+                if request_clicked and not attachment_ready and not pending_urls and not pending_downloads:
+                    wait_started = time.monotonic()
+                    diag_event(
+                        "attachment",
+                        "capture",
+                        "timeout",
+                        cost_ms=0,
+                        wait_ms=0,
+                        candidate=profile_label,
+                        planned_wait_ms=0,
+                        request_clicked=request_clicked,
+                        button_state=request_button_state,
+                        attachment_ready=attachment_ready,
+                        view_clicked=False,
+                        pending_urls=0,
+                        pending_downloads=0,
+                        reason="requested_attachment_not_ready_fast_skip",
+                    )
+                    if on_resume_skipped:
+                        on_resume_skipped({
+                            "platform_code": self.platform_code,
+                            "source_url": page.url,
+                            "raw_json": {
+                                "candidate_signature": display_signature,
+                                "pre_download_candidate_info": profile_info_before_download,
+                                "candidate_info": profile_info_before_download,
+                                "attachment": {},
+                                "skip_stage": "requested_attachment_not_ready",
+                            },
+                            "raw_html_path": None,
+                            "content_hash": "",
+                        })
+                    diag_event(
+                        "candidate",
+                        "summary",
+                        "skipped",
+                        cost_ms=(time.monotonic() - iter_started) * 1000,
+                        wait_ms=(time.monotonic() - wait_started) * 1000,
+                        candidate=profile_label,
+                        reason="requested_attachment_not_ready",
+                    )
+                    closed_current_pages = cleanup_current_candidate_pages()
+                    if closed_current_pages:
+                        logger.info("已关闭本候选人产生的简历/附件页面：{} 个。", closed_current_pages)
+                    active_candidate_started_at = 0.0
+                    active_candidate_identity = ""
+                    page.wait_for_timeout(50)
+                    continue
 
                 def process_downloaded_row(row: dict, source_label: str, source_url: str = "") -> bool:
                     nonlocal last_download_monotonic, current_candidate_polluted
@@ -3177,11 +3348,17 @@ class ZhilianAdapter(BasePlatformAdapter):
                             except Exception:
                                 pass
                             closed_count = cleanup_current_candidate_pages()
-                            diag(
-                                "已丢弃疑似归属污染附件并终止当前候选人附件处理："
-                                f"content_hash={content_hash[:12]}，当前候选人={display_signature[:40]}，"
-                                f"此前候选人={previous_identity[:40]}，source={source_label}，"
-                                f"url_hash={text_hash(polluted_url)[:10] if polluted_url else '空'}，关闭页面={closed_count}"
+                            diag_event(
+                                "attachment",
+                                "owner_check",
+                                "failed",
+                                candidate=display_signature[:40],
+                                reason="content_hash_owner_mismatch",
+                                content_hash=content_hash[:12],
+                                previous_candidate=previous_identity[:40],
+                                source=source_label,
+                                url_hash=text_hash(polluted_url)[:10] if polluted_url else "空",
+                                closed_pages=closed_count,
                             )
                             return False
                     row["raw_json"]["candidate_signature"] = display_signature
@@ -3198,56 +3375,82 @@ class ZhilianAdapter(BasePlatformAdapter):
                     cleared_download_count = len(pending_downloads) - len(retained_downloads)
                     pending_downloads[:] = retained_downloads
                     if cleared_download_count:
-                        diag(f"已清理当前候选人保存后的残留浏览器下载事件：{cleared_download_count} 个。")
+                        logger.info("已清理当前候选人保存后的残留浏览器下载事件：{} 个。", cleared_download_count)
                     if on_resume_saved:
                         on_resume_saved(row)
                     save_debug_snapshot(f"candidate_{len(results)}_info")
-                    print(f"已自动保存第 {len(results)} 份：{attachment.get('file_path')}")
-                    diag(f"附件简历已保存：source={source_label}，file={attachment.get('file_name') or '空'}")
+                    logger.info("已自动保存第 {} 份：{}", len(results), attachment.get("file_path"))
+                    diag_event(
+                        "attachment",
+                        "save",
+                        "success",
+                        cost_ms=(time.monotonic() - candidate_download_started) * 1000,
+                        wait_ms=(time.monotonic() - wait_started) * 1000 if "wait_started" in locals() else None,
+                        candidate=profile_label,
+                        source=source_label,
+                        file=attachment.get("file_name") or "空",
+                    )
                     return True
 
-                active_candidate_started_at = time.monotonic()
-                active_candidate_page_ids.clear()
-                active_candidate_page_ids.add(id(page))
-                candidate_download_started = active_candidate_started_at
-                stale_download_count = drain_stale_downloads(candidate_download_started)
-                if stale_download_count:
-                    diag(f"已丢弃候选人切换前残留浏览器下载事件：{stale_download_count} 个。")
-                bind_existing_download_pages()
                 self._last_chat_detail_click = {}
                 view_started = time.monotonic()
                 pages_before_view_list = [item for item in session.context.pages if not item.is_closed()]
                 pages_before_view_ids = {id(item) for item in pages_before_view_list}
                 pages_before_view = len(pages_before_view_list)
                 view_clicked = self._click_view_attachment_resume(page)
-                page.wait_for_timeout(500)
+                post_view_wait_ms = 0 if pending_urls or pending_downloads else 300
+                if post_view_wait_ms:
+                    page.wait_for_timeout(post_view_wait_ms)
                 bind_existing_download_pages()
                 new_page_count = remember_candidate_pages(pages_before_view_ids)
                 pages_after_view = len([item for item in session.context.pages if not item.is_closed()])
                 visible_new_page_count = max(0, pages_after_view - pages_before_view)
                 click_meta = getattr(self, "_last_chat_detail_click", {}) or {}
-                diag(
-                    f"查看附件简历按钮查找完成：clicked={view_clicked}，entry={click_meta.get('source') or 'not_clicked'}，"
-                    f"target_text={str(click_meta.get('text') or '空')[:80]}，click=({click_meta.get('x', '空')},{click_meta.get('y', '空')})，"
-                    f"tag={click_meta.get('tag') or '空'}，href_hash={text_hash(click_meta.get('href') or '')[:10] if click_meta.get('href') else '空'}，"
-                    f"score={click_meta.get('score') or '空'}，耗时={time.monotonic() - view_started:.2f}s，"
-                    f"页面数={pages_before_view}->{pages_after_view}，本次新增页={visible_new_page_count}，绑定新增页={new_page_count}，"
-                    f"pending_downloads={len(pending_downloads)}，pending_urls={len(pending_urls)}"
+                diag_event(
+                    "attachment",
+                    "view_button",
+                    "clicked" if view_clicked else "not_found",
+                    cost_ms=(time.monotonic() - view_started) * 1000,
+                    wait_ms=post_view_wait_ms,
+                    candidate=profile_label,
+                    entry=click_meta.get("source") or "not_clicked",
+                    target_text=str(click_meta.get("text") or "空")[:80],
+                    click=f"{click_meta.get('x', '空')},{click_meta.get('y', '空')}",
+                    tag=click_meta.get("tag") or "空",
+                    href_hash=text_hash(click_meta.get("href") or "")[:10] if click_meta.get("href") else "空",
+                    score=click_meta.get("score") or "空",
+                    pages=f"{pages_before_view}->{pages_after_view}",
+                    new_pages=visible_new_page_count,
+                    bound_new_pages=new_page_count,
+                    pending_downloads=len(pending_downloads),
+                    pending_urls=len(pending_urls),
                 )
                 if not view_clicked:
                     logger.warning("当前候选人未找到'查看附件简历'按钮，等待可能的自动链接。")
                     self._print_chat_detail_actions(page)
                 latest_page_urls = self._find_latest_chat_attachment_urls(page, captured_urls, mark_captured=False)
                 if latest_page_urls:
-                    diag(f"已限定从当前候选人最新聊天区域捕获附件链接：count={len(latest_page_urls)}")
+                    diag_event(
+                        "attachment",
+                        "latest_chat_scan",
+                        "captured",
+                        candidate=profile_label,
+                        count=len(latest_page_urls),
+                    )
                     for url in latest_page_urls:
                         add_pending_url(url, time.monotonic(), id(page), source="latest_chat_after_view")
                 elif not pending_urls:
-                    diag("最新聊天区域未捕获附件链接，启用当前候选人页面DOM兜底扫描。")
+                    logger.info("最新聊天区域未捕获附件链接，启用当前候选人页面DOM兜底扫描。")
                     for url in self._find_attachment_urls_from_pages([page], captured_urls, mark_captured=False):
                         add_pending_url(url, time.monotonic(), id(page), source="dom_fallback_after_view")
                 if not view_clicked and pending_urls:
-                    diag(f"未点击到附件按钮，但已从当前聊天DOM兜底捕获附件链接：pending_urls={len(pending_urls)}")
+                    diag_event(
+                        "attachment",
+                        "dom_fallback",
+                        "captured",
+                        candidate=profile_label,
+                        pending_urls=len(pending_urls),
+                    )
 
                 wait_started = time.monotonic()
                 initial_pages = candidate_pages()
@@ -3267,9 +3470,9 @@ class ZhilianAdapter(BasePlatformAdapter):
                 elif view_clicked:
                     effective_wait_seconds = min(per_candidate_wait_seconds, 15)
                 elif request_button_state == "already_requested":
-                    effective_wait_seconds = min(per_candidate_wait_seconds, 4)
+                    effective_wait_seconds = min(per_candidate_wait_seconds, 3)
                 elif request_clicked and not attachment_ready:
-                    effective_wait_seconds = min(per_candidate_wait_seconds, 4)
+                    effective_wait_seconds = min(per_candidate_wait_seconds, 3)
                 elif request_clicked or attachment_ready:
                     effective_wait_seconds = min(per_candidate_wait_seconds, 15)
                 else:
@@ -3298,9 +3501,15 @@ class ZhilianAdapter(BasePlatformAdapter):
                         download_item = pending_downloads.pop(0)
                         candidate_identity = download_item.get("candidate_identity") or ""
                         if active_candidate_identity and candidate_identity and candidate_identity != active_candidate_identity:
-                            diag(
-                                "已丢弃非当前候选人身份的浏览器下载事件："
-                                f"identity={candidate_identity}，current={active_candidate_identity}，filename={download_item.get('suggested_filename') or '空'}"
+                            diag_event(
+                                "attachment",
+                                "download_event",
+                                "ignored",
+                                candidate=profile_label,
+                                reason="non_current_identity",
+                                identity=candidate_identity,
+                                current=active_candidate_identity,
+                                filename=download_item.get("suggested_filename") or "空",
                             )
                             continue
                         download_page = download_item.get("page")
@@ -3308,9 +3517,14 @@ class ZhilianAdapter(BasePlatformAdapter):
                         if download_item.get("created_at", 0) < candidate_download_started:
                             continue
                         if download_page_id and download_page_id not in active_candidate_page_ids:
-                            diag(
-                                "已丢弃非当前候选人页面的浏览器下载事件："
-                                f"filename={download_item.get('suggested_filename') or '空'}，page_id={download_page_id}"
+                            diag_event(
+                                "attachment",
+                                "download_event",
+                                "ignored",
+                                candidate=profile_label,
+                                reason="non_current_page",
+                                filename=download_item.get("suggested_filename") or "空",
+                                page_id=download_page_id,
                             )
                             continue
                         elapsed_since_download = time.monotonic() - last_download_monotonic if last_download_monotonic else min_download_interval_seconds
@@ -3347,13 +3561,27 @@ class ZhilianAdapter(BasePlatformAdapter):
                         page_id = int(download_item.get("page_id") or 0)
                         candidate_identity = download_item.get("candidate_identity") or ""
                         if active_candidate_identity and candidate_identity and candidate_identity != active_candidate_identity:
-                            diag(
-                                "已丢弃非当前候选人身份的附件链接："
-                                f"identity={candidate_identity}，current={active_candidate_identity}，url_hash={text_hash(download_url)[:10] if text_hash(download_url) else '空'}"
+                            diag_event(
+                                "attachment",
+                                "url",
+                                "ignored",
+                                candidate=profile_label,
+                                reason="non_current_identity",
+                                identity=candidate_identity,
+                                current=active_candidate_identity,
+                                url_hash=text_hash(download_url)[:10] if text_hash(download_url) else "空",
                             )
                             continue
                         if page_id and page_id not in active_candidate_page_ids:
-                            diag(f"已丢弃非当前候选人页面的附件链接：page_id={page_id}，url_hash={text_hash(download_url)[:10] if text_hash(download_url) else '空'}")
+                            diag_event(
+                                "attachment",
+                                "url",
+                                "ignored",
+                                candidate=profile_label,
+                                reason="non_current_page",
+                                page_id=page_id,
+                                url_hash=text_hash(download_url)[:10] if text_hash(download_url) else "空",
+                            )
                             continue
                         if download_url in downloaded_urls:
                             continue
@@ -3381,10 +3609,14 @@ class ZhilianAdapter(BasePlatformAdapter):
                             failed_download_urls.add(download_url)
                             ignored_attachment_urls.add(download_url)
                             pending_urls[:] = [item for item in pending_urls if item.get("url") != download_url]
-                            diag(
-                                "附件系统内下载失败，继续尝试当前候选人的其他附件链接："
-                                f"候选人={display_signature[:60]}，url_hash={error_payload['url_hash'] or '空'}，"
-                                f"剩余链接={len(pending_urls)}，原因={exc}"
+                            diag_event(
+                                "attachment",
+                                "download",
+                                "failed",
+                                candidate=profile_label,
+                                url_hash=error_payload["url_hash"] or "空",
+                                remaining_urls=len(pending_urls),
+                                reason=exc,
                             )
                             logger.warning("自动下载附件失败，继续尝试其他链接：{}", exc)
                             if not pending_urls:
@@ -3405,9 +3637,12 @@ class ZhilianAdapter(BasePlatformAdapter):
                     page.wait_for_timeout(200)
 
                 if current_candidate_polluted:
-                    diag(
-                        f"当前候选人命中上一位附件污染，已清空本轮下载队列并跳过："
-                        f"候选人={display_signature[:80]}"
+                    diag_event(
+                        "attachment",
+                        "owner_check",
+                        "skipped",
+                        candidate=display_signature[:80],
+                        reason="content_hash_polluted",
                     )
                     if on_resume_skipped:
                         on_resume_skipped({
@@ -3425,15 +3660,29 @@ class ZhilianAdapter(BasePlatformAdapter):
                         })
 
                 if not saved_current_candidate and not skipped_or_failed_current_candidate:
-                    diag(
-                        f"附件按钮点击后未捕获下载链接，快速跳过当前候选人："
-                        f"等待耗时={time.monotonic() - wait_started:.2f}s，计划等待={effective_wait_seconds:.2f}s，"
-                        f"request_clicked={request_clicked}，button_state={request_button_state}，attachment_ready={attachment_ready}，view_clicked={view_clicked}，"
-                        f"pending_urls={len(pending_urls)}，pending_downloads={len(pending_downloads)}"
+                    diag_event(
+                        "attachment",
+                        "capture",
+                        "timeout",
+                        cost_ms=(time.monotonic() - wait_started) * 1000,
+                        wait_ms=(time.monotonic() - wait_started) * 1000,
+                        candidate=profile_label,
+                        planned_wait_ms=int(effective_wait_seconds * 1000),
+                        request_clicked=request_clicked,
+                        button_state=request_button_state,
+                        attachment_ready=attachment_ready,
+                        view_clicked=view_clicked,
+                        pending_urls=len(pending_urls),
+                        pending_downloads=len(pending_downloads),
                     )
                     logger.warning("当前候选人在快速等待窗口内未捕获到附件下载链接。")
                     if on_resume_skipped:
-                        skip_stage = "request_attachment_disabled" if request_button_state == "disabled" else "attachment_url_not_captured"
+                        if request_button_state == "disabled":
+                            skip_stage = "request_attachment_disabled"
+                        elif request_clicked and not attachment_ready:
+                            skip_stage = "requested_attachment_not_ready"
+                        else:
+                            skip_stage = "attachment_url_not_captured"
                         on_resume_skipped({
                             "platform_code": self.platform_code,
                             "source_url": page.url,
@@ -3447,17 +3696,33 @@ class ZhilianAdapter(BasePlatformAdapter):
                             "raw_html_path": None,
                             "content_hash": "",
                         })
+                    diag_event(
+                        "candidate",
+                        "summary",
+                        "skipped",
+                        cost_ms=(time.monotonic() - iter_started) * 1000,
+                        wait_ms=(time.monotonic() - wait_started) * 1000,
+                        candidate=profile_label,
+                        reason=skip_stage if 'skip_stage' in locals() else "attachment_url_not_captured",
+                    )
                     skipped_or_failed_current_candidate = True
 
                 else:
-                    diag(f"候选人处理完成：总耗时={time.monotonic() - iter_started:.2f}s，下载等待耗时={time.monotonic() - wait_started:.2f}s")
+                    diag_event(
+                        "candidate",
+                        "summary",
+                        "success" if saved_current_candidate else "skipped",
+                        cost_ms=(time.monotonic() - iter_started) * 1000,
+                        wait_ms=(time.monotonic() - wait_started) * 1000,
+                        candidate=profile_label,
+                    )
                 closed_current_pages = cleanup_current_candidate_pages()
                 if closed_current_pages:
-                    diag(f"已关闭本候选人产生的简历/附件页面：{closed_current_pages} 个。")
+                    logger.info("已关闭本候选人产生的简历/附件页面：{} 个。", closed_current_pages)
                 active_candidate_started_at = 0.0
                 active_candidate_identity = ""
 
-            print(f"自动采集结束：已保存 {len(results)} 份。")
+            diag_event("collect", "finish", "success", saved=len(results))
             return results
         finally:
             session.close()

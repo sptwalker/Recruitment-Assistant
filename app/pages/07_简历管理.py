@@ -28,14 +28,23 @@ from recruitment_assistant.storage.models import (
 from recruitment_assistant.utils.hash_utils import mask_email, mask_phone, text_hash
 
 SUPPORTED_SUFFIXES = {".pdf", ".doc", ".docx"}
-PLATFORM_CODE = "zhilian"
+PLATFORM_OPTIONS = {"BOSS直聘": "boss", "智联招聘": "zhilian"}
 
 st.set_page_config(page_title="简历管理", layout="wide", initial_sidebar_state="collapsed")
 inject_vibe_style("简历管理")
-page_header("简历管理", "按日期加载已保存简历，批量解析 PDF/DOC/DOCX，规范入库并导出 Excel。")
+page_header("简历管理", "按平台和日期加载已保存简历，批量解析 PDF/DOC/DOCX，规范入库并导出 Excel。")
 
 settings = get_settings()
-attachment_root = settings.attachment_dir / PLATFORM_CODE
+selected_platform_name = st.selectbox("简历来源平台", list(PLATFORM_OPTIONS.keys()), index=0, key="resume_manage_platform_name")
+platform_code = PLATFORM_OPTIONS[selected_platform_name]
+attachment_root = settings.attachment_dir / platform_code
+
+if st.session_state.get("resume_manage_active_platform") != platform_code:
+    st.session_state.resume_manage_active_platform = platform_code
+    st.session_state.resume_manage_files = []
+    st.session_state.resume_manage_rows = []
+    st.session_state.resume_manage_failures = {}
+    st.session_state.resume_manage_loaded_date = None
 
 if "resume_manage_files" not in st.session_state:
     st.session_state.resume_manage_files = []
@@ -129,7 +138,10 @@ def existing_file_statuses(files: list[Path]) -> dict[str, str]:
         return {}
     with create_session() as session:
         rows = session.execute(
-            select(ResumeAttachment.file_hash).where(ResumeAttachment.file_hash.in_(hashes))
+            select(ResumeAttachment.file_hash).where(
+                ResumeAttachment.platform_code == platform_code,
+                ResumeAttachment.file_hash.in_(hashes),
+            )
         ).scalars().all()
     return {str(item): "已解析" for item in rows if item}
 
@@ -229,7 +241,11 @@ def normalize_resume_data(parsed: dict, path: Path, current_hash: str) -> dict:
 
 
 def find_or_create_raw_resume(session, normalized: dict) -> RawResume:
-    raw_resume = session.scalar(select(RawResume).where(RawResume.content_hash == normalized["file_hash"]).limit(1))
+    raw_resume = session.scalar(
+        select(RawResume)
+        .where(RawResume.platform_code == platform_code, RawResume.content_hash == normalized["file_hash"])
+        .limit(1)
+    )
     raw_json = {
         "source": "resume_management",
         "parsed_resume": json_safe(normalized),
@@ -246,7 +262,7 @@ def find_or_create_raw_resume(session, normalized: dict) -> RawResume:
         raw_resume.parsed_at = datetime.now()
         return raw_resume
     raw_resume = RawResume(
-        platform_code=PLATFORM_CODE,
+        platform_code=platform_code,
         source_resume_id=normalized["file_hash"][:32],
         source_url=Path(normalized["file_path"]).resolve().as_uri(),
         raw_json=raw_json,
@@ -310,7 +326,9 @@ def find_or_create_candidate(session, normalized: dict) -> tuple[Candidate, bool
 def save_normalized_resume(normalized: dict) -> tuple[str, int, int]:
     with create_session() as session:
         existing_attachment = session.scalar(
-            select(ResumeAttachment).where(ResumeAttachment.file_hash == normalized["file_hash"]).limit(1)
+            select(ResumeAttachment)
+            .where(ResumeAttachment.platform_code == platform_code, ResumeAttachment.file_hash == normalized["file_hash"])
+            .limit(1)
         )
         if existing_attachment:
             return "重复跳过", existing_attachment.resume_id, existing_attachment.raw_resume_id or 0
@@ -320,7 +338,7 @@ def save_normalized_resume(normalized: dict) -> tuple[str, int, int]:
         resume = Resume(
             candidate_id=candidate.id,
             raw_resume_id=raw_resume.id,
-            platform_code=PLATFORM_CODE,
+            platform_code=platform_code,
             resume_title=normalized.get("job_title") or normalized.get("expected_position") or normalized["file_name"],
             summary=normalized.get("text_preview"),
             expected_position=normalized.get("expected_position") or normalized.get("job_title"),
@@ -332,7 +350,7 @@ def save_normalized_resume(normalized: dict) -> tuple[str, int, int]:
             ResumeAttachment(
                 resume_id=resume.id,
                 raw_resume_id=raw_resume.id,
-                platform_code=PLATFORM_CODE,
+                platform_code=platform_code,
                 file_name=normalized["file_name"],
                 file_path=normalized["file_path"],
                 file_ext=normalized["file_ext"],
@@ -408,13 +426,13 @@ def export_rows(rows: list[dict]) -> bytes:
 def clear_current_parse_library() -> dict[str, int]:
     with create_session() as session:
         resume_rows = session.execute(
-            select(Resume.id, Resume.candidate_id, Resume.raw_resume_id).where(Resume.platform_code == PLATFORM_CODE)
+            select(Resume.id, Resume.candidate_id, Resume.raw_resume_id).where(Resume.platform_code == platform_code)
         ).all()
         resume_ids = [row.id for row in resume_rows]
         candidate_ids = [row.candidate_id for row in resume_rows if row.candidate_id]
         raw_resume_ids = [row.raw_resume_id for row in resume_rows if row.raw_resume_id]
         attachment_raw_ids = session.execute(
-            select(ResumeAttachment.raw_resume_id).where(ResumeAttachment.platform_code == PLATFORM_CODE)
+            select(ResumeAttachment.raw_resume_id).where(ResumeAttachment.platform_code == platform_code)
         ).scalars().all()
         raw_resume_ids.extend([item for item in attachment_raw_ids if item])
 
@@ -498,13 +516,13 @@ if rows:
     with col_refresh:
         refresh = st.button("刷新状态")
     with col_clear:
-        clear_parse_library = st.button("调试：清除当前解析库", type="secondary")
+        clear_parse_library = st.button("调试：清除平台解析库", type="secondary")
     if clear_parse_library:
-        with st.spinner("正在清除当前解析库..."):
+        with st.spinner("正在清除平台解析库..."):
             deleted = clear_current_parse_library()
             reset_resume_manage_state()
         st.warning(
-            "已清除当前解析库："
+            "已清除平台解析库："
             f"简历 {deleted['resumes']} 条，候选人 {deleted['candidates']} 条，"
             f"原始简历 {deleted['raw_resumes']} 条，附件 {deleted['attachments']} 条。"
         )

@@ -75,14 +75,19 @@ class CrawlTaskService:
         self.session.refresh(task)
         return task
 
-    def list_tasks(self, limit: int = 50) -> list[CrawlTask]:
-        stmt = select(CrawlTask).order_by(CrawlTask.id.desc()).limit(limit)
+    def list_tasks(self, limit: int = 50, platform_code: str | None = None) -> list[CrawlTask]:
+        stmt = select(CrawlTask)
+        if platform_code:
+            stmt = stmt.where(CrawlTask.platform_code == platform_code)
+        stmt = stmt.order_by(CrawlTask.id.desc()).limit(limit)
         return list(self.session.scalars(stmt).all())
 
-    def success_summary(self) -> tuple[int, int]:
+    def success_summary(self, platform_code: str | None = None) -> tuple[int, int]:
         stmt = select(func.count(CrawlTask.id), func.coalesce(func.sum(CrawlTask.success_count), 0)).where(
             CrawlTask.status == "success"
         )
+        if platform_code:
+            stmt = stmt.where(CrawlTask.platform_code == platform_code)
         task_count, resume_count = self.session.execute(stmt).one()
         return int(task_count or 0), int(resume_count or 0)
 

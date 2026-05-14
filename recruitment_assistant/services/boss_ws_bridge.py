@@ -22,6 +22,7 @@ class BossWSBridge:
         self.ws_server.on_event = self._handle_event
         self._event_seq = 0
         self._seen_candidate_records: set[str] = set()
+        self._recent_ui_log_keys: dict[str, float] = {}
 
         self.runtime_state: dict[str, Any] = {
             "running": False,
@@ -57,6 +58,7 @@ class BossWSBridge:
 
         self._event_seq = 0
         self._seen_candidate_records.clear()
+        self._recent_ui_log_keys.clear()
         self.runtime_state.update({
             "running": False,
             "paused": False,
@@ -144,7 +146,25 @@ class BossWSBridge:
     def _handle_event(self, event: dict) -> None:
         event_type = event.get("type", "")
         data = event.get("data", {})
-        self._write_event_log("extension_event", {"type": event_type, "data": data})
+        noisy_events = {
+            "resume_attachment_debug",
+            "resume_preview_diagnostics",
+            "resume_preview_recognition_started",
+            "resume_preview_wait_result",
+            "resume_preview_weak_candidate_used",
+            "resume_preview_info_extract_start",
+            "download_button_candidates",
+            "candidate_list_scroll_reset",
+            "download_intent_registered",
+            "boss_tabs_scanned",
+            "candidate_list_scanned",
+            "page_ready",
+            "resume_attachment_clicked",
+            "resume_preview_detected",
+            "resume_preview_info_extract_success",
+        }
+        if event_type not in noisy_events:
+            self._write_event_log("extension_event", {"type": event_type, "data": data})
 
         match event_type:
             case "extension_connected":
@@ -166,14 +186,11 @@ class BossWSBridge:
             case "page_ready":
                 self.runtime_state["page_ready"] = True
                 self.runtime_state["page_url"] = data.get("url", "")
-                self._log("info", f"Boss 沟通页已就绪: {data.get('url', '')}")
             case "page_detected":
                 self.runtime_state["page_ready"] = False
                 self.runtime_state["page_url"] = data.get("url", "")
-                self._log("info", f"已检测到 Boss 页面但未确认登录态: {data.get('url', '')}")
             case "boss_tabs_scanned":
-                urls = data.get("urls") or []
-                self._log("info", f"扩展扫描到 Boss 标签页 {data.get('count', 0)} 个: {' | '.join(urls[:3])}")
+                pass
             case "content_script_inject_failed":
                 self._log("error", f"注入 Boss 页面脚本失败: {data.get('url', '')}")
             case "content_script_message_failed":
@@ -186,34 +203,23 @@ class BossWSBridge:
             case "candidate_skipped":
                 self._record_skip(data)
             case "candidate_list_scanned":
-                samples = data.get("samples") or []
-                sample_text = " | ".join(str(x) for x in samples[:3])
-                suffix = f"；样例: {sample_text}" if sample_text else ""
-                self._log("info", f"候选人列表扫描完成: {data.get('count', 0)} 个候选项{suffix}")
+                pass
             case "resume_button_found":
-                sig = data.get("candidate_signature", "未知")
-                state = str(data.get("button_state", "unknown"))
-                text = str(data.get("button_text", ""))
-                message = f"附件按钮: {sig} [{state}] {text[:60]}"
-                if state in {"view", "unknown_resume"} or "附件简历" in text:
-                    self._log("highlight", message)
-                else:
-                    self._log("info", message)
+                pass
+            case "resume_attachment_debug":
+                pass
             case "download_intent_registered":
-                sig = data.get("candidate_signature", "未知")
-                self._log("info", f"下载意图已登记: {sig}")
+                pass
             case "download_created":
                 sig = data.get("candidate_signature", "未知")
                 self._log("info", f"Chrome 下载已创建: {sig} #{data.get('download_id', '')}")
             case "candidate_list_scroll_reset":
-                self._log("info", f"候选人列表已回到顶部: {data.get('reset', False)}")
+                pass
             case "resume_request_confirm_clicked":
                 sig = data.get("candidate_signature", "未知")
                 self._log("info", f"已点击索要简历确认: {sig}")
             case "resume_attachment_clicked":
-                sig = data.get("candidate_signature", "未知")
-                self._log("info", f"已点击附件简历入口: {sig} [{data.get('button_state', '')}] {str(data.get('button_text', ''))[:60]}")
-                self._log("highlight", "开始识别弹出页面")
+                pass
             case "unknown_resume_preview_probe_started":
                 sig = data.get("candidate_signature", "未知")
                 confirmed = data.get("confirmed", False)
@@ -228,66 +234,58 @@ class BossWSBridge:
                 sig = data.get("candidate_signature", "未知")
                 self._log("error", f"未识别到简历弹出页面: {sig}")
             case "resume_preview_diagnostics":
-                sig = data.get("candidate_signature", "未知")
-                overlays = data.get("overlays") or []
-                frames = data.get("frames") or []
-                large_blocks = data.get("large_blocks") or []
-                reason = data.get("reason", "")
-                self._log("highlight", f"弹出页识别诊断: {sig}；阶段={reason}")
-                if "李子志" in str(sig) or "陈柱荣" in str(sig):
-                    self._log("highlight", f"{str(sig).split('/')[0]}确认有附件简历，本次未发现弹出页面，判定为识别失败。")
-                self._log("info", f"诊断URL: {data.get('url', '')}")
-                self._log("info", f"候选弹层={len(overlays)} 个，iframe/object/embed={len(frames)} 个，大块DOM={len(large_blocks)} 个")
-                for index, item in enumerate(overlays[:5], start=1):
-                    rect = item.get("rect") or {}
-                    text = str(item.get("text", ""))[:120]
-                    class_name = str(item.get("class_name", ""))[:80]
-                    self._log("info", f"弹层候选#{index}: {item.get('tag', '')} class={class_name} rect=({rect.get('left')},{rect.get('top')},{rect.get('width')}x{rect.get('height')}) text={text}")
-                for index, item in enumerate(frames[:5], start=1):
-                    rect = item.get("rect") or {}
-                    src = str(item.get("src", ""))[:120]
-                    self._log("info", f"内嵌页候选#{index}: {item.get('tag', '')} rect=({rect.get('left')},{rect.get('top')},{rect.get('width')}x{rect.get('height')}) src={src}")
-                for index, item in enumerate(large_blocks[:5], start=1):
-                    rect = item.get("rect") or {}
-                    text = str(item.get("text", ""))[:120]
-                    class_name = str(item.get("class_name", ""))[:80]
-                    self._log("info", f"大块DOM#{index}: {item.get('tag', '')} class={class_name} rect=({rect.get('left')},{rect.get('top')},{rect.get('width')}x{rect.get('height')}) text={text}")
+                pass
             case "boss_ui_stage":
                 message = str(data.get("message", ""))
                 if message:
                     self._log("highlight", message)
             case "resume_preview_recognition_started":
-                sig = data.get("candidate_signature", "未知")
-                stage = data.get("stage", "")
-                self._log("highlight", f"开始识别弹出页面: {sig}；真实等待入口={stage}")
+                pass
             case "resume_preview_wait_result":
-                sig = data.get("candidate_signature", "未知")
-                if data.get("found"):
-                    self._log("highlight", f"弹出页面识别等待完成: {sig}；结果=已发现")
-                else:
-                    suffix = "；发现弱候选但未接受" if data.get("weak_candidate") else ""
-                    self._log("error", f"弹出页面识别等待完成: {sig}；结果=未发现{suffix}")
+                pass
             case "resume_preview_weak_candidate_used":
-                sig = data.get("candidate_signature", "未知")
-                descriptor = str(data.get("descriptor", ""))[:120]
-                self._log("highlight", f"疑似发现弹出页面: {sig}；候选区域={descriptor}")
+                pass
             case "resume_preview_info_extract_start":
-                self._log("info", "开始尝试获取弹出页面中的信息……")
+                pass
             case "resume_preview_detected":
-                self._log("highlight", "发现弹出页面")
+                pass
             case "resume_preview_info_extract_success":
+                sig = data.get("candidate_signature", "未知")
+                source = data.get("preview_source", "")
                 name = data.get("name", "未识别")
-                phone = data.get("phone", "未识别")
-                email = data.get("email", "未识别")
-                self._log("highlight", f"成功获取以下信息：候选人名字“{name}”，电话“{phone}”，邮箱“{email}”")
+                self._log("highlight", f"已识别简历预览页: {sig}；来源={source}；姓名={name}")
+            case "resume_preview_candidate_confirm":
+                sig = data.get("candidate_signature", "未知")
+                component_type = str(data.get("component_preview_type", "") or "dom_text")
+                component_src = str(data.get("component_src", "") or data.get("iframe_src", ""))[:180]
+                component = str(data.get("component_class", "") or data.get("component_tag", "未知组件"))[:120]
+                rect = data.get("component_rect") or {}
+                src_suffix = f"；src={component_src}" if component_src else ""
+                self._log("highlight", f"疑似识别到弹窗: {sig}；类型={component_type}；组件={component}；rect=({rect.get('left')},{rect.get('top')},{rect.get('width')}x{rect.get('height')}){src_suffix}")
+                self._log(
+                    "highlight",
+                    "该弹窗上有候选人姓名：{} 性别：{} 年龄：{} 籍贯：{} 电话：{} 邮箱：{}".format(
+                        data.get("name", "未识别"),
+                        data.get("gender", "未识别"),
+                        data.get("age", "未识别"),
+                        data.get("native_place", "未识别"),
+                        data.get("phone", "未识别"),
+                        data.get("email", "未识别"),
+                    ),
+                )
+                self._log("highlight", "请确认是否是正确的简历弹窗。如正确，请点击停止，我们下一步再确认下载图标。")
             case "collect_paused_for_resume_preview_confirm":
                 self.runtime_state["paused"] = True
-                self._log("info", "采集任务已暂停，请确认弹出页面识别正确后点击“继续”")
+                self._log("info", "采集任务已暂停，请在页面中确认识别出的简历弹窗是否正确")
             case "manual_download_recording_started":
                 self._log("highlight", "正在记录你的操作……")
             case "manual_download_click_captured":
                 descriptor = str(data.get("descriptor", ""))[:160]
-                self._log("info", f"已捕获点击操作: {descriptor}，位置=({data.get('x')},{data.get('y')})")
+                frame_src = str(data.get("frame_src", ""))[:180]
+                if frame_src:
+                    self._log("highlight", f"已捕获你在 PDF iframe 内的点击操作: {descriptor}，位置=({data.get('x')},{data.get('y')})，iframe相对位置=({data.get('frame_relative_x')},{data.get('frame_relative_y')})，src={frame_src}")
+                else:
+                    self._log("info", f"已捕获点击操作: {descriptor}，位置=({data.get('x')},{data.get('y')})")
             case "manual_download_learning_success":
                 component = str(data.get("descriptor", "") or data.get("tag", "未知组件"))[:120]
                 position = f"({data.get('x')},{data.get('y')})"
@@ -296,17 +294,17 @@ class BossWSBridge:
             case "manual_download_click_timeout":
                 sig = data.get("candidate_signature", "未知")
                 self._log("error", f"等待人工点击下载超时: {sig}")
+            case "auto_download_click_used":
+                sig = data.get("candidate_signature", "未知")
+                self._log("info", f"自动点击简历下载按钮: {sig}")
             case "learned_download_click_used":
                 sig = data.get("candidate_signature", "未知")
-                descriptor = str(data.get("descriptor", ""))[:120]
-                self._log("info", f"使用已学习下载控件尝试点击: {sig}；{descriptor}")
+                self._log("info", f"自动复用已学习下载按钮: {sig}")
             case "learned_download_click_failed":
                 sig = data.get("candidate_signature", "未知")
                 self._log("error", f"已学习下载控件未找到: {sig}")
             case "download_button_candidates":
-                sig = data.get("candidate_signature", "未知")
-                samples = str(data.get("samples", ""))[:120]
-                self._log("error", f"未找到下载图标: {sig}；候选控件: {samples}")
+                pass
             case "collect_progress":
                 self.runtime_state["skipped_count"] = data.get("skipped", 0)
                 self.runtime_state["current_index"] = data.get("current_index", 0)
@@ -409,11 +407,12 @@ class BossWSBridge:
             error = reason.split(":", 1)[1] or "未知错误"
             return f"下载失败（{error}）"
         mapping = {
+            "need_request_resume": "需要索要简历，已按设置跳过",
             "resume_requested": "已成功索要简历，等待候选人上传",
             "resume_request_clicked": "已点击索要简历，等待确认结果",
             "resume_request_already_sent": "简历请求已发送，等待候选人上传",
             "resume_already_requested": "此前已索要简历，等待候选人上传",
-            "resume_preview_not_found": "未识别到简历弹出页面",
+            "resume_attachment_click_guarded": "附件简历入口重复点击已拦截",
             "resume_preview_detected_wait_confirm": "已识别简历页面，等待确认后进入人工点击学习",
             "manual_download_click_timeout": "等待人工点击下载超时",
             "download_button_not_found": "未找到简历下载按钮",
@@ -453,6 +452,16 @@ class BossWSBridge:
 
     def _log(self, level: str, message: str) -> None:
         now = datetime.now()
+        dedupe_key = f"{level}|{message}"
+        dedupe_until = self._recent_ui_log_keys.get(dedupe_key)
+        if dedupe_until and now.timestamp() - dedupe_until < 2.5:
+            return
+        self._recent_ui_log_keys[dedupe_key] = now.timestamp()
+        if len(self._recent_ui_log_keys) > 300:
+            cutoff = now.timestamp() - 10
+            self._recent_ui_log_keys = {
+                key: value for key, value in self._recent_ui_log_keys.items() if value >= cutoff
+            }
         entry = {
             "level": level,
             "message": message,

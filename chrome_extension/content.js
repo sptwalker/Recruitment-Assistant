@@ -1,11 +1,17 @@
 (function () {
   "use strict";
 
-  const CONTENT_SCRIPT_VERSION = "1.25.0";
+  const CONTENT_SCRIPT_VERSION = "1.36.0";
   if (window.__bossResumeCollectorVersion === CONTENT_SCRIPT_VERSION) {
     return;
   }
+  const INSTANCE_ID = `${CONTENT_SCRIPT_VERSION}_${Date.now()}_${Math.random().toString(16).slice(2)}`;
   window.__bossResumeCollectorVersion = CONTENT_SCRIPT_VERSION;
+  window.__bossResumeCollectorActiveInstance = INSTANCE_ID;
+
+  function isActiveInstance() {
+    return window.__bossResumeCollectorActiveInstance === INSTANCE_ID;
+  }
 
   const CANDIDATE_SELECTORS = [
     ".chat-list li",
@@ -48,10 +54,12 @@
 
 
   let state = "idle";
-  let config = { max_resumes: 5, interval_ms: 5000 };
+  let config = { max_resumes: 5, interval_ms: 5000, request_resume_if_missing: false };
   let results = { downloaded: 0, skipped: 0, currentIndex: 0 };
   let pauseResolve = null;
   let activeRunId = "";
+  let activeCollectLoopRunId = "";
+  let lastResumeAttachmentClick = { key: "", at: 0 };
   let collectFinishedEmitted = false;
   const pendingDownloadWaiters = new Map();
   const STORAGE_KEYS = {
@@ -89,15 +97,17 @@
 
   function emitCritical(event) {
     emit(event);
-    try {
-      setTimeout(() => emit(event), 120);
-      setTimeout(() => emit(event), 600);
-      setTimeout(() => emit(event), 1500);
-    } catch {}
   }
 
   function emitUiStage(message, data = {}) {
     emitCritical({ type: "boss_ui_stage", data: { message, ...data } });
+  }
+
+  function emitAttachmentDebug(stage, candidateId = "", signature = "", details = {}) {
+    void stage;
+    void candidateId;
+    void signature;
+    void details;
   }
 
   function isAuthenticated() {
@@ -176,7 +186,6 @@
     }
     window.scrollTo(0, 0);
     await sleep(800);
-    emit({ type: "candidate_list_scroll_reset", data: { reset: Boolean(container), scroll_top: container?.scrollTop || 0 } });
   }
 
   function getCandidateItems() {
@@ -362,20 +371,29 @@
     return false;
   }
 
-  function clickElementReliably(el) {
+  function clickElementOnce(el) {
     if (!el) return false;
     el.scrollIntoView?.({ block: "center", inline: "center" });
     const rect = el.getBoundingClientRect();
     const x = Math.max(1, Math.min(window.innerWidth - 1, rect.left + rect.width / 2));
     const y = Math.max(1, Math.min(window.innerHeight - 1, rect.top + rect.height / 2));
     const target = document.elementFromPoint(x, y) || el;
-    const clickTargets = Array.from(new Set([target, el, target.closest?.("button, a, [role='button'], [class*='btn'], [class*='icon'], [class*='download']"), el.closest?.("button, a, [role='button'], [class*='btn'], [class*='icon'], [class*='download']")].filter(Boolean)));
-    for (const node of clickTargets) {
-      for (const type of ["pointerover", "mouseover", "pointermove", "mousemove", "pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
-        node.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, clientX: x, clientY: y, view: window }));
-      }
-      node.click?.();
+    const node = target.closest?.("button, a, [role='button'], [class*='btn'], [class*='icon'], [class*='download'], [class*='resume']") || target || el;
+    for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+      node.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, clientX: x, clientY: y, view: window }));
     }
+    return true;
+  }
+
+  function clickElementReliably(el) {
+    return clickElementOnce(el);
+  }
+
+  function guardResumeAttachmentClick(candidateId, signature) {
+    const key = `${activeRunId}|${candidateId}|${signature}`;
+    const now = Date.now();
+    if (lastResumeAttachmentClick.key === key && now - lastResumeAttachmentClick.at < 5000) return false;
+    lastResumeAttachmentClick = { key, at: now };
     return true;
   }
 
@@ -473,19 +491,95 @@
     };
   }
 
+  function isStrongBossPdfPreviewUrl(src = "") {
+    return /pdf-viewer-b|bzl-office\/pdf-viewer|preview4boss|wflow\/zpgeek\/download\/preview4boss|\.pdf(?:$|[?#])/i.test(src);
+  }
+
+  function isPdfPreviewRoot(root) {
+    const tag = root?.tagName || "";
+    const src = root?.getAttribute?.("src") || root?.getAttribute?.("data") || "";
+    const descriptor = `${src} ${getElementDescriptor(root)}`;
+    const isFrame = /IFRAME|OBJECT|EMBED/.test(tag);
+    return (isFrame && isStrongBossPdfPreviewUrl(src)) || /pdf-viewer|preview4boss|\.pdf|pdf/i.test(descriptor);
+  }
+
+  function findPdfIframePreview(fallbackInfo = {}) {
+    const frames = Array.from(document.querySelectorAll("iframe, object, embed"))
+      .filter((el) => {
+        try {
+          if (!isVisible(el)) return false;
+          const rect = el.getBoundingClientRect();
+          const src = el.getAttribute?.("src") || el.getAttribute?.("data") || "";
+          return rect.width >= 300 && rect.height >= 180 && rect.left > window.innerWidth * 0.08 && isStrongBossPdfPreviewUrl(src);
+        } catch {
+          return false;
+        }
+      })
+      .sort((a, b) => {
+        const ar = a.getBoundingClientRect();
+        const br = b.getBoundingClientRect();
+        return br.width * br.height - ar.width * ar.height;
+      });
+    const root = frames[0];
+    if (!root) return null;
+    const rect = root.getBoundingClientRect();
+    return { root, rect, score: 99, info: extractResumePreviewInfo(root, fallbackInfo), pdf_iframe: true };
+  }
+
   function extractResumePreviewInfo(root, fallbackInfo = {}) {
     const text = (root?.innerText || root?.textContent || "").replace(/\s+/g, " ").trim();
     const emailMatch = text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
     const phoneMatch = text.match(/(?:\+?86[-\s]?)?1[3-9]\d[-\s]?\d{4}[-\s]?\d{4}/);
-    const candidateNames = Array.from(text.slice(0, 260).matchAll(/[\u4e00-\u9fa5]{2,4}(?:先生|女士)?/g)).map((m) => m[0]);
-    const blacklist = new Set(["附件简历", "下载简历", "在线简历", "个人简历", "查看简历", "简历预览", "求职意向", "工作经历", "项目经历", "教育经历"]);
-    const name = candidateNames.find((x) => !blacklist.has(x)) || fallbackInfo.name || "未识别";
+    const ageMatch = text.match(/(\d{2})\s*岁/);
+    const genderMatch = text.match(/(?:^|\s)(男|女)(?:\s|$|·|\||，|,)/);
+    const nativePlaceMatch = text.match(/(?:籍贯|户籍|现居住地|所在地|现居地)[:：\s]*([\u4e00-\u9fa5]{2,12})/);
+    const toolbarNameBlacklist = new Set(["全屏", "缩放", "放大", "缩小", "打印", "下载", "上一页", "下一页", "页面", "旋转", "适合", "宽度", "附件简历", "下载简历", "在线简历", "个人简历", "查看简历", "简历预览", "求职意向", "工作经历", "项目经历", "教育经历", "正在加载", "请稍等"]);
+    const candidateNames = Array.from(text.slice(0, 320).matchAll(/[\u4e00-\u9fa5]{2,4}(?:先生|女士)?/g)).map((m) => m[0]);
+    const fallbackName = fallbackInfo.name && fallbackInfo.name !== "待识别" ? fallbackInfo.name : "";
+    const extractedName = candidateNames.find((x) => !toolbarNameBlacklist.has(x) && !toolbarNameBlacklist.has(x.replace(/先生|女士/g, "")));
+    const name = isPdfPreviewRoot(root) ? (fallbackName || extractedName || "未识别") : (extractedName || fallbackName || "未识别");
     return {
       name,
+      gender: genderMatch ? genderMatch[1] : "未识别",
+      age: ageMatch ? `${ageMatch[1]}岁` : (fallbackInfo.age || "未识别"),
+      native_place: nativePlaceMatch ? nativePlaceMatch[1] : "未识别",
       phone: phoneMatch ? phoneMatch[0] : "未识别",
       email: emailMatch ? emailMatch[0] : "未识别",
+      preview_source: isPdfPreviewRoot(root) ? "pdf_iframe_or_viewer" : "dom_text",
+      iframe_src: root?.getAttribute?.("src") || root?.getAttribute?.("data") || "",
       text_sample: text.slice(0, 240),
     };
+  }
+
+  function isLoadingResumePreviewText(text) {
+    return /正在加载简历|正 在 加 载 简 历|请稍等/.test(text || "");
+  }
+
+  function describePreviewComponent(root) {
+    if (!root) return {};
+    return {
+      component_tag: root.tagName || "",
+      component_id: root.getAttribute?.("id") || "",
+      component_role: root.getAttribute?.("role") || "",
+      component_class: getElementClassName(root),
+      component_path: getElementDomPath(root),
+      component_rect: getRectSnapshot(root),
+      component_descriptor: getElementDescriptor(root).slice(0, 240),
+      component_src: root.getAttribute?.("src") || root.getAttribute?.("data") || "",
+      component_preview_type: isPdfPreviewRoot(root) ? "pdf_iframe_or_viewer" : "dom_text",
+    };
+  }
+
+  function emitResumePreviewCandidateConfirm(candidateId, signature, preview) {
+    emitCritical({
+      type: "resume_preview_candidate_confirm",
+      data: {
+        candidate_id: candidateId,
+        candidate_signature: signature,
+        ...describePreviewComponent(preview.root),
+        ...(preview.info || {}),
+      },
+    });
   }
 
   function getRectSnapshot(el) {
@@ -585,7 +679,7 @@
   }
 
   function shouldAbortAsyncStep() {
-    return state === "stopped" || state === "idle";
+    return !isActiveInstance() || state === "stopped" || state === "idle";
   }
 
   async function waitUntilResumePreviewGone(timeoutMs = 1200) {
@@ -598,37 +692,45 @@
   }
 
   function emitResumePreviewDiagnostics(candidateId = "", signature = "", info = {}, sample = "", reason = "manual_probe") {
-    const diagnostics = collectResumePreviewDiagnostics(candidateId, signature, info, sample);
-    emit({ type: "resume_preview_diagnostics", data: { ...diagnostics, reason } });
+    void candidateId;
+    void signature;
+    void info;
+    void sample;
+    void reason;
   }
 
   function findResumePreview(fallbackInfo = {}) {
+    const pdfFramePreview = findPdfIframePreview(fallbackInfo);
+    if (pdfFramePreview) return pdfFramePreview;
+
     const roots = getPreviewRoots();
     const matches = [];
     for (const root of roots) {
       const rect = root.getBoundingClientRect?.();
       const text = (root.innerText || root.textContent || "").replace(/\s+/g, " ").trim();
       if (!rect || rect.width < 220 || rect.height < 120) continue;
+      if (isLoadingResumePreviewText(text)) continue;
+      const descriptor = getElementDescriptor(root);
+      const src = root.getAttribute?.("src") || root.getAttribute?.("data") || "";
       let score = 0;
-      if (/简历|附件|预览|PDF|pdf|resume/i.test(text + " " + getElementDescriptor(root))) score += 5;
+      if (isPdfPreviewRoot(root)) score += 8;
+      if (/简历|附件|预览|PDF|pdf|resume/i.test(text + " " + descriptor + " " + src)) score += 5;
+      if (/求职意向|工作经历|项目经历|教育经历|个人优势|个人信息|联系方式/.test(text)) score += 5;
       if (/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i.test(text)) score += 3;
       if (/(?:\+?86[-\s]?)?1[3-9]\d[-\s]?\d{4}[-\s]?\d{4}/.test(text)) score += 3;
       if (rect.left > window.innerWidth * 0.15) score += 1;
       if (!/聊天|常用语|发送/.test(text.slice(0, 120))) score += 1;
-      if (score >= 4) matches.push({ root, rect, score, info: extractResumePreviewInfo(root, fallbackInfo) });
+      if (score >= 6) matches.push({ root, rect, score, info: extractResumePreviewInfo(root, fallbackInfo) });
     }
     matches.sort((a, b) => b.score - a.score || b.rect.width * b.rect.height - a.rect.width * a.rect.height);
     return matches[0] || null;
   }
 
   async function waitForResumePreview(candidateId = "", signature = "", info = {}, timeoutMs = 12000) {
-    emitCritical({ type: "resume_preview_recognition_started", data: { candidate_id: candidateId, candidate_signature: signature, stage: "wait_entered", timeout_ms: timeoutMs, real_wait_started: true } });
     const deadline = Date.now() + timeoutMs;
     let lastSample = "";
-    let emittedEarlyDiagnostic = false;
     while (Date.now() < deadline) {
       if (shouldAbortAsyncStep()) {
-        emitResumePreviewDiagnostics(candidateId, signature, info, lastSample, "aborted_before_preview_detected");
         return null;
       }
       const preview = findResumePreview(info);
@@ -637,22 +739,13 @@
         return preview;
       }
       lastSample = (document.body?.innerText || "").replace(/\s+/g, " ").slice(0, 260) || lastSample;
-      if (!emittedEarlyDiagnostic && Date.now() > deadline - timeoutMs + 2500) {
-        emittedEarlyDiagnostic = true;
-        emitResumePreviewDiagnostics(candidateId, signature, info, lastSample, "early_preview_probe_2_5s");
-      }
       await sleep(250);
     }
     const weakPreview = makeResumePreviewFromLargestRoot(info);
     if (weakPreview) {
-      emitResumePreviewDiagnostics(candidateId, signature, info, lastSample, "weak_preview_candidate_found_but_not_accepted");
-      emit({ type: "resume_preview_weak_candidate_used", data: { candidate_id: candidateId, candidate_signature: signature, rect: getRectSnapshot(weakPreview.root), descriptor: getElementDescriptor(weakPreview.root).slice(0, 180) } });
-      emit({ type: "resume_preview_wait_result", data: { candidate_id: candidateId, candidate_signature: signature, found: false, weak_candidate: true, stage: "wait_timeout" } });
       emit({ type: "resume_preview_not_found", data: { candidate_id: candidateId, candidate_signature: signature, sample: lastSample, weak_candidate: true } });
       return null;
     }
-    emitResumePreviewDiagnostics(candidateId, signature, info, lastSample, "preview_wait_timeout");
-    emit({ type: "resume_preview_wait_result", data: { candidate_id: candidateId, candidate_signature: signature, found: false, stage: "wait_timeout" } });
     emit({ type: "resume_preview_not_found", data: { candidate_id: candidateId, candidate_signature: signature, sample: lastSample } });
     return null;
   }
@@ -662,6 +755,25 @@
     try {
       localStorage.setItem(STORAGE_KEYS.learnedClick, JSON.stringify(snapshot));
     } catch {}
+  }
+
+  function getFrameDownloadCandidateAtPoint(x, y) {
+    const frames = Array.from(document.querySelectorAll("iframe, object, embed"))
+      .filter((el) => {
+        try { return isVisible(el) && isPdfPreviewRoot(el); } catch { return false; }
+      });
+    for (const frame of frames) {
+      const rect = frame.getBoundingClientRect();
+      if (x < rect.left || x > rect.right || y < rect.top || y > rect.bottom) continue;
+      return {
+        frame_tag: frame.tagName || "",
+        frame_src: frame.getAttribute?.("src") || frame.getAttribute?.("data") || "",
+        frame_rect: getRectSnapshot(frame),
+        frame_relative_x: (x - rect.left) / Math.max(1, rect.width),
+        frame_relative_y: (y - rect.top) / Math.max(1, rect.height),
+      };
+    }
+    return null;
   }
 
   function captureNextManualDownloadClick(candidateId = "", signature = "", timeoutMs = 60000) {
@@ -677,6 +789,8 @@
         if (!resumePreviewLearnState.waitingManualClick) return;
         const target = document.elementFromPoint(event.clientX, event.clientY) || event.target;
         const snapshot = getElementSnapshot(target, event.clientX, event.clientY);
+        const frameCandidate = getFrameDownloadCandidateAtPoint(event.clientX, event.clientY);
+        if (frameCandidate) Object.assign(snapshot, frameCandidate);
         snapshot.candidate_id = candidateId;
         snapshot.candidate_signature = signature;
         saveLearnedDownloadClick(snapshot);
@@ -843,18 +957,79 @@
     emit({ type: "candidate_skipped", data: { candidate_id: candidateId, candidate_signature: signature, reason, ...extra } });
     results.skipped++;
     emitProgress();
-    await sleep(config.interval_ms);
+    const delay = extra.fast_skip ? 20 : Math.min(Math.max(config.interval_ms || 0, 300), 900);
+    await sleep(delay);
   }
 
   async function requestResumeAndSkip(btn, candidateId, signature) {
+    if (hasResumeRequestSent(getChatDetailRoot())) {
+      await skipCandidate(candidateId, signature, "resume_request_already_sent", { fast_skip: true });
+      return;
+    }
     const beforeCount = getResumeRequestSentCount();
-    clickElementReliably(btn.el);
+    clickElementOnce(btn.el);
     const confirmed = await confirmRequestIfNeeded(candidateId, signature);
     const requestSent = confirmed ? await waitForResumeRequestSent(3000, beforeCount) : await waitForResumeRequestSent(1200, beforeCount);
     if (requestSent || confirmed) {
       emit({ type: "resume_request_success", data: { candidate_id: candidateId, candidate_signature: signature, confirmed, request_sent: requestSent } });
     }
-    await skipCandidate(candidateId, signature, requestSent ? "resume_requested" : "resume_request_clicked", { confirmed });
+    await skipCandidate(candidateId, signature, requestSent ? "resume_requested" : "resume_request_clicked", { confirmed, fast_skip: true });
+  }
+
+  function downloadDirectUrl(data = {}, timeoutMs = 2000) {
+    return new Promise((resolve) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        resolve({ ok: false, reason: "direct_download_response_timeout" });
+      }, timeoutMs);
+      try {
+        chrome.runtime.sendMessage({ type: "download_direct_url", data }, (response) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          if (chrome.runtime.lastError) {
+            resolve({ ok: false, reason: chrome.runtime.lastError.message || "direct_download_message_failed" });
+            return;
+          }
+          resolve(response || { ok: false, reason: "empty_direct_download_response" });
+        });
+      } catch (error) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve({ ok: false, reason: String(error) });
+      }
+    });
+  }
+
+  function getPreviewDirectDownloadUrl(preview) {
+    const src = preview?.info?.iframe_src || preview?.root?.getAttribute?.("src") || preview?.root?.getAttribute?.("data") || "";
+    if (!src || !isStrongBossPdfPreviewUrl(src)) return "";
+    return src;
+  }
+
+  async function tryDirectIframeDownload(candidateId, signature, info, preview) {
+    const url = getPreviewDirectDownloadUrl(preview);
+    if (!url) return false;
+    const payload = { candidate_id: candidateId, candidate_signature: signature, candidate_info: info, expected_filename: `${signature}.pdf`, url, iframe_src: url };
+    emit({ type: "direct_iframe_download_used", data: payload });
+    const resultPromise = waitForDownloadResult(candidateId, 20000);
+    const started = await downloadDirectUrl(payload);
+    if (!started.ok) {
+      emit({ type: "direct_iframe_download_failed", data: { ...payload, reason: started.reason || "direct_download_start_failed" } });
+      return false;
+    }
+    const downloadResult = await resultPromise;
+    if (downloadResult.ok) {
+      results.downloaded++;
+      emitProgress();
+      await sleep(Math.min(Math.max(config.interval_ms || 0, 300), 900));
+      return true;
+    }
+    emit({ type: "direct_iframe_download_failed", data: { ...payload, reason: downloadResult.reason || "download_failed" } });
+    return false;
   }
 
   function findLearnedDownloadElement(learned) {
@@ -866,9 +1041,30 @@
       } catch {}
     }
 
+    if (typeof learned.frame_relative_x === "number" && typeof learned.frame_relative_y === "number") {
+      const frames = Array.from(document.querySelectorAll("iframe, object, embed"))
+        .filter((el) => {
+          try { return isVisible(el) && isPdfPreviewRoot(el); } catch { return false; }
+        });
+      const learnedSrc = learned.frame_src || "";
+      const frame = frames.find((el) => {
+        const src = el.getAttribute?.("src") || el.getAttribute?.("data") || "";
+        return learnedSrc && src === learnedSrc;
+      }) || frames[0];
+      if (frame) {
+        const rect = frame.getBoundingClientRect();
+        const x = rect.left + learned.frame_relative_x * rect.width;
+        const y = rect.top + learned.frame_relative_y * rect.height;
+        return document.elementFromPoint(
+          Math.max(1, Math.min(window.innerWidth - 1, x)),
+          Math.max(1, Math.min(window.innerHeight - 1, y))
+        );
+      }
+    }
+
     const descriptor = (learned.descriptor || "").replace(/\s+/g, " ").trim();
     if (descriptor) {
-      const tokens = descriptor.split(/\s+/).filter((x) => x.length >= 2).slice(0, 8);
+      const tokens = descriptor.split(/\s+/).filter((x) => x.length >= 2 && !/object|SVGAnimatedString/.test(x)).slice(0, 8);
       const nodes = Array.from(document.querySelectorAll("button, a, [role='button'], [class*='btn'], [class*='icon'], [class*='download'], div, span, i, svg, use"))
         .filter((el) => isVisible(el) && !isDisabled(el));
       const scored = nodes.map((el) => {
@@ -891,8 +1087,7 @@
     const target = findLearnedDownloadElement(resumePreviewLearnState.learnedClick);
     if (!target) {
       emit({ type: "learned_download_click_failed", data: { candidate_id: candidateId, candidate_signature: signature, reason: "learned_element_not_found" } });
-      await skipCandidate(candidateId, signature, "download_button_not_found");
-      return;
+      return false;
     }
 
     emit({ type: "learned_download_click_used", data: { candidate_id: candidateId, candidate_signature: signature, ...getElementSnapshot(target) } });
@@ -903,10 +1098,11 @@
     if (downloadResult.ok) {
       results.downloaded++;
       emitProgress();
-      await sleep(config.interval_ms);
-    } else {
-      await skipCandidate(candidateId, signature, downloadResult.reason || "download_failed", downloadResult.data || {});
+      await sleep(Math.min(Math.max(config.interval_ms || 0, 500), 1500));
+      return true;
     }
+    await skipCandidate(candidateId, signature, downloadResult.reason || "download_failed", downloadResult.data || {});
+    return true;
   }
 
   function finishLearningTask(candidateId = "", signature = "", data = {}) {
@@ -922,9 +1118,10 @@
     emit({ type: "collect_finished", data: { total_downloaded: results.downloaded, total_skipped: results.skipped, learning_finished: true } });
   }
 
-  async function waitForResumeLearningContinue() {
+  async function waitForResumeLearningContinue(candidateId = "", signature = "", preview = null) {
     state = "paused";
-    emit({ type: "collect_paused_for_resume_preview_confirm", data: {} });
+    if (preview) emitResumePreviewCandidateConfirm(candidateId, signature, preview);
+    emit({ type: "collect_paused_for_resume_preview_confirm", data: { candidate_id: candidateId, candidate_signature: signature } });
     await waitForPause();
   }
 
@@ -934,15 +1131,34 @@
   }
 
   async function startResumePreviewRecognition(candidateId, signature, info, btn, beforeUrl, stalePreviewClosed) {
-    emitCritical({ type: "resume_attachment_clicked", data: { candidate_id: candidateId, candidate_signature: signature, button_state: btn.state, button_text: btn.text, before_url: beforeUrl, stale_preview_closed: stalePreviewClosed } });
-    if (shouldAbortAsyncStep()) return null;
-    return await waitForResumePreview(candidateId, signature, info);
+    emitAttachmentDebug("01_enter_after_attachment_click", candidateId, signature, {
+      button_state: btn.state,
+      button_text: btn.text,
+      before_url: beforeUrl,
+      after_click_url: location.href,
+      stale_preview_closed: stalePreviewClosed,
+      state,
+    });
+    if (shouldAbortAsyncStep()) {
+      emitAttachmentDebug("02_abort_before_preview_wait", candidateId, signature, { state });
+      return null;
+    }
+    emitAttachmentDebug("02_call_wait_for_resume_preview", candidateId, signature, { timeout_ms: 12000 });
+    const preview = await waitForResumePreview(candidateId, signature, info);
+    emitAttachmentDebug(preview ? "03_wait_for_resume_preview_return_found" : "03_wait_for_resume_preview_return_null", candidateId, signature, {
+      found: Boolean(preview),
+      preview_score: preview?.score || 0,
+      preview_rect: preview?.root ? getRectSnapshot(preview.root) : null,
+      preview_descriptor: preview?.root ? getElementDescriptor(preview.root).slice(0, 180) : "",
+    });
+    return preview;
   }
 
   async function tryDownloadResume(candidateId, signature, info, preview = null, previewAlreadyWaited = false) {
     if (shouldAbortAsyncStep()) return;
-    emit({ type: "resume_preview_info_extract_start", data: { candidate_id: candidateId, candidate_signature: signature } });
-    if (!preview && !previewAlreadyWaited) preview = await waitForResumePreview(candidateId, signature, info);
+    if (!preview && !previewAlreadyWaited) {
+      preview = await waitForResumePreview(candidateId, signature, info);
+    }
     if (shouldAbortAsyncStep()) return;
     if (!preview) {
       await skipCandidate(candidateId, signature, "resume_preview_not_found");
@@ -952,37 +1168,32 @@
     emit({ type: "resume_preview_detected", data: { candidate_id: candidateId, candidate_signature: signature, ...preview.info } });
     emit({ type: "resume_preview_info_extract_success", data: { candidate_id: candidateId, candidate_signature: signature, ...preview.info } });
 
-    if (resumePreviewLearnState.learningStage === "detect_preview") {
-      resumePreviewLearnState.learningStage = "wait_manual_click";
-      try {
-        localStorage.setItem(STORAGE_KEYS.learningStage, "wait_manual_click");
-      } catch {}
-      await waitForResumeLearningContinue();
-    }
-
-    if (resumePreviewLearnState.learningStage === "wait_manual_click" || !resumePreviewLearnState.learnedClick) {
-      emit({ type: "manual_download_recording_started", data: { candidate_id: candidateId, candidate_signature: signature } });
-      emit({ type: "download_intent", data: { candidate_id: candidateId, candidate_signature: signature, candidate_info: info, expected_filename: `${signature}.pdf` } });
-      const resultPromise = waitForDownloadResult(candidateId, 65000);
-      const learned = await captureNextManualDownloadClick(candidateId, signature);
-      if (!learned) {
-        await skipCandidate(candidateId, signature, "manual_download_click_timeout");
-        return;
-      }
-      const downloadResult = await resultPromise;
-      if (downloadResult.ok) {
-        results.downloaded++;
-        emitProgress();
-        const downloadUrl = findDownloadUrlFromResult(downloadResult);
-        emit({ type: "manual_download_learning_success", data: { ...learned, download_url: downloadUrl } });
-        finishLearningTask(candidateId, signature, { download_url: downloadUrl });
-      } else {
-        await skipCandidate(candidateId, signature, downloadResult.reason || "download_failed", downloadResult.data || {});
-      }
+    if (await tryDirectIframeDownload(candidateId, signature, info, preview)) {
       return;
     }
 
-    await clickLearnedDownload(candidateId, signature, info);
+    if (resumePreviewLearnState.learnedClick && await clickLearnedDownload(candidateId, signature, info)) {
+      return;
+    }
+
+    const downloadButton = await waitForDownloadButton(candidateId, signature, 5000);
+    if (!downloadButton) {
+      await skipCandidate(candidateId, signature, "download_button_not_found");
+      return;
+    }
+
+    emit({ type: "auto_download_click_used", data: { candidate_id: candidateId, candidate_signature: signature, ...getElementSnapshot(downloadButton) } });
+    emit({ type: "download_intent", data: { candidate_id: candidateId, candidate_signature: signature, candidate_info: info, expected_filename: `${signature}.pdf` } });
+    const resultPromise = waitForDownloadResult(candidateId, 20000);
+    clickElementReliably(downloadButton);
+    const downloadResult = await resultPromise;
+    if (downloadResult.ok) {
+      results.downloaded++;
+      emitProgress();
+      await sleep(Math.min(Math.max(config.interval_ms || 0, 500), 1500));
+    } else {
+      await skipCandidate(candidateId, signature, downloadResult.reason || "download_failed", downloadResult.data || {});
+    }
   }
 
   async function waitForPause() {
@@ -991,7 +1202,11 @@
   }
 
   async function collectLoop() {
-    if (!isAuthenticated()) {
+    if (!isActiveInstance()) return;
+    if (activeCollectLoopRunId === activeRunId) return;
+    activeCollectLoopRunId = activeRunId;
+    try {
+      if (!isAuthenticated()) {
       emit({ type: "error", data: { message: "未检测到登录态", stage: "pre_check" } });
       state = "idle";
       return;
@@ -1001,7 +1216,6 @@
 
     await resetCandidateListScroll();
     const items = getCandidateItems();
-    emit({ type: "candidate_list_scanned", data: { count: items.length, samples: items.slice(0, 5).map((el) => textOf(el).slice(0, 80)) } });
     if (items.length === 0) {
       emit({ type: "error", data: { message: "未找到候选人列表", stage: "scan" } });
       state = "idle";
@@ -1020,9 +1234,9 @@
 
       try {
         item.scrollIntoView({ block: "center" });
-        await sleep(300);
+        await sleep(80);
         item.click();
-        await sleep(1200);
+        await sleep(450);
       } catch (error) {
         emit({ type: "candidate_skipped", data: { candidate_signature: `index_${i}`, reason: "click_failed", error: String(error) } });
         results.skipped++;
@@ -1044,25 +1258,46 @@
         emit({ type: "candidate_skipped", data: { candidate_id: candidateId, candidate_signature: signature, reason: "candidate_info_unrecognized", raw_text: info.raw_text || "" } });
         results.skipped++;
         emitProgress();
-        await sleep(config.interval_ms);
+        await sleep(20);
         continue;
       }
 
       const btn = findResumeButton();
       if (!btn) {
-        emit({ type: "candidate_skipped", data: { candidate_id: candidateId, candidate_signature: signature, reason: "no_resume_button" } });
-        results.skipped++;
-        emitProgress();
-        await sleep(config.interval_ms);
+        await skipCandidate(candidateId, signature, "no_resume_button", { fast_skip: true });
         continue;
       }
 
       emit({ type: "resume_button_found", data: { candidate_id: candidateId, candidate_signature: signature, button_state: btn.state, button_text: btn.text } });
 
+      if (btn.state === "requested") {
+        await skipCandidate(candidateId, signature, "resume_request_already_sent", { fast_skip: true });
+        continue;
+      }
+
+      if (btn.state === "request") {
+        if (config.request_resume_if_missing) {
+          await requestResumeAndSkip(btn, candidateId, signature);
+        } else {
+          await skipCandidate(candidateId, signature, "need_request_resume", { fast_skip: true });
+        }
+        continue;
+      }
+
+      emitAttachmentDebug("00_resume_button_ready", candidateId, signature, {
+        button_state: btn.state,
+        button_text: btn.text,
+        button_rect: btn.el ? getRectSnapshot(btn.el) : null,
+        button_descriptor: btn.el ? getElementDescriptor(btn.el).slice(0, 180) : "",
+      });
+
       const beforeUrl = location.href;
-      clickElementReliably(btn.el);
+      if (!guardResumeAttachmentClick(candidateId, signature)) {
+        await skipCandidate(candidateId, signature, "resume_attachment_click_guarded", { fast_skip: true });
+        continue;
+      }
+      clickElementOnce(btn.el);
       const preview = await startResumePreviewRecognition(candidateId, signature, info, btn, beforeUrl, true);
-      emitResumePreviewDiagnostics(candidateId, signature, info, (document.body?.innerText || "").replace(/\s+/g, " ").slice(0, 260), "after_attachment_click_preview_probe");
       if (shouldAbortAsyncStep()) break;
       if (!preview) {
         await skipCandidate(candidateId, signature, "resume_preview_not_found");
@@ -1075,6 +1310,9 @@
     state = "idle";
     if (!collectFinishedEmitted) {
       emit({ type: "collect_finished", data: { total_downloaded: results.downloaded, total_skipped: results.skipped } });
+    }
+    } finally {
+      if (activeCollectLoopRunId === activeRunId) activeCollectLoopRunId = "";
     }
   }
 
@@ -1102,23 +1340,26 @@
   }
 
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    if (!isActiveInstance()) {
+      sendResponse({ ok: false, inactive_instance: true });
+      return true;
+    }
     if (msg.run_id) activeRunId = msg.run_id;
     switch (msg.type) {
       case "probe_page":
         emitPageStatus("probe");
         break;
       case "start_collect":
-        if (state === "collecting") break;
+        window.__bossResumeCollectorActiveInstance = INSTANCE_ID;
         activeRunId = msg.run_id || `${Date.now()}`;
+        if (state === "collecting" && activeCollectLoopRunId === activeRunId) break;
         state = "collecting";
         config = { ...config, ...msg.config };
         results = { downloaded: 0, skipped: 0, currentIndex: 0 };
-        resumePreviewLearnState.learningStage = "detect_preview";
+        resumePreviewLearnState.learningStage = resumePreviewLearnState.learnedClick ? "learned" : "auto_download";
         resumePreviewLearnState.waitingManualClick = false;
-        resumePreviewLearnState.learnedClick = null;
         try {
-          localStorage.setItem(STORAGE_KEYS.learningStage, "detect_preview");
-          localStorage.removeItem(STORAGE_KEYS.learnedClick);
+          localStorage.setItem(STORAGE_KEYS.learningStage, resumePreviewLearnState.learningStage);
         } catch {}
         collectFinishedEmitted = false;
         pendingDownloadWaiters.forEach((resolve) => resolve({ ok: false, reason: "new_collect_started" }));
@@ -1134,6 +1375,7 @@
         break;
       case "reset_content_script":
         window.__bossResumeCollectorVersion = "";
+        window.__bossResumeCollectorActiveInstance = "";
         state = "stopped";
         location.reload();
         break;

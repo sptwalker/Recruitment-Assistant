@@ -1,5 +1,5 @@
 const WS_URL = "ws://127.0.0.1:8765";
-const EXTENSION_VERSION = "1.25.0";
+const EXTENSION_VERSION = "1.36.0";
 const HEARTBEAT_INTERVAL_MS = 15000;
 let ws = null;
 let heartbeatTimer = null;
@@ -85,25 +85,41 @@ async function ensureContentScript(tabId) {
   }
 }
 
+function shouldTargetSingleTab(msg) {
+  return ["start_collect", "pause_collect", "resume_collect", "stop_collect", "reset_content_script"].includes(msg?.type);
+}
+
+function pickBossTab(candidateTabs) {
+  return candidateTabs.find((tab) => tab.active && tab.highlighted) || candidateTabs.find((tab) => tab.active) || candidateTabs[0] || null;
+}
+
+function sendMessageToTab(tab, msg) {
+  chrome.tabs.sendMessage(tab.id, msg, async () => {
+    if (!chrome.runtime.lastError) return;
+    const injected = await ensureContentScript(tab.id);
+    if (!injected) {
+      sendToServer({ type: "content_script_inject_failed", data: { tab_id: tab.id, url: tab.url || "" } });
+      return;
+    }
+    chrome.tabs.sendMessage(tab.id, msg, () => {
+      if (chrome.runtime.lastError) {
+        sendToServer({ type: "content_script_message_failed", data: { tab_id: tab.id, url: tab.url || "", error: chrome.runtime.lastError.message } });
+      }
+    });
+  });
+}
+
 function sendToContentScript(msg) {
   chrome.tabs.query({ url: bossChatUrlPatterns() }, async (tabs) => {
     const candidateTabs = tabs.filter((tab) => isBossCandidatePage(tab.url || ""));
-    sendToServer({ type: "boss_tabs_scanned", data: { count: candidateTabs.length, urls: candidateTabs.map((tab) => tab.url || "") } });
+    if (shouldTargetSingleTab(msg)) {
+      const tab = pickBossTab(candidateTabs);
+      if (tab) sendMessageToTab(tab, msg);
+      return;
+    }
 
     for (const tab of candidateTabs) {
-      chrome.tabs.sendMessage(tab.id, msg, async () => {
-        if (!chrome.runtime.lastError) return;
-        const injected = await ensureContentScript(tab.id);
-        if (!injected) {
-          sendToServer({ type: "content_script_inject_failed", data: { tab_id: tab.id, url: tab.url || "" } });
-          return;
-        }
-        chrome.tabs.sendMessage(tab.id, msg, () => {
-          if (chrome.runtime.lastError) {
-            sendToServer({ type: "content_script_message_failed", data: { tab_id: tab.id, url: tab.url || "", error: chrome.runtime.lastError.message } });
-          }
-        });
-      });
+      sendMessageToTab(tab, msg);
     }
   });
 }
@@ -155,6 +171,28 @@ function notifyDownloadResult(type, data) {
   });
 }
 
+function downloadDirectUrl(data = {}, sendResponse = () => {}) {
+  const url = data.url || data.iframe_src || data.src || "";
+  if (!url || !/^https?:\/\//i.test(url)) {
+    sendResponse({ ok: false, reason: "invalid_download_url" });
+    return;
+  }
+  const intent = { ...data, run_id: data.run_id || activeRunId, at: Date.now(), direct_url: url };
+  lastDownloadIntent = intent;
+  chrome.downloads.download({ url, saveAs: false }, (downloadId) => {
+    if (chrome.runtime.lastError || !downloadId) {
+      const reason = chrome.runtime.lastError?.message || "download_start_failed";
+      sendToServer({ type: "direct_download_failed", data: { ...intent, reason } });
+      notifyDownloadResult("download_failed", { ...intent, reason });
+      sendResponse({ ok: false, reason });
+      return;
+    }
+    pendingDownloads.set(downloadId, { ...intent, download_id: downloadId, started_at: Date.now() });
+    sendToServer({ type: "download_created", data: { ...intent, download_id: downloadId, filename: url } });
+    sendResponse({ ok: true, download_id: downloadId });
+  });
+}
+
 chrome.downloads.onCreated.addListener((item) => {
   const intent = getFreshDownloadIntent();
   if (!intent) return;
@@ -201,6 +239,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       sendToServer(msg.event);
     }
     sendResponse({ ok: true });
+  } else if (msg.type === "download_direct_url") {
+    downloadDirectUrl(msg.data || {}, sendResponse);
+    return true;
   } else if (msg.type === "get_state") {
     sendResponse({ connected: ws?.readyState === WebSocket.OPEN, collectState });
   }

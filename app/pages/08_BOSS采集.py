@@ -61,7 +61,7 @@ st.markdown(
 
 
 def classify_boss_log(message: str, level: str = "info") -> str:
-    if level == "highlight" or any(token in message for token in ["发现弹出页面", "成功获取以下信息", "正在记录你的操作", "成功记录到你的点击操作", "学习任务已完成"]):
+    if level == "highlight" or any(token in message for token in ["附件简历调试", "发现弹出页面", "成功获取以下信息", "正在记录你的操作", "成功记录到你的点击操作", "学习任务已完成"]):
         return "boss-log-highlight"
     if "附件按钮:" in message and ("unknown_resume" in message or "附件简历" in message or "开始识别弹出页面" in message):
         return "boss-log-highlight"
@@ -86,6 +86,7 @@ def translate_boss_detail(value: str) -> str:
         error = value.split(":", 1)[1] or "未知错误"
         return f"下载失败（{error}）"
     mapping = {
+        "need_request_resume": "需要索要简历，已按设置跳过",
         "resume_requested": "已成功索要简历，等待候选人上传",
         "resume_request_clicked": "已点击索要简历，等待确认结果",
         "resume_request_already_sent": "简历请求已发送，等待候选人上传",
@@ -209,20 +210,26 @@ with st.container(border=True):
 # --- Collection & Results ---
 section_title("采集与结果")
 with st.container(border=True):
-    top_cols = st.columns([1.15, 1.15, 1.1, 1, 1, 1, 1])
+    top_cols = st.columns([1.05, 1.05, 1.05, 1.05, 0.85, 0.85, 0.85, 0.85])
     max_resumes = top_cols[0].number_input("最大采集数量", min_value=1, max_value=100, value=5, step=1)
-    interval_ms = top_cols[1].number_input("点击间隔（毫秒）", min_value=2000, max_value=30000, value=5000, step=1000)
+    interval_ms = top_cols[1].number_input("点击间隔（毫秒）", min_value=500, max_value=30000, value=1500, step=500)
     test_mode = top_cols[2].selectbox("测试模式", ["连续采集", "单步采集1人"])
-    top_cols[3].metric("已下载", runtime.get("downloaded_count", 0))
-    top_cols[4].metric("已跳过", runtime.get("skipped_count", 0))
-    top_cols[5].metric("当前索引", runtime.get("current_index", 0))
+    request_resume_if_missing = top_cols[3].checkbox("需要时索要简历", value=False)
+    top_cols[4].metric("已下载", runtime.get("downloaded_count", 0))
+    top_cols[5].metric("已跳过", runtime.get("skipped_count", 0))
+    top_cols[6].metric("当前索引", runtime.get("current_index", 0))
     status_text = "采集中" if is_running and not is_paused else ("已暂停" if is_paused else "空闲")
-    top_cols[6].metric("状态", status_text)
+    top_cols[7].metric("状态", status_text)
 
     btn_cols = st.columns([1, 1, 1, 1, 5])
     if btn_cols[0].button("开始采集", disabled=is_running or not ws_connected, type="primary"):
         effective_max = 1 if test_mode == "单步采集1人" else max_resumes
-        bridge.start_collect({"max_resumes": effective_max, "interval_ms": interval_ms, "test_mode": test_mode})
+        bridge.start_collect({
+            "max_resumes": effective_max,
+            "interval_ms": interval_ms,
+            "test_mode": test_mode,
+            "request_resume_if_missing": request_resume_if_missing,
+        })
         st.rerun()
     if btn_cols[1].button("暂停", disabled=not is_running or is_paused):
         bridge.pause_collect()

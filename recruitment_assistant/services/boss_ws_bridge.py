@@ -10,8 +10,10 @@ from typing import Any
 
 from loguru import logger
 
-from recruitment_assistant.config.settings import get_settings
+from recruitment_assistant.services.crawl_task_service import BossCandidateRecordService
 from recruitment_assistant.services.ws_server import BossWSServer
+from recruitment_assistant.storage.db import create_session
+from recruitment_assistant.utils.hash_utils import text_hash
 from recruitment_assistant.utils.snapshot_utils import safe_filename
 
 
@@ -33,6 +35,7 @@ class BossWSBridge:
             "candidates": [],
             "downloaded_count": 0,
             "skipped_count": 0,
+            "dedup_record_count": 0,
             "current_index": 0,
             "run_id": "",
             "run_started_at": "",
@@ -66,12 +69,14 @@ class BossWSBridge:
             "candidates": [],
             "downloaded_count": 0,
             "skipped_count": 0,
+            "dedup_record_count": 0,
             "current_index": 0,
             "run_id": run_id,
             "run_started_at": now.isoformat(timespec="seconds"),
             "log_file": str(log_file),
             "skip_reason_counts": {},
         })
+        self._seen_candidate_records.update(self._load_boss_candidate_keys())
         self._write_event_log("run_started", {"run_id": run_id})
         self._log("info", f"新测试轮次已创建: {run_id}")
         if self.ws_server.is_extension_connected:
@@ -80,6 +85,15 @@ class BossWSBridge:
             self._write_event_log("command_sent", command)
             self._log("info", "已请求扩展重新加载 Boss 页面脚本")
             self.probe_page()
+
+    def clear_boss_dedup_records(self) -> int:
+        with create_session() as session:
+            deleted_count = BossCandidateRecordService(session).clear_records("boss")
+        self._seen_candidate_records.clear()
+        self.runtime_state["dedup_record_count"] = 0
+        self._log("info", f"已清除 BOSS 去重数据库: {deleted_count} 条")
+        self._write_event_log("boss_dedup_records_cleared", {"deleted_count": deleted_count})
+        return deleted_count
 
     def start_collect(self, config: dict) -> None:
         if not self.ws_server.is_extension_connected:
@@ -90,6 +104,7 @@ class BossWSBridge:
         self.runtime_state["paused"] = False
         self.runtime_state["downloaded_count"] = 0
         self.runtime_state["skipped_count"] = 0
+        self.runtime_state["dedup_record_count"] = 0
         self.runtime_state["current_index"] = 0
         self.runtime_state["candidates"] = []
         self.runtime_state["skip_reason_counts"] = {}
@@ -135,6 +150,7 @@ class BossWSBridge:
             "log_file": self.runtime_state.get("log_file", ""),
             "downloaded_count": self.runtime_state.get("downloaded_count", 0),
             "skipped_count": self.runtime_state.get("skipped_count", 0),
+            "dedup_record_count": self.runtime_state.get("dedup_record_count", 0),
             "current_index": self.runtime_state.get("current_index", 0),
             "status_counts": dict(statuses),
             "skip_reason_counts": self.runtime_state.get("skip_reason_counts", {}),
@@ -198,7 +214,13 @@ class BossWSBridge:
                 self._log("error", f"Boss 页面脚本通信失败: {data.get('error', '')} {data.get('url', '')}")
             case "candidate_clicked":
                 sig = f"{data.get('name', '?')}/{data.get('age', '?')}/{data.get('education', '?')}"
-                self._log("info", f"点击候选人: {sig} (#{data.get('index', 0)})")
+                source = data.get("contact_source", "未知")
+                note = data.get("contact_source_note", "")
+                rect = data.get("contact_source_rect") or {}
+                path = str(data.get("contact_source_path", ""))[:120]
+                sample = str(data.get("contact_source_text_sample", ""))[:120]
+                position = f"rect=({rect.get('left')},{rect.get('top')},{rect.get('width')}x{rect.get('height')})" if rect else "rect=无"
+                self._log("info", f"点击候选人: {sig} (#{data.get('index', 0)})；姓名识别位置={source}；{note}；{position}；path={path}；文本={sample}")
             case "resume_downloaded":
                 self._save_resume(data)
             case "candidate_skipped":
@@ -255,7 +277,11 @@ class BossWSBridge:
             case "resume_preview_wait_result":
                 pass
             case "resume_preview_weak_candidate_used":
-                pass
+                sig = data.get("candidate_signature", "未知")
+                component_type = str(data.get("component_preview_type", "") or "dom_text")
+                component = str(data.get("component_class", "") or data.get("component_tag", "未知组件"))[:120]
+                rect = data.get("component_rect") or {}
+                self._log("highlight", f"未发现 PDF iframe，已改用最大疑似弹窗继续下载识别: {sig}；类型={component_type}；组件={component}；rect=({rect.get('left')},{rect.get('top')},{rect.get('width')}x{rect.get('height')})")
             case "resume_preview_info_extract_start":
                 pass
             case "resume_preview_detected":
@@ -267,7 +293,7 @@ class BossWSBridge:
                 self._log("highlight", f"已识别简历预览页: {sig}；来源={source}；姓名={name}")
             case "pdf_iframe_preview_scan_started":
                 sig = data.get("candidate_signature", "未知")
-                self._log("info", f"正在扫描 PDF iframe 预览页: {sig}；可见frame={data.get('total_frames', 0)}；强匹配={data.get('strong_candidates', 0)}")
+                self._log("info", f"正在扫描 PDF iframe 预览页: {sig}；可见frame={data.get('total_frames', 0)}；强匹配={data.get('strong_candidates', 0)}；本候选人仅记录首次扫描")
             case "pdf_iframe_preview_detected":
                 sig = data.get("candidate_signature", "未知")
                 src = str(data.get("iframe_src", "") or data.get("component_src", ""))[:180]
@@ -421,18 +447,92 @@ class BossWSBridge:
             text = fallback
         return safe_filename(text, max_length=24)
 
+    def _build_boss_candidate_key(self, candidate_sig: str, candidate_info: dict[str, Any]) -> str:
+        raw_name = candidate_info.get("name") or ""
+        raw_age = candidate_info.get("age") or ""
+        raw_education = candidate_info.get("education") or ""
+        signature_parts = [part.strip() for part in str(candidate_sig or "").split("/")]
+        while len(signature_parts) < 3:
+            signature_parts.append("")
+        name = self._normalize_resume_filename_part(raw_name or signature_parts[0], "待识别")
+        age = self._normalize_resume_filename_part(raw_age or signature_parts[1], "待识别")
+        education = self._normalize_resume_filename_part(raw_education or signature_parts[2], "待识别")
+        key = text_hash("|".join(["boss", "profile_name_age_education", name, age, education]))
+        if key:
+            return key
+        return text_hash(f"boss|candidate_signature|{candidate_sig or ''}") or ""
+
+    def _load_boss_candidate_keys(self) -> set[str]:
+        try:
+            with create_session() as session:
+                return BossCandidateRecordService(session).list_candidate_keys("boss")
+        except Exception as exc:
+            self._log("warning", f"读取 BOSS 去重记录失败: {exc}")
+            return set()
+
+    def _upsert_boss_candidate_record(
+        self,
+        *,
+        candidate_sig: str,
+        candidate_info: dict[str, Any],
+        file_name: str | None,
+        source_url: str | None,
+        content_hash: str | None,
+        raw_resume_id: int | None = None,
+        task_id: int | None = None,
+    ) -> bool:
+        candidate_key = self._build_boss_candidate_key(candidate_sig, candidate_info)
+        if not candidate_key:
+            return False
+
+        name = self._normalize_resume_filename_part(candidate_info.get("name"), "待识别")
+        gender = candidate_info.get("gender") if candidate_info.get("gender") not in {"", "待识别"} else None
+        job_title = candidate_info.get("job_title") if candidate_info.get("job_title") not in {"", "待识别"} else None
+        phone = candidate_info.get("phone") if candidate_info.get("phone") not in {"", "待识别"} else None
+
+        with create_session() as session:
+            service = BossCandidateRecordService(session)
+            return service.upsert_candidate_record(
+                platform_code="boss",
+                target_site="BOSS直聘",
+                candidate_key=candidate_key,
+                candidate_signature=candidate_sig,
+                name=name if name != "待识别" else None,
+                gender=gender,
+                job_title=job_title,
+                phone=phone,
+                resume_file_name=file_name,
+                source_url=source_url,
+                content_hash=content_hash,
+                raw_resume_id=raw_resume_id,
+                task_id=task_id,
+            )
+
     def _save_resume(self, data: dict) -> None:
-        settings = get_settings()
         candidate_sig = data.get("candidate_signature", "未知")
         candidate_info = data.get("candidate_info", {})
         source_filename = data.get("filename", "")
         download_path = data.get("download_path", "")
+        source_url = str(data.get("url", "") or data.get("direct_url", "") or "") or None
+        candidate_key = self._build_boss_candidate_key(candidate_sig, candidate_info)
+
+        if candidate_key and candidate_key in self._seen_candidate_records:
+            self._log("info", f"BOSS 去重命中，已存在记录: {candidate_sig}")
+            self._write_event_log("resume_saved_duplicate_skipped", {
+                "signature": candidate_sig,
+                "candidate_key": candidate_key,
+                "info": candidate_info,
+                "status": "duplicate_skipped",
+                "at": datetime.now().isoformat(),
+            })
+            return
 
         if download_path:
             source = Path(download_path)
             if source.exists():
                 now = datetime.now()
-                target_dir = settings.attachment_dir / "boss" / now.strftime("%Y%m%d")
+                project_root = Path(__file__).resolve().parents[2]
+                target_dir = project_root / "data" / "attachments" / "boss" / now.strftime("%Y%m%d")
                 target_dir.mkdir(parents=True, exist_ok=True)
 
                 content = source.read_bytes()
@@ -451,14 +551,45 @@ class BossWSBridge:
                 while target.exists() and target != source:
                     target = target_dir / f"{filename_stem}-{duplicate_index}{suffix}"
                     duplicate_index += 1
-                shutil.move(str(source), str(target))
-                record_key = str(candidate_sig)
-                if record_key in self._seen_candidate_records:
-                    return
-                self._seen_candidate_records.add(record_key)
+                if source.resolve() != target.resolve():
+                    shutil.copy2(str(source), str(target))
+                    try:
+                        source.unlink()
+                    except OSError as exc:
+                        self._log("warning", f"简历归档后删除源文件失败: {source}；原因={exc}")
+                is_new_record = self._upsert_boss_candidate_record(
+                    candidate_sig=candidate_sig,
+                    candidate_info=candidate_info,
+                    file_name=target.name,
+                    source_url=source_url,
+                    content_hash=file_hash,
+                )
+                self._seen_candidate_records.add(candidate_key)
+                if is_new_record:
+                    self.runtime_state["dedup_record_count"] += 1
+                    self._log("info", f"BOSS 去重记录已写入: {candidate_sig}")
+                    self._write_event_log("resume_saved_dedup_record_created", {
+                        "signature": candidate_sig,
+                        "candidate_key": candidate_key,
+                        "file": target.name,
+                        "path": str(target),
+                        "hash": file_hash,
+                        "status": "created",
+                        "at": now.isoformat(),
+                    })
+                else:
+                    self._log("info", f"BOSS 去重记录已存在，未新增: {candidate_sig}")
+                    self._write_event_log("resume_saved_duplicate_record", {
+                        "signature": candidate_sig,
+                        "candidate_key": candidate_key,
+                        "file": target.name,
+                        "path": str(target),
+                        "hash": file_hash,
+                        "status": "duplicate_record",
+                        "at": now.isoformat(),
+                    })
 
                 final_filename = target.name
-
                 self._log("info", f"简历已保存: {final_filename}")
                 self.runtime_state["downloaded_count"] = seq
                 record = {
@@ -468,16 +599,30 @@ class BossWSBridge:
                     "path": str(target),
                     "hash": file_hash,
                     "status": "downloaded",
+                    "candidate_key": candidate_key,
                     "at": now.isoformat(),
                 }
                 self.runtime_state["candidates"].append(record)
                 self._write_event_log("resume_saved", record)
                 return
 
-        record_key = str(candidate_sig)
-        if record_key in self._seen_candidate_records:
+        if candidate_key and candidate_key in self._seen_candidate_records:
             return
-        self._seen_candidate_records.add(record_key)
+
+        is_new = self._upsert_boss_candidate_record(
+            candidate_sig=candidate_sig,
+            candidate_info=candidate_info,
+            file_name=source_filename or None,
+            source_url=source_url,
+            content_hash=data.get("hash") or None,
+        )
+        if candidate_key:
+            self._seen_candidate_records.add(candidate_key)
+        if is_new:
+            self.runtime_state["dedup_record_count"] += 1
+        else:
+            self._log("info", f"BOSS 去重记录已存在，未新增: {candidate_sig}")
+
         self.runtime_state["downloaded_count"] += 1
         record = {
             "signature": candidate_sig,
@@ -486,11 +631,13 @@ class BossWSBridge:
             "download_id": data.get("download_id", ""),
             "url": data.get("url", ""),
             "status": "downloaded_external",
+            "candidate_key": candidate_key,
             "at": datetime.now().isoformat(),
         }
         self.runtime_state["candidates"].append(record)
         self._write_event_log("resume_downloaded_external", record)
         self._log("info", f"简历已下载: {candidate_sig} -> {source_filename}")
+
 
     def _translate_skip_reason(self, reason: str) -> str:
         if reason.startswith("button_disabled:"):
@@ -523,15 +670,27 @@ class BossWSBridge:
     def _record_skip(self, data: dict) -> None:
         candidate_sig = data.get("candidate_signature", "未知")
         reason = data.get("reason", "") or "unknown"
+        reason_text = self._translate_skip_reason(reason)
         record_key = str(candidate_sig)
-        if record_key in self._seen_candidate_records:
+        is_duplicate_record = record_key in self._seen_candidate_records
+
+        self._log("info", f"跳过: {candidate_sig} ({reason_text})")
+        self._write_event_log("candidate_skipped_seen", {
+            "signature": candidate_sig,
+            "reason": reason,
+            "reason_text": reason_text,
+            "duplicate_record": is_duplicate_record,
+            "at": datetime.now().isoformat(),
+        })
+
+        if is_duplicate_record:
             return
+
         self._seen_candidate_records.add(record_key)
         self.runtime_state["skipped_count"] += 1
         counts = dict(self.runtime_state.get("skip_reason_counts", {}))
         counts[reason] = counts.get(reason, 0) + 1
         self.runtime_state["skip_reason_counts"] = counts
-        reason_text = self._translate_skip_reason(reason)
         record = {
             "signature": candidate_sig,
             "status": "skipped",
@@ -541,7 +700,6 @@ class BossWSBridge:
         }
         self.runtime_state["candidates"].append(record)
         self._write_event_log("candidate_skipped_recorded", record)
-        self._log("info", f"跳过: {candidate_sig} ({reason_text})")
 
     def _log(self, level: str, message: str) -> None:
         now = datetime.now()

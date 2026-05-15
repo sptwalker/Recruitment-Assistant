@@ -193,7 +193,7 @@ with st.container(border=True):
     status_cols[3].metric("Run ID", runtime.get("run_id") or "-")
     status_cols[4].metric("最近事件", runtime.get("last_event_at") or "-")
 
-    action_cols = st.columns([1.25, 1.25, 1.1, 1.1, 4.3], gap="medium")
+    action_cols = st.columns([1.25, 1.25, 1.1, 1.1, 1.25, 3.05], gap="medium")
     action_cols[0].link_button("打开 BOSS 登录页面", "https://www.zhipin.com/web/user/?ka=header-login")
     if action_cols[1].button("重新检测 BOSS 页面", disabled=not ws_connected):
         bridge.probe_page()
@@ -203,6 +203,16 @@ with st.container(border=True):
         st.rerun()
     if action_cols[3].button("生成本轮摘要"):
         st.session_state["boss_run_summary"] = bridge.get_run_summary()
+    if action_cols[4].button("清除去重数据库", disabled=runtime.get("running", False)):
+        try:
+            deleted_count = bridge.clear_boss_dedup_records()
+            st.session_state["boss_dedup_clear_message"] = f"已清除 BOSS 去重记录 {deleted_count} 条"
+        except Exception as exc:
+            st.session_state["boss_dedup_clear_message"] = f"清除 BOSS 去重记录失败：{exc}"
+        st.rerun()
+    clear_message = st.session_state.get("boss_dedup_clear_message")
+    if clear_message:
+        st.caption(clear_message)
     summary = st.session_state.get("boss_run_summary")
     if summary:
         st.code(json.dumps(summary, ensure_ascii=False, indent=2), language="json")
@@ -210,7 +220,7 @@ with st.container(border=True):
 # --- Collection & Results ---
 section_title("采集与结果")
 with st.container(border=True):
-    top_cols = st.columns([1.05, 1.05, 1.05, 1.05, 0.85, 0.85, 0.85, 0.85])
+    top_cols = st.columns([1.05, 1.05, 1.05, 1.05, 0.85, 0.85, 0.85, 0.95, 0.85])
     max_resumes = top_cols[0].number_input("最大采集数量", min_value=1, max_value=100, value=5, step=1)
     interval_ms = top_cols[1].number_input("点击间隔（毫秒）", min_value=500, max_value=30000, value=1500, step=500)
     test_mode = top_cols[2].selectbox("测试模式", ["连续采集", "单步采集1人"])
@@ -218,8 +228,10 @@ with st.container(border=True):
     top_cols[4].metric("已下载", runtime.get("downloaded_count", 0))
     top_cols[5].metric("已跳过", runtime.get("skipped_count", 0))
     top_cols[6].metric("当前索引", runtime.get("current_index", 0))
+    top_cols[7].metric("新增去重", runtime.get("dedup_record_count", 0))
     status_text = "采集中" if is_running and not is_paused else ("已暂停" if is_paused else "空闲")
-    top_cols[7].metric("状态", status_text)
+    top_cols[8].metric("状态", status_text)
+    st.caption("如果要自动保存简历，请在chorm浏览器设置中关闭“下载前询问每个文件的保存位置”")
 
     btn_cols = st.columns([1, 1, 1, 1, 5])
     if btn_cols[0].button("开始采集", disabled=is_running or not ws_connected, type="primary"):

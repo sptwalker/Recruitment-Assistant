@@ -2,6 +2,147 @@
 
 ## 2026-05-15
 
+### V1.83 BOSS 去重入库成功日志
+
+#### 已完成内容
+
+- 确认 BOSS 简历成功下载并归档后，会调用 `_upsert_boss_candidate_record()` 写入 BOSS 专用去重数据库。
+- 新增去重记录写入成功日志：`BOSS 去重记录已写入: 姓名/年龄/学历`，便于在页面实时日志中确认候选人已入库。
+- 保留重复记录日志：`BOSS 去重记录已存在，未新增: 姓名/年龄/学历`，明确区分新增写入和已存在未新增。
+- 同步事件日志新增 `resume_saved_dedup_record_created`，记录候选人签名、去重 key、归档文件、路径和内容 hash。
+
+- 同步版本：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.83`。
+
+### V1.82 BOSS 专用去重表、清库按钮与自动归档
+
+#### 已完成内容
+
+- 新增 BOSS 专用去重表 `boss_candidate_record`，结构参考智联去重记录，但不与智联共用表，避免影响智联采集模块。
+- 新增 `BossCandidateRecordService`，支持读取去重 key、写入候选人记录、自动建表和清空 BOSS 去重记录。
+- BOSS 简历下载成功后自动归档到项目根目录 `data/attachments/boss/YYYYMMDD/`，归档后删除浏览器下载目录中的源文件。
+- BOSS 采集页面新增“清除去重数据库”按钮，位于“生成本轮摘要”右侧，并在清除后输出页面提示。
+- 页面新增自动保存提示：如果要自动保存简历，请在 Chrome 浏览器设置中关闭“下载前询问每个文件的保存位置”。
+- 任务统计和摘要中保留“新增去重”数量，用于确认本轮新增入库记录。
+
+- 同步版本：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.82`。
+  - `chrome_extension/manifest.json` 与 `chrome_extension/background.js` 扩展版本更新为 `1.53.0`。
+  - `chrome_extension/content.js` 内容脚本版本更新为 `1.53.0`。
+
+### V1.79 BOSS 无附件快跳与自动下载兜底
+
+#### 已完成内容
+
+- 修正 BOSS 无附件候选人的跳过判定：附件简历按钮为置灰/暗淡/不可用状态时，直接按无可下载附件处理，不再点击按钮，也不再进入弹窗识别。
+- 当未勾选“需要时索要简历”时，置灰附件按钮直接跳过并记录 `need_request_resume`，避免无附件候选人误触发 `resume_preview_not_found`。
+- 优化自动下载流程：`boss-svg` 下载图标点击后若未捕获到 Chrome 下载完成事件，不再立即终止为跳过，继续进入已学习下载控件和通用下载按钮兜底识别，提高自动保存成功率。
+
+- 同步版本：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.79`。
+  - `chrome_extension/manifest.json` 与 `chrome_extension/background.js` 扩展版本更新为 `1.52.0`。
+  - `chrome_extension/content.js` 内容脚本版本更新为 `1.52.0`。
+
+### V1.77 BOSS 跳过日志每次输出
+
+#### 已完成内容
+
+- 调整 BOSS 跳过记录逻辑：每次收到 `candidate_skipped` 事件都会输出实时日志 `跳过: 候选人签名 (原因)`，不再因为候选人签名已记录而静默返回。
+- 重复跳过候选人时仅写入 `candidate_skipped_seen` 事件日志，标记 `duplicate_record=true`，用于追踪每一次跳过触发。
+- 候选人结果列表、`skipped_count` 和 `skip_reason_counts` 仍保持按候选人签名去重，避免重复写入结果列表和重复累计统计。
+
+- 同步版本：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.77`。
+  - `chrome_extension/manifest.json` 与 `chrome_extension/background.js` 扩展版本更新为 `1.50.0`。
+  - `chrome_extension/content.js` 内容脚本版本更新为 `1.50.0`。
+
+### V1.76 BOSS 顶部信息分字段识别与未识别熔断
+
+#### 已完成内容
+
+- 修复顶部红框区域姓名、年龄、学历分属不同 DOM 节点时无法识别的问题：改为在右侧沟通页顶部同一行内分别定位姓名节点、年龄节点和学历节点，再组合为候选人信息。
+- 点击候选人后新增最多 2.2 秒的顶部信息等待，等待右侧详情区切换完成后再读取红框信息，避免刚点击后读到旧页面或空白状态。
+- 当右侧顶部红框区域仍无法识别完整个人信息时，立即结束本轮采集，不再继续跳过大量候选人，避免在错误候选人页面继续识别弹窗。
+- 简历预览页姓名识别改为始终优先使用当前候选人顶部红框识别出的姓名，避免 DOM 弱识别时把弹窗按钮文案如“确定向牛”等当作姓名。
+
+- 同步版本：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.76`。
+  - `chrome_extension/manifest.json` 与 `chrome_extension/background.js` 扩展版本更新为 `1.49.0`。
+  - `chrome_extension/content.js` 内容脚本版本更新为 `1.49.0`。
+
+### V1.75 BOSS 个人信息唯一识别区域限定
+
+#### 已完成内容
+
+- 按截图确认的唯一位置，将 BOSS 候选人个人信息识别限定为右侧沟通页顶部基础信息栏的三个字段：姓名、年龄、学历。
+- 移除个人信息识别中的左侧候选人列表兜底和页面正文前 80 行兜底，避免聊天内容、列表摘要或页面其他文本被误识别为姓名。
+- 新增 `top_profile_red_boxes` 识别来源，日志明确标记“右侧沟通页顶部红框区域：姓名、年龄、学历”。
+- 当右侧顶部红框区域未识别到完整姓名、年龄、学历时，直接返回 `待识别/待识别/待识别`，不再从其他区域猜测。
+
+- 同步版本：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.75`。
+  - `chrome_extension/manifest.json` 与 `chrome_extension/background.js` 扩展版本更新为 `1.48.0`。
+  - `chrome_extension/content.js` 内容脚本版本更新为 `1.48.0`。
+
+### V1.74 BOSS 弹窗等待 3 秒与姓名识别位置日志
+
+#### 已完成内容
+
+- 将 BOSS 附件简历弹窗识别默认等待周期从 12 秒缩短为 3 秒，同步修正附件调试日志中的等待超时值，避免页面显示仍为 12000ms。
+- 候选人姓名/年龄/学历识别结果新增来源位置字段：识别来源、说明、元素矩形坐标、DOM 路径、class 和文本样本。
+- BOSS 实时日志中的“点击候选人”现在会输出姓名识别的具体页面位置，便于确认当前姓名来自右侧详情区、左侧候选人列表，还是正文兜底文本。
+- 当前识别优先级为：右侧详情/聊天区域上半部分候选人信息 > 左侧候选人列表当前点击项 > 页面正文前 80 行兜底文本。
+
+- 同步版本：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.74`。
+  - `chrome_extension/manifest.json` 与 `chrome_extension/background.js` 扩展版本更新为 `1.47.0`。
+  - `chrome_extension/content.js` 内容脚本版本更新为 `1.47.0`。
+
+### V1.73 BOSS 弹窗弱识别与候选人信息修正
+
+#### 已完成内容
+
+- 修复 BOSS 附件简历点击后只有普通 DOM 弹窗、没有 PDF iframe 时被判定为 `resume_preview_not_found` 的问题：未命中 PDF iframe 时改用最大疑似弹窗继续后续下载按钮识别。
+- 候选人姓名识别不再从“无年龄信息的文本块”里硬猜姓名，避免把聊天内容如“可以看一”“有过相近”“学院的计”“数据”等误当作姓名。
+- PDF iframe 扫描日志由等待循环每轮输出改为每个候选人只记录首次扫描，减少重复日志噪音。
+- 说明：重复扫描原因为系统在 12 秒等待窗口内轮询弹窗是否加载完成，此机制保留，但日志不再重复刷屏。
+
+- 同步版本：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.73`。
+  - `chrome_extension/manifest.json` 与 `chrome_extension/background.js` 扩展版本更新为 `1.46.0`。
+  - `chrome_extension/content.js` 内容脚本版本更新为 `1.46.0`。
+
+### V1.72 BOSS 归档目录固定到项目根目录
+
+#### 已完成内容
+
+- 按要求将 BOSS 简历归档目录固定为项目根目录下 `data/attachments/boss/YYYYMMDD/`，路径格式对齐智联采集模块的日期子目录结构。
+- 归档路径不再依赖运行进程当前工作目录或外部配置覆盖，避免保存到非项目根目录下的 `data/attachments`。
+- 保持文件命名格式为 `姓名-年龄-学历-BOSS直聘-YYYYMMDD-HHMMSS-序号.pdf`，同名时追加 `-1`、`-2`。
+
+- 同步版本：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.72`。
+
+### V1.71 BOSS 下载文件强制落盘与本地归档
+
+#### 已完成内容
+
+- 修复 BOSS 附件下载窗口已打开、但 Chrome 下载被取消或未稳定进入本地归档的问题。
+- Chrome 后台直接下载时显式指定下载文件名到 `Boss直聘/姓名-年龄-学历-BOSS直聘-时间.pdf`，避免浏览器因 URL 无文件名、非法候选人签名或路径分隔符触发保存异常。
+- Python 侧收到 `resume_downloaded` 后改为从 Chrome 下载目录复制文件到 `data/attachments/boss/YYYYMMDD/`，不再移动浏览器下载原文件，降低跨盘符/文件占用导致归档失败的概率。
+- 保留原有 `resume_downloaded` 成功事件驱动，只有 Chrome 真实下载完成后才计入已保存。
+
+- 同步版本：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.71`。
+  - `chrome_extension/manifest.json` 与 `chrome_extension/background.js` 扩展版本更新为 `1.45.0`。
+  - `chrome_extension/content.js` 内容脚本版本更新为 `1.45.0`。
+
+#### 测试提示
+
+- 需要在 `chrome://extensions/` 重新加载本地扩展，并刷新 BOSS 沟通页，确认页面版本为 `V1.71`、扩展版本为 `1.45.0` 后再测试。
+- 本版下载成功后，Chrome 默认下载目录应出现 `Boss直聘/...pdf`，同时系统归档目录应出现 `data/attachments/boss/YYYYMMDD/...pdf`。
+- 如果仍出现 `download_error:USER_CANCELED`，优先检查 Chrome 是否开启了“每次下载前询问保存位置”或下载权限弹窗。
+
 ### V1.70 BOSS PDF iframe 下载链路日志增强
 
 #### 已完成内容

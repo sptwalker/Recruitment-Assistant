@@ -1,9 +1,10 @@
 from datetime import datetime
 
-from sqlalchemy import BigInteger, Column, DateTime, Integer, MetaData, String, Table, Text, func, select
+from sqlalchemy import BigInteger, Column, DateTime, Integer, MetaData, String, Table, Text, delete, func, select
 from sqlalchemy.orm import Session
 
-from recruitment_assistant.storage.models import CrawlTask
+from recruitment_assistant.storage.db import engine
+from recruitment_assistant.storage.models import BossCandidateRecord, CrawlTask
 
 metadata = MetaData()
 platform_candidate_record = Table(
@@ -101,4 +102,83 @@ class PlatformCandidateRecordService:
             platform_candidate_record.c.platform_code == platform_code
         )
         return {str(key) for key in self.session.execute(stmt).scalars() if key}
+
+
+class BossCandidateRecordService:
+    def __init__(self, session: Session):
+        self.session = session
+
+    def ensure_table(self) -> None:
+        BossCandidateRecord.__table__.create(bind=engine, checkfirst=True)
+
+    def list_candidate_keys(self, platform_code: str = "boss") -> set[str]:
+        self.ensure_table()
+        stmt = select(BossCandidateRecord.candidate_key).where(BossCandidateRecord.platform_code == platform_code)
+        return {str(key) for key in self.session.execute(stmt).scalars() if key}
+
+    def clear_records(self, platform_code: str = "boss") -> int:
+        self.ensure_table()
+        result = self.session.execute(delete(BossCandidateRecord).where(BossCandidateRecord.platform_code == platform_code))
+        self.session.commit()
+        return int(result.rowcount or 0)
+
+    def upsert_candidate_record(
+        self,
+        *,
+        platform_code: str,
+        target_site: str,
+        candidate_key: str,
+        candidate_signature: str | None = None,
+        name: str | None = None,
+        gender: str | None = None,
+        job_title: str | None = None,
+        phone: str | None = None,
+        resume_file_name: str | None = None,
+        source_url: str | None = None,
+        content_hash: str | None = None,
+        raw_resume_id: int | None = None,
+        task_id: int | None = None,
+    ) -> bool:
+        self.ensure_table()
+        existing = self.session.execute(
+            select(BossCandidateRecord).where(
+                BossCandidateRecord.platform_code == platform_code,
+                BossCandidateRecord.candidate_key == candidate_key,
+            )
+        ).scalar_one_or_none()
+        if existing:
+            existing.hit_count = int(existing.hit_count or 0) + 1
+            existing.candidate_signature = existing.candidate_signature or candidate_signature
+            existing.name = existing.name or name
+            existing.gender = existing.gender or gender
+            existing.job_title = existing.job_title or job_title
+            existing.phone = existing.phone or phone
+            existing.resume_file_name = existing.resume_file_name or resume_file_name
+            existing.source_url = existing.source_url or source_url
+            existing.content_hash = existing.content_hash or content_hash
+            existing.raw_resume_id = existing.raw_resume_id or raw_resume_id
+            existing.task_id = existing.task_id or task_id
+            self.session.add(existing)
+            self.session.commit()
+            return False
+
+        self.session.add(
+            BossCandidateRecord(
+                platform_code=platform_code,
+                target_site=target_site,
+                candidate_key=candidate_key,
+                candidate_signature=candidate_signature,
+                name=name,
+                gender=gender,
+                job_title=job_title,
+                phone=phone,
+                resume_file_name=resume_file_name,
+                source_url=source_url,
+                content_hash=content_hash,
+                raw_resume_id=raw_resume_id,
+                task_id=task_id,
+            )
+        )
+        self.session.commit()
+        return True
 

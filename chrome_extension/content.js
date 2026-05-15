@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  const CONTENT_SCRIPT_VERSION = "1.44.0";
+  const CONTENT_SCRIPT_VERSION = "1.53.0";
   if (window.__bossResumeCollectorVersion === CONTENT_SCRIPT_VERSION) {
     return;
   }
@@ -129,12 +129,46 @@
 
   function isDisabled(el) {
     const style = getComputedStyle(el);
+    const text = textOf(el);
     return Boolean(
       el.disabled ||
       el.getAttribute("aria-disabled") === "true" ||
+      el.getAttribute("disabled") != null ||
       (el.className || "").toString().includes("disabled") ||
+      /禁用|不可用|置灰|disabled/i.test(`${el.getAttribute?.("class") || ""} ${el.getAttribute?.("aria-label") || ""} ${el.getAttribute?.("title") || ""}`) ||
+      /暂无附件|无附件|未上传|没有附件|不可查看|无法查看/.test(text) ||
       style.pointerEvents === "none" ||
       parseFloat(style.opacity || "1") < 0.55
+    );
+  }
+
+  function getOpacityChain(el) {
+    const values = [];
+    let node = el;
+    while (node && node !== document.body && values.length < 6) {
+      try {
+        const opacity = parseFloat(getComputedStyle(node).opacity || "1");
+        if (!Number.isNaN(opacity)) values.push(opacity);
+      } catch {}
+      node = node.parentElement;
+    }
+    return values;
+  }
+
+  function isVisuallyDimmed(el) {
+    return getOpacityChain(el).some((opacity) => opacity < 0.72);
+  }
+
+  function isResumeButtonUnavailable(btn) {
+    if (!btn) return false;
+    const text = btn.text || textOf(btn.el);
+    const descriptor = `${text} ${getElementDescriptor(btn.el)} ${getElementDescriptor(btn.el?.parentElement)}`;
+    return Boolean(
+      btn.state === "disabled" ||
+      btn.enabled === false ||
+      isDisabled(btn.el) ||
+      isVisuallyDimmed(btn.el) ||
+      /暂无附件|无附件|未上传|没有附件|不可查看|无法查看|disabled|disable|置灰|禁用|不可用/i.test(descriptor)
     );
   }
 
@@ -262,13 +296,15 @@
     if (!ageMatch && !eduMatch) return null;
 
     let name = "待识别";
-    const beforeAge = ageMatch ? clean.slice(0, ageMatch.index).trim() : clean.slice(0, 40).trim();
-    const nameMatches = Array.from(beforeAge.matchAll(/[\u4e00-\u9fa5]{2,4}(?:先生|女士)?/g)).map((m) => m[0]);
-    for (let i = nameMatches.length - 1; i >= 0; i--) {
-      const value = nameMatches[i];
-      if (!isInvalidCandidateNameToken(value)) {
-        name = value;
-        break;
+    if (ageMatch) {
+      const beforeAge = clean.slice(0, ageMatch.index).trim();
+      const nameMatches = Array.from(beforeAge.matchAll(/[\u4e00-\u9fa5]{2,4}(?:先生|女士)?/g)).map((m) => m[0]);
+      for (let i = nameMatches.length - 1; i >= 0; i--) {
+        const value = nameMatches[i];
+        if (!isInvalidCandidateNameToken(value)) {
+          name = value;
+          break;
+        }
       }
     }
 
@@ -279,37 +315,147 @@
     return { name, age: ageMatch ? `${ageMatch[1]}岁` : "待识别", education, raw_text: clean.slice(0, 160) };
   }
 
+  function normalizeEducation(value = "") {
+    if (value === "研究生") return "硕士";
+    if (value === "专科") return "大专";
+    return value;
+  }
+
+  function parseTopProfileName(text = "") {
+    const clean = stripActivityText(text).replace(/刚刚活跃|今日活跃|昨日活跃|活跃|在线/g, " ").trim();
+    const titledName = clean.match(/([\u4e00-\u9fa5]{1,3}(?:先生|女士))/);
+    if (titledName && !isInvalidCandidateNameToken(titledName[1])) return titledName[1];
+    const beforeLocation = clean.split(/在|现居|居住|位于|来自/)[0].trim();
+    const source = beforeLocation || clean;
+    const names = Array.from(source.matchAll(/[\u4e00-\u9fa5]{2,4}/g)).map((m) => m[0]);
+    for (const value of names) {
+      if (!isInvalidCandidateNameToken(value)) return value;
+    }
+    return "";
+  }
+
+  function parseTopProfileText(text) {
+    const clean = stripActivityText(text);
+    if (!clean || /职位管理|推荐牛人|牛人管理|工具箱|招聘规范|我的客服|在线简历|附件简历|沟通职位|期望|工作经历/.test(clean)) return null;
+    const ageMatch = clean.match(/(\d{2})\s*岁/);
+    const eduMatch = clean.match(/博士|硕士|研究生|本科|大专|专科|高中|中专/);
+    if (!ageMatch || !eduMatch) return null;
+    const name = parseTopProfileName(clean.slice(0, ageMatch.index));
+    if (!name) return null;
+    const education = normalizeEducation(eduMatch[0]);
+    return { name, age: `${ageMatch[1]}岁`, education, raw_text: clean.slice(0, 160) };
+  }
+
+  function isTopProfileBandRect(rect) {
+    const pageWidth = window.innerWidth || document.documentElement.clientWidth || 0;
+    return rect.left >= pageWidth * 0.28 && rect.left <= pageWidth * 0.78 && rect.top >= 80 && rect.top <= 170;
+  }
+
+  function isTopProfileNameBandRect(rect) {
+    const pageWidth = window.innerWidth || document.documentElement.clientWidth || 0;
+    return rect.left >= pageWidth * 0.28 && rect.left <= pageWidth * 0.62 && rect.top >= 80 && rect.top <= 170;
+  }
+
+  function isTopProfileAgeEducationBandRect(rect) {
+    const pageWidth = window.innerWidth || document.documentElement.clientWidth || 0;
+    return rect.left >= pageWidth * 0.42 && rect.left <= pageWidth * 0.78 && rect.top >= 80 && rect.top <= 170;
+  }
+
+  function getTopProfileTokens() {
+    return Array.from(document.querySelectorAll("body *"))
+      .filter((el) => {
+        if (!isVisible(el)) return false;
+        const rect = el.getBoundingClientRect();
+        if (!isTopProfileBandRect(rect)) return false;
+        if (rect.width < 8 || rect.width > 520 || rect.height < 10 || rect.height > 90) return false;
+        const text = textOf(el);
+        if (!text || text.length > 180) return false;
+        if (/职位管理|推荐牛人|牛人管理|工具箱|招聘规范|我的客服|在线简历|附件简历|沟通职位|期望|工作经历|职位:|沟通职位/.test(text)) return false;
+        return /\d{2}\s*岁|博士|硕士|研究生|本科|大专|专科|高中|中专|[\u4e00-\u9fa5]{2,4}/.test(text);
+      })
+      .map((el) => ({ el, rect: el.getBoundingClientRect(), text: textOf(el) }))
+      .sort((a, b) => a.rect.left - b.rect.left || a.rect.top - b.rect.top);
+  }
+
+  function findTopProfileInfoRoot() {
+    const tokens = getTopProfileTokens();
+    const nameTokens = tokens
+      .filter((x) => isTopProfileNameBandRect(x.rect))
+      .map((x) => ({ ...x, name: parseTopProfileName(x.text) }))
+      .filter((x) => x.name);
+    const ageTokens = tokens
+      .filter((x) => isTopProfileAgeEducationBandRect(x.rect) && /\d{2}\s*岁/.test(x.text));
+    const eduTokens = tokens
+      .filter((x) => isTopProfileAgeEducationBandRect(x.rect))
+      .map((x) => ({ ...x, education: normalizeEducation((x.text.match(/博士|硕士|研究生|本科|大专|专科|高中|中专/) || [""])[0]) }))
+      .filter((x) => x.education);
+
+    for (const ageToken of ageTokens) {
+      const ageMatch = ageToken.text.match(/(\d{2})\s*岁/);
+      const ageCenterY = ageToken.rect.top + ageToken.rect.height / 2;
+      const rowNameTokens = nameTokens
+        .filter((x) => Math.abs((x.rect.top + x.rect.height / 2) - ageCenterY) <= 34 && x.rect.right <= ageToken.rect.left + 48)
+        .map((x) => ({ ...x, distance: Math.abs(ageToken.rect.left - x.rect.right) + Math.abs((x.rect.top + x.rect.height / 2) - ageCenterY) * 2 }))
+        .sort((a, b) => a.distance - b.distance);
+      const rowEduTokens = eduTokens
+        .filter((x) => Math.abs((x.rect.top + x.rect.height / 2) - ageCenterY) <= 34 && x.rect.left >= ageToken.rect.left - 24)
+        .map((x) => ({ ...x, distance: Math.abs(x.rect.left - ageToken.rect.right) + Math.abs((x.rect.top + x.rect.height / 2) - ageCenterY) * 2 }))
+        .sort((a, b) => a.distance - b.distance);
+      const nameToken = rowNameTokens[0];
+      const eduToken = rowEduTokens[0];
+      if (nameToken && eduToken && ageMatch) {
+        const rawText = `${nameToken.text} ${ageToken.text} ${eduToken.text}`.replace(/\s+/g, " ").trim();
+        return {
+          el: ageToken.el,
+          info: { name: nameToken.name, age: `${ageMatch[1]}岁`, education: eduToken.education, raw_text: rawText.slice(0, 160) },
+          score: 100,
+          top: ageToken.rect.top,
+          area: ageToken.rect.width * ageToken.rect.height,
+          len: rawText.length,
+        };
+      }
+    }
+
+    const combined = tokens
+      .filter((x) => x.rect.width >= 80 && x.rect.width <= 520 && x.rect.height >= 18 && x.rect.height <= 90)
+      .map((x) => ({ ...x, info: parseTopProfileText(x.text) }))
+      .filter((x) => x.info)
+      .sort((a, b) => a.rect.top - b.rect.top || a.rect.left - b.rect.left)[0];
+    return combined ? { el: combined.el, info: combined.info, score: 80, top: combined.rect.top, area: combined.rect.width * combined.rect.height, len: combined.text.length } : null;
+  }
+
+  function buildContactSourceInfo(el, sourceType = "unknown", sourceNote = "") {
+    if (!el) return { contact_source: sourceType, contact_source_note: sourceNote };
+    return {
+      contact_source: sourceType,
+      contact_source_note: sourceNote,
+      contact_source_rect: getRectSnapshot(el),
+      contact_source_path: getElementDomPath(el),
+      contact_source_class: getElementClassName(el),
+      contact_source_text_sample: textOf(el).slice(0, 160),
+    };
+  }
+
   function extractContactInfo(clickedItem = null) {
-    const detailNodes = DETAIL_SELECTORS.flatMap((selector) => Array.from(document.querySelectorAll(selector)));
-    const scored = [];
-    for (const el of detailNodes) {
-      if (!isVisible(el)) continue;
-      const rect = el.getBoundingClientRect();
-      if (rect.left < window.innerWidth * 0.25 || rect.top < 55 || rect.top > window.innerHeight * 0.55) continue;
-      const info = parseContactText(textOf(el));
-      if (!info) continue;
-      let score = 0;
-      if (info.name !== "待识别") score += 3;
-      if (info.age !== "待识别") score += 3;
-      if (info.education !== "待识别") score += 3;
-      scored.push({ info, score, top: rect.top, len: textOf(el).length });
+    void clickedItem;
+    const match = findTopProfileInfoRoot();
+    if (match) {
+      return {
+        ...match.info,
+        ...buildContactSourceInfo(match.el, "top_profile_red_boxes", "右侧沟通页顶部红框区域：姓名、年龄、学历")
+      };
     }
+    return { name: "待识别", age: "待识别", education: "待识别", raw_text: "", contact_source: "top_profile_red_boxes_not_found", contact_source_note: "未在右侧沟通页顶部红框区域识别到姓名、年龄、学历" };
+  }
 
-    scored.sort((a, b) => b.score - a.score || a.top - b.top || a.len - b.len);
-    if (scored[0] && scored[0].info.name !== "待识别") return scored[0].info;
-
-    if (clickedItem) {
-      const itemInfo = parseContactText(textOf(clickedItem));
-      if (itemInfo && itemInfo.name !== "待识别") return itemInfo;
+  async function waitForContactInfo(clickedItem = null, timeoutMs = 2200) {
+    const deadline = Date.now() + timeoutMs;
+    let info = extractContactInfo(clickedItem);
+    while (`${info.name}/${info.age}/${info.education}` === "待识别/待识别/待识别" && Date.now() < deadline) {
+      await sleep(120);
+      info = extractContactInfo(clickedItem);
     }
-
-    const bodyLines = (document.body?.innerText || "").split("\n").map((x) => x.trim()).filter(Boolean);
-    for (const line of bodyLines.slice(0, 80)) {
-      const info = parseContactText(line);
-      if (info && (info.name !== "待识别" || info.age !== "待识别" || info.education !== "待识别")) return info;
-    }
-
-    return { name: "待识别", age: "待识别", education: "待识别", raw_text: "" };
+    return info;
   }
 
   function hasResumeRequestSent(scope = document) {
@@ -367,9 +513,10 @@
       if (stateName === "requested" && text === "简历请求已发送") continue;
       const clickable = getClickableResumeElement(el);
       if (!isVisible(clickable)) continue;
-      matches.push({ el: clickable, text, state: stateName, enabled: stateName === "unknown_resume" || (!isDisabled(clickable) && !isDisabled(el)), left: rect.left, top: rect.top });
+      const disabled = isDisabled(clickable) || isDisabled(el);
+      matches.push({ el: clickable, text, state: disabled && stateName !== "request" ? "disabled" : stateName, enabled: stateName === "unknown_resume" ? !disabled : !disabled, left: rect.left, top: rect.top });
     }
-    const priority = { view: 1, request: 2, unknown_resume: 3, requested: 4 };
+    const priority = { view: 1, request: 2, unknown_resume: 3, disabled: 4, requested: 5 };
     matches.sort((a, b) => priority[a.state] - priority[b.state] || b.left - a.left || a.top - b.top);
     return matches[0] || null;
   }
@@ -608,7 +755,7 @@
     const candidateNames = Array.from(text.slice(0, 320).matchAll(/[\u4e00-\u9fa5]{2,4}(?:先生|女士)?/g)).map((m) => m[0]);
     const fallbackName = fallbackInfo.name && fallbackInfo.name !== "待识别" ? fallbackInfo.name : "";
     const extractedName = candidateNames.find((x) => !toolbarNameBlacklist.has(x) && !toolbarNameBlacklist.has(x.replace(/先生|女士/g, "")));
-    const name = isPdfPreviewRoot(root) ? (fallbackName || extractedName || "未识别") : (extractedName || fallbackName || "未识别");
+    const name = fallbackName || extractedName || "未识别";
     return {
       name,
       gender: genderMatch ? genderMatch[1] : "未识别",
@@ -797,14 +944,16 @@
     return matches[0] || null;
   }
 
-  async function waitForResumePreview(candidateId = "", signature = "", info = {}, timeoutMs = 12000) {
+  async function waitForResumePreview(candidateId = "", signature = "", info = {}, timeoutMs = 3000) {
     const deadline = Date.now() + timeoutMs;
     let lastSample = "";
+    let scanLogged = false;
     while (Date.now() < deadline) {
       if (shouldAbortAsyncStep()) {
         return null;
       }
-      const preview = findResumePreview(info, { candidateId, signature });
+      const preview = findResumePreview(info, scanLogged ? null : { candidateId, signature });
+      scanLogged = true;
       if (preview) {
         emit({ type: "resume_preview_wait_result", data: { candidate_id: candidateId, candidate_signature: signature, found: true, stage: "wait_found", elapsed_ms: timeoutMs - Math.max(0, deadline - Date.now()) } });
         return preview;
@@ -814,8 +963,8 @@
     }
     const weakPreview = makeResumePreviewFromLargestRoot(info);
     if (weakPreview) {
-      emit({ type: "resume_preview_not_found", data: { candidate_id: candidateId, candidate_signature: signature, sample: lastSample, weak_candidate: true } });
-      return null;
+      emit({ type: "resume_preview_weak_candidate_used", data: { candidate_id: candidateId, candidate_signature: signature, ...describePreviewComponent(weakPreview.root), ...(weakPreview.info || {}) } });
+      return weakPreview;
     }
     emit({ type: "resume_preview_not_found", data: { candidate_id: candidateId, candidate_signature: signature, sample: lastSample } });
     return null;
@@ -1233,8 +1382,7 @@
       return true;
     }
     emit({ type: "boss_svg_download_link_capture_failed", data: { candidate_id: candidateId, candidate_signature: signature, reason: downloadResult.reason || "download_failed", ...(downloadResult.data || {}) } });
-    await skipCandidate(candidateId, signature, downloadResult.reason || "download_failed", downloadResult.data || {});
-    return true;
+    return false;
   }
 
   function findLearnedDownloadElement(learned) {
@@ -1348,7 +1496,7 @@
       emitAttachmentDebug("02_abort_before_preview_wait", candidateId, signature, { state });
       return null;
     }
-    emitAttachmentDebug("02_call_wait_for_resume_preview", candidateId, signature, { timeout_ms: 12000 });
+    emitAttachmentDebug("02_call_wait_for_resume_preview", candidateId, signature, { timeout_ms: 3000 });
     const preview = await waitForResumePreview(candidateId, signature, info);
     emitAttachmentDebug(preview ? "03_wait_for_resume_preview_return_found" : "03_wait_for_resume_preview_return_null", candidateId, signature, {
       found: Boolean(preview),
@@ -1454,14 +1602,9 @@
         continue;
       }
 
-      const info = extractContactInfo(item);
+      const info = await waitForContactInfo(item, 2200);
       const signature = `${info.name}/${info.age}/${info.education}`;
       const candidateId = `${activeRunId || "run"}_${i}_${signature}`;
-
-      if (seenSignatures.has(signature)) {
-        continue;
-      }
-      seenSignatures.add(signature);
 
       emit({ type: "candidate_clicked", data: { ...info, candidate_id: candidateId, candidate_signature: signature, index: i } });
 
@@ -1469,9 +1612,14 @@
         emit({ type: "candidate_skipped", data: { candidate_id: candidateId, candidate_signature: signature, reason: "candidate_info_unrecognized", raw_text: info.raw_text || "" } });
         results.skipped++;
         emitProgress();
-        await sleep(20);
+        state = "idle";
+        break;
+      }
+
+      if (seenSignatures.has(signature)) {
         continue;
       }
+      seenSignatures.add(signature);
 
       const btn = findResumeButton();
       if (!btn) {
@@ -1483,6 +1631,16 @@
 
       if (btn.state === "requested") {
         await skipCandidate(candidateId, signature, "resume_request_already_sent", { fast_skip: true });
+        continue;
+      }
+
+      if (isResumeButtonUnavailable(btn)) {
+        await skipCandidate(candidateId, signature, config.request_resume_if_missing ? "no_resume_button" : "need_request_resume", {
+          fast_skip: true,
+          button_state: btn.state,
+          button_text: btn.text,
+          unavailable: true,
+        });
         continue;
       }
 

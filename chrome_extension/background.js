@@ -1,5 +1,5 @@
 const WS_URL = "ws://127.0.0.1:8765";
-const EXTENSION_VERSION = "1.44.0";
+const EXTENSION_VERSION = "1.53.0";
 const HEARTBEAT_INTERVAL_MS = 15000;
 let ws = null;
 let heartbeatTimer = null;
@@ -157,6 +157,24 @@ function rememberDownloadIntent(data) {
   sendToServer({ type: "download_intent_registered", data: lastDownloadIntent });
 }
 
+function makeSafeDownloadFilename(data = {}, fallbackExt = ".pdf") {
+  const candidateInfo = data.candidate_info || {};
+  const clean = (value, fallback) => {
+    const text = String(value || fallback || "")
+      .replace(/[\\/:*?"<>|\r\n\t]+/g, "")
+      .replace(/\s+/g, "")
+      .replace(/[，,。.;；()（）\[\]【】]+/g, "")
+      .slice(0, 24);
+    return text || fallback;
+  };
+  const name = clean(candidateInfo.name, "未知姓名");
+  const age = clean(candidateInfo.age, "未知年龄");
+  const education = clean(candidateInfo.education, "未知学历");
+  const stamp = new Date().toISOString().replace(/[-:T.Z]/g, "").slice(0, 14);
+  const ext = /^\.[a-z0-9]{1,8}$/i.test(fallbackExt) ? fallbackExt : ".pdf";
+  return `Boss直聘/${name}-${age}-${education}-BOSS直聘-${stamp}${ext}`;
+}
+
 function getFreshDownloadIntent() {
   if (!lastDownloadIntent) return null;
   if (Date.now() - lastDownloadIntent.at > 120000) return null;
@@ -212,7 +230,7 @@ function downloadDirectUrl(data = {}, sendResponse = () => {}) {
   lastDownloadIntent = intent;
   sendToServer({ type: "direct_download_starting", data: intent });
   try {
-    chrome.downloads.download({ url, saveAs: false }, (downloadId) => {
+    chrome.downloads.download({ url, filename: makeSafeDownloadFilename(intent), conflictAction: "uniquify", saveAs: false }, (downloadId) => {
       if (chrome.runtime.lastError || !downloadId) {
         const reason = chrome.runtime.lastError?.message || "download_start_failed";
         sendToServer({ type: "direct_download_failed", data: { ...intent, reason } });

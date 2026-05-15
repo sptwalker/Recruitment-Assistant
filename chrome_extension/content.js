@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  const CONTENT_SCRIPT_VERSION = "1.36.0";
+  const CONTENT_SCRIPT_VERSION = "1.44.0";
   if (window.__bossResumeCollectorVersion === CONTENT_SCRIPT_VERSION) {
     return;
   }
@@ -230,11 +230,27 @@
     return items.sort((a, b) => a.top - b.top || b.score - a.score).map((x) => x.el);
   }
 
-  function stripActivityText(text) {
+  function stripCandidateUiText(text = "") {
     return (text || "")
+      .replace(/查看附件简历|查看简历附件|下载附件简历|下载简历附件|查看简历|下载简历|下简历|附件简历|简历附件/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function stripActivityText(text) {
+    return stripCandidateUiText(text)
       .replace(/刚刚活跃|今日活跃|昨日活跃|活跃|在线|分钟前活跃|\d+分钟前活跃/g, " ")
       .replace(/\s+/g, " ")
       .trim();
+  }
+
+  function isInvalidCandidateNameToken(value = "") {
+    const baseValue = value.replace(/先生|女士/g, "");
+    const blacklist = new Set([
+      "沟通", "在线", "附件", "附件简历", "简历附件", "交换微信", "常用语", "招聘者", "职位管理", "推荐牛人", "搜索",
+      "刚刚", "刚刚活跃", "今日", "今日活跃", "昨日", "昨日活跃", "活跃", "下载", "查看", "简历", "下载简历", "查看简历", "下简历",
+    ]);
+    return !baseValue || blacklist.has(value) || blacklist.has(baseValue) || /简历|下载|附件|查看|沟通|职位|推荐|搜索|客服|工具/.test(baseValue);
   }
 
   function parseContactText(text) {
@@ -248,11 +264,9 @@
     let name = "待识别";
     const beforeAge = ageMatch ? clean.slice(0, ageMatch.index).trim() : clean.slice(0, 40).trim();
     const nameMatches = Array.from(beforeAge.matchAll(/[\u4e00-\u9fa5]{2,4}(?:先生|女士)?/g)).map((m) => m[0]);
-    const blacklist = new Set(["沟通", "在线", "附件简历", "交换微信", "常用语", "招聘者", "职位管理", "推荐牛人", "搜索", "刚刚", "刚刚活跃", "今日", "今日活跃", "昨日", "昨日活跃", "活跃"]);
     for (let i = nameMatches.length - 1; i >= 0; i--) {
       const value = nameMatches[i];
-      const baseValue = value.replace(/先生|女士/g, "");
-      if (!blacklist.has(value) && !blacklist.has(baseValue)) {
+      if (!isInvalidCandidateNameToken(value)) {
         name = value;
         break;
       }
@@ -495,6 +509,36 @@
     return /pdf-viewer-b|bzl-office\/pdf-viewer|preview4boss|wflow\/zpgeek\/download\/preview4boss|\.pdf(?:$|[?#])/i.test(src);
   }
 
+  function normalizeBossUrl(url = "", base = location.origin) {
+    const raw = `${url || ""}`.trim();
+    if (!raw) return "";
+    try {
+      return new URL(raw, base || location.origin).href;
+    } catch {
+      return "";
+    }
+  }
+
+  function parseBossPdfViewerUrl(src = "") {
+    const viewer_url = normalizeBossUrl(src);
+    if (!viewer_url) return { viewer_url: "", extracted_url: "", direct_url: "", direct_source: "" };
+    let extracted_url = "";
+    try {
+      const parsed = new URL(viewer_url);
+      const inner = parsed.searchParams.get("url") || parsed.searchParams.get("file") || parsed.searchParams.get("src") || "";
+      extracted_url = inner ? normalizeBossUrl(inner, parsed.origin) : "";
+    } catch {
+      extracted_url = "";
+    }
+    const direct_url = extracted_url && isStrongBossPdfPreviewUrl(extracted_url) ? extracted_url : viewer_url;
+    return {
+      viewer_url,
+      extracted_url,
+      direct_url,
+      direct_source: extracted_url ? "viewer_inner_url" : "viewer_url",
+    };
+  }
+
   function isPdfPreviewRoot(root) {
     const tag = root?.tagName || "";
     const src = root?.getAttribute?.("src") || root?.getAttribute?.("data") || "";
@@ -503,11 +547,26 @@
     return (isFrame && isStrongBossPdfPreviewUrl(src)) || /pdf-viewer|preview4boss|\.pdf|pdf/i.test(descriptor);
   }
 
-  function findPdfIframePreview(fallbackInfo = {}) {
-    const frames = Array.from(document.querySelectorAll("iframe, object, embed"))
+  function findPdfIframePreview(fallbackInfo = {}, debugContext = null) {
+    const visibleFrames = Array.from(document.querySelectorAll("iframe, object, embed"))
+      .filter((el) => {
+        try { return isVisible(el); } catch { return false; }
+      });
+    if (debugContext) {
+      emit({
+        type: "pdf_iframe_preview_scan_started",
+        data: {
+          candidate_id: debugContext.candidateId || "",
+          candidate_signature: debugContext.signature || "",
+          total_frames: visibleFrames.length,
+          strong_candidates: visibleFrames.filter((el) => isStrongBossPdfPreviewUrl(el.getAttribute?.("src") || el.getAttribute?.("data") || "")).length,
+          frame_samples: visibleFrames.map((el) => ({ tag: el.tagName || "", rect: getRectSnapshot(el), src: el.getAttribute?.("src") || el.getAttribute?.("data") || "" })).slice(0, 5),
+        },
+      });
+    }
+    const frames = visibleFrames
       .filter((el) => {
         try {
-          if (!isVisible(el)) return false;
           const rect = el.getBoundingClientRect();
           const src = el.getAttribute?.("src") || el.getAttribute?.("data") || "";
           return rect.width >= 300 && rect.height >= 180 && rect.left > window.innerWidth * 0.08 && isStrongBossPdfPreviewUrl(src);
@@ -523,7 +582,19 @@
     const root = frames[0];
     if (!root) return null;
     const rect = root.getBoundingClientRect();
-    return { root, rect, score: 99, info: extractResumePreviewInfo(root, fallbackInfo), pdf_iframe: true };
+    const preview = { root, rect, score: 99, info: extractResumePreviewInfo(root, fallbackInfo), pdf_iframe: true };
+    if (debugContext) {
+      emit({
+        type: "pdf_iframe_preview_detected",
+        data: {
+          candidate_id: debugContext.candidateId || "",
+          candidate_signature: debugContext.signature || "",
+          ...describePreviewComponent(root),
+          ...(preview.info || {}),
+        },
+      });
+    }
+    return preview;
   }
 
   function extractResumePreviewInfo(root, fallbackInfo = {}) {
@@ -699,8 +770,8 @@
     void reason;
   }
 
-  function findResumePreview(fallbackInfo = {}) {
-    const pdfFramePreview = findPdfIframePreview(fallbackInfo);
+  function findResumePreview(fallbackInfo = {}, debugContext = null) {
+    const pdfFramePreview = findPdfIframePreview(fallbackInfo, debugContext);
     if (pdfFramePreview) return pdfFramePreview;
 
     const roots = getPreviewRoots();
@@ -733,7 +804,7 @@
       if (shouldAbortAsyncStep()) {
         return null;
       }
-      const preview = findResumePreview(info);
+      const preview = findResumePreview(info, { candidateId, signature });
       if (preview) {
         emit({ type: "resume_preview_wait_result", data: { candidate_id: candidateId, candidate_signature: signature, found: true, stage: "wait_found", elapsed_ms: timeoutMs - Math.max(0, deadline - Date.now()) } });
         return preview;
@@ -815,6 +886,7 @@
 
   function isLikelyDownloadIcon(el, descriptor) {
     const combined = `${descriptor} ${getElementDescriptor(el.parentElement)} ${getElementDescriptor(el.closest?.("button, a, [role='button'], [class*='btn'], [class*='icon'], [class*='download']"))}`;
+    if (isBossSvgDownloadDescriptor(combined)) return true;
     if (/下载附件|下载简历|下载|download|down-load|icon[-_]?download|download[-_]?icon|resume[-_]?download|file[-_]?download|attachment[-_]?download/i.test(combined)) return true;
     const href = el.getAttribute?.("href") || el.getAttribute?.("xlink:href") || "";
     if (/download|xiazai|down/i.test(href)) return true;
@@ -822,6 +894,57 @@
     if (/download|down|xiazai/i.test(cls)) return true;
     return false;
   }
+
+  function isBossSvgDownloadDescriptor(descriptor = "") {
+    return /boss-svg/i.test(descriptor) && /svg-icon/i.test(descriptor) && /SVGAnimatedString/i.test(descriptor);
+  }
+
+  function getBossSvgDownloadSnapshot(el) {
+    const node = el?.closest?.("button, a, [role='button'], [class*='btn'], [class*='icon'], [class*='download'], [class*='toolbar'] span, [class*='toolbar'] div") || el;
+    return {
+      component_name: "boss-svg svg-icon [object SVGAnimatedString]",
+      component_descriptor: getElementDescriptor(node).slice(0, 260),
+      component_path: getElementDomPath(node),
+      component_rect: node ? getRectSnapshot(node) : null,
+    };
+  }
+
+  function findBossSvgDownloadIcon(preview = null) {
+    const roots = [];
+    const pushRoot = (el) => {
+      if (!el) return;
+      if (!roots.includes(el)) roots.push(el);
+    };
+    if (preview?.root) {
+      pushRoot(preview.root);
+      pushRoot(preview.root.parentElement);
+      pushRoot(preview.root.parentElement?.parentElement);
+      pushRoot(preview.root.closest?.("[role='dialog'], [class*='dialog'], [class*='modal'], [class*='preview'], [class*='viewer'], [class*='pdf'], [class*='resume'], [class*='attachment'], [class*='drawer'], [class*='popup'], [class*='pop'], [class*='layer']"));
+    }
+    for (const root of getPreviewRoots()) pushRoot(root);
+    if (!roots.length) pushRoot(document.body || document.documentElement);
+    const matches = [];
+    const selector = "svg, use, [class*='boss-svg'], [class*='svg-icon']";
+    for (const root of roots) {
+      if (!root) continue;
+      const nodes = root.matches?.(selector) ? [root, ...root.querySelectorAll(selector)] : Array.from(root.querySelectorAll?.(selector) || []);
+      for (const el of nodes) {
+        const clickable = el.closest?.("button, a, [role='button'], [class*='btn'], [class*='icon'], [class*='download'], [class*='toolbar'] span, [class*='toolbar'] div") || el.parentElement || el;
+        if (!clickable || !isVisible(clickable) || isDisabled(clickable)) continue;
+        const rect = clickable.getBoundingClientRect();
+        if (rect.width < 10 || rect.height < 10 || rect.top < 0 || rect.left < 0) continue;
+        const descriptor = `${getElementDescriptor(el)} ${getElementDescriptor(clickable)} ${getElementDescriptor(clickable.parentElement)}`;
+        const combined = descriptor.toLowerCase();
+        if (!isBossSvgDownloadDescriptor(descriptor)) continue;
+        if (/关闭|close|取消|返回|back|delete|trash|更多|more|打印|print|zoom|放大|缩小|rotate|旋转|×|✕|esc/i.test(combined)) continue;
+        const score = 30 + (rect.top <= Math.min(220, window.innerHeight * 0.28) ? 4 : 0) + (rect.left > window.innerWidth * 0.55 ? 3 : 0) + (rect.left > window.innerWidth * 0.75 ? 2 : 0);
+        matches.push({ el: clickable, rect, score });
+      }
+    }
+    matches.sort((a, b) => b.score - a.score || b.rect.left - a.rect.left || a.rect.top - b.rect.top);
+    return matches[0]?.el || null;
+  }
+
 
   function getPreviewRoots() {
     const selectors = [
@@ -877,6 +1000,7 @@
         const combined = descriptor.toLowerCase();
         let score = 0;
         if (isLikelyDownloadIcon(el, descriptor)) score += 12;
+        if (isBossSvgDownloadDescriptor(descriptor)) score += 30;
         if (/下载附件|下载简历/.test(descriptor)) score += 8;
         if (/下载|download|down/i.test(descriptor)) score += 6;
         if (/svg|icon|btn|button|toolbar/i.test(descriptor)) score += 2;
@@ -976,12 +1100,14 @@
     await skipCandidate(candidateId, signature, requestSent ? "resume_requested" : "resume_request_clicked", { confirmed, fast_skip: true });
   }
 
-  function downloadDirectUrl(data = {}, timeoutMs = 2000) {
+  function downloadDirectUrl(data = {}, timeoutMs = 10000) {
+    emit({ type: "direct_download_message_send", data: { candidate_id: data.candidate_id || "", candidate_signature: data.candidate_signature || "", url: data.url || data.direct_url || data.iframe_src || "", timeout_ms: timeoutMs } });
     return new Promise((resolve) => {
       let settled = false;
       const timer = setTimeout(() => {
         if (settled) return;
         settled = true;
+        emit({ type: "direct_download_message_timeout", data: { candidate_id: data.candidate_id || "", candidate_signature: data.candidate_signature || "", url: data.url || data.direct_url || data.iframe_src || "", timeout_ms: timeoutMs } });
         resolve({ ok: false, reason: "direct_download_response_timeout" });
       }, timeoutMs);
       try {
@@ -990,46 +1116,125 @@
           settled = true;
           clearTimeout(timer);
           if (chrome.runtime.lastError) {
-            resolve({ ok: false, reason: chrome.runtime.lastError.message || "direct_download_message_failed" });
+            const reason = chrome.runtime.lastError.message || "direct_download_message_failed";
+            emit({ type: "direct_download_message_response", data: { candidate_id: data.candidate_id || "", candidate_signature: data.candidate_signature || "", ok: false, reason } });
+            resolve({ ok: false, reason });
             return;
           }
-          resolve(response || { ok: false, reason: "empty_direct_download_response" });
+          const result = response || { ok: false, reason: "empty_direct_download_response" };
+          emit({ type: "direct_download_message_response", data: { candidate_id: data.candidate_id || "", candidate_signature: data.candidate_signature || "", ...result } });
+          resolve(result);
         });
       } catch (error) {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
-        resolve({ ok: false, reason: String(error) });
+        const reason = String(error);
+        emit({ type: "direct_download_message_response", data: { candidate_id: data.candidate_id || "", candidate_signature: data.candidate_signature || "", ok: false, reason } });
+        resolve({ ok: false, reason });
       }
     });
   }
 
+  function normalizeBossAbsoluteUrl(url = "", base = location.origin) {
+    if (!url) return "";
+    try {
+      return new URL(url, base).href;
+    } catch {
+      return "";
+    }
+  }
+
+  function resolveBossPdfPreviewDownloadTarget(preview) {
+    const rawSrc = preview?.info?.iframe_src || preview?.root?.getAttribute?.("src") || preview?.root?.getAttribute?.("data") || "";
+    if (!rawSrc || !isStrongBossPdfPreviewUrl(rawSrc)) {
+      return { raw_src: rawSrc, normalized_src: "", viewer_url: "", extracted_src: "", download_url: "" };
+    }
+
+    const normalizedSrc = normalizeBossAbsoluteUrl(rawSrc);
+    if (!normalizedSrc) {
+      return { raw_src: rawSrc, normalized_src: "", viewer_url: "", extracted_src: "", download_url: "" };
+    }
+
+    let viewerUrl = "";
+    let extractedSrc = "";
+    let downloadUrl = normalizedSrc;
+    try {
+      const parsed = new URL(normalizedSrc);
+      viewerUrl = parsed.href;
+      const innerUrl = parsed.searchParams.get("url") || "";
+      if (innerUrl) {
+        extractedSrc = decodeURIComponent(innerUrl);
+        const extractedNormalized = normalizeBossAbsoluteUrl(extractedSrc, parsed.origin);
+        if (extractedNormalized) {
+          downloadUrl = extractedNormalized;
+        }
+      }
+    } catch {
+      downloadUrl = normalizedSrc;
+    }
+
+    return { raw_src: rawSrc, normalized_src: normalizedSrc, viewer_url: viewerUrl, extracted_src: extractedSrc, download_url: downloadUrl };
+  }
+
   function getPreviewDirectDownloadUrl(preview) {
-    const src = preview?.info?.iframe_src || preview?.root?.getAttribute?.("src") || preview?.root?.getAttribute?.("data") || "";
-    if (!src || !isStrongBossPdfPreviewUrl(src)) return "";
-    return src;
+    return resolveBossPdfPreviewDownloadTarget(preview).download_url || "";
   }
 
   async function tryDirectIframeDownload(candidateId, signature, info, preview) {
-    const url = getPreviewDirectDownloadUrl(preview);
-    if (!url) return false;
-    const payload = { candidate_id: candidateId, candidate_signature: signature, candidate_info: info, expected_filename: `${signature}.pdf`, url, iframe_src: url };
-    emit({ type: "direct_iframe_download_used", data: payload });
+    const resolved = resolveBossPdfPreviewDownloadTarget(preview);
+    const url = resolved.download_url;
+    if (!url) {
+      emit({ type: "direct_iframe_download_skipped", data: { candidate_id: candidateId, candidate_signature: signature, reason: "no_strong_pdf_iframe_url", iframe_src: resolved.raw_src || "" } });
+      return false;
+    }
+    emit({ type: "direct_iframe_download_resolved", data: { candidate_id: candidateId, candidate_signature: signature, raw_src: resolved.raw_src || "", normalized_src: resolved.normalized_src || "", viewer_url: resolved.viewer_url || "", extracted_src: resolved.extracted_src || "", download_url: resolved.download_url || "" } });
+    const payload = { candidate_id: candidateId, candidate_signature: signature, candidate_info: info, expected_filename: `${signature}.pdf`, url, iframe_src: resolved.raw_src || url, normalized_src: resolved.normalized_src || "", viewer_url: resolved.viewer_url || "", extracted_src: resolved.extracted_src || "", direct_url: url };
+    emit({ type: "direct_iframe_download_start", data: payload });
     const resultPromise = waitForDownloadResult(candidateId, 20000);
     const started = await downloadDirectUrl(payload);
     if (!started.ok) {
       emit({ type: "direct_iframe_download_failed", data: { ...payload, reason: started.reason || "direct_download_start_failed" } });
       return false;
     }
+    emit({ type: "direct_iframe_download_created", data: { ...payload, download_id: started.download_id || "" } });
     const downloadResult = await resultPromise;
     if (downloadResult.ok) {
+      emit({ type: "direct_iframe_download_link_captured", data: { ...payload, download_url: findDownloadUrlFromResult(downloadResult), ...(downloadResult.data || {}) } });
       results.downloaded++;
       emitProgress();
       await sleep(Math.min(Math.max(config.interval_ms || 0, 300), 900));
       return true;
     }
-    emit({ type: "direct_iframe_download_failed", data: { ...payload, reason: downloadResult.reason || "download_failed" } });
+    emit({ type: "direct_iframe_download_failed", data: { ...payload, reason: downloadResult.reason || "download_failed", ...(downloadResult.data || {}) } });
     return false;
+  }
+
+
+  async function clickBossSvgDownloadIcon(candidateId, signature, info, preview) {
+    emit({ type: "boss_svg_download_icon_scan_started", data: { candidate_id: candidateId, candidate_signature: signature, preview_source: preview?.info?.preview_source || "", iframe_src: preview?.info?.iframe_src || "" } });
+    const target = findBossSvgDownloadIcon(preview);
+    if (!target) {
+      emit({ type: "boss_svg_download_icon_not_found", data: { candidate_id: candidateId, candidate_signature: signature } });
+      return false;
+    }
+    const snapshot = getBossSvgDownloadSnapshot(target);
+    emit({ type: "boss_svg_download_icon_found", data: { candidate_id: candidateId, candidate_signature: signature, ...snapshot } });
+    emit({ type: "download_intent", data: { candidate_id: candidateId, candidate_signature: signature, candidate_info: info, expected_filename: `${signature}.pdf`, click_strategy: "boss_svg_icon" } });
+    const resultPromise = waitForDownloadResult(candidateId, 20000);
+    clickElementReliably(target);
+    emit({ type: "boss_svg_download_icon_clicked", data: { candidate_id: candidateId, candidate_signature: signature, ...snapshot } });
+    const downloadResult = await resultPromise;
+    if (downloadResult.ok) {
+      emit({ type: "boss_svg_download_link_captured", data: { candidate_id: candidateId, candidate_signature: signature, download_url: findDownloadUrlFromResult(downloadResult), ...downloadResult.data } });
+      results.downloaded++;
+      emitProgress();
+      await sleep(Math.min(Math.max(config.interval_ms || 0, 300), 900));
+      return true;
+    }
+    emit({ type: "boss_svg_download_link_capture_failed", data: { candidate_id: candidateId, candidate_signature: signature, reason: downloadResult.reason || "download_failed", ...(downloadResult.data || {}) } });
+    await skipCandidate(candidateId, signature, downloadResult.reason || "download_failed", downloadResult.data || {});
+    return true;
   }
 
   function findLearnedDownloadElement(learned) {
@@ -1168,7 +1373,13 @@
     emit({ type: "resume_preview_detected", data: { candidate_id: candidateId, candidate_signature: signature, ...preview.info } });
     emit({ type: "resume_preview_info_extract_success", data: { candidate_id: candidateId, candidate_signature: signature, ...preview.info } });
 
+    emit({ type: "resume_download_strategy_start", data: { candidate_id: candidateId, candidate_signature: signature, pdf_iframe: Boolean(preview.pdf_iframe), iframe_src: preview.info?.iframe_src || "", preview_source: preview.info?.preview_source || "" } });
+
     if (await tryDirectIframeDownload(candidateId, signature, info, preview)) {
+      return;
+    }
+
+    if (await clickBossSvgDownloadIcon(candidateId, signature, info, preview)) {
       return;
     }
 

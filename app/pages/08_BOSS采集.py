@@ -61,7 +61,7 @@ st.markdown(
 
 
 def classify_boss_log(message: str, level: str = "info") -> str:
-    if level == "highlight" or any(token in message for token in ["附件简历调试", "发现弹出页面", "成功获取以下信息", "正在记录你的操作", "成功记录到你的点击操作", "学习任务已完成"]):
+    if level == "highlight" or any(token in message for token in ["附件简历调试", "发现弹出页面", "成功获取以下信息", "正在记录你的操作", "成功记录到你的点击操作", "学习任务已完成", "PDF iframe", "boss-svg", "捕获下载链接"]):
         return "boss-log-highlight"
     if "附件按钮:" in message and ("unknown_resume" in message or "附件简历" in message or "开始识别弹出页面" in message):
         return "boss-log-highlight"

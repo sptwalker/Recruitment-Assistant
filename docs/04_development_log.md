@@ -1,5 +1,29 @@
 # 开发日志
 
+## 2026-05-15
+
+### V1.70 BOSS PDF iframe 下载链路日志增强
+
+#### 已完成内容
+
+- 强化 BOSS 附件简历 PDF iframe 识别：支持从 `/bzl-office/pdf-viewer-b?url=...` 中解析真实 `preview4boss` 地址，并统一转换为 `https://www.zhipin.com/...` 绝对下载 URL。
+- 增强 Content Script 到 Chrome 后台的直接下载请求链路日志：新增请求发送、后台响应、响应超时、下载结果捕获等事件，便于定位 direct download 卡住位置。
+- 增强 Chrome 后台直接下载可观测性：记录请求接收、URL 校验、下载启动、响应发送、回调超时和失败原因，并对 `chrome.downloads.download()` 增加超时兜底。
+- 扩大 `boss-svg svg-icon [object SVGAnimatedString]` 下载组件扫描范围，覆盖 iframe 根节点、父容器、弹层、抽屉、viewer、body 等候选区域。
+- BOSS 采集页面日志高亮新增 `PDF iframe`、`boss-svg`、`捕获下载链接` 等关键字，关键下载链路更容易识别。
+- 候选人姓名解析增加 UI 文案过滤，剔除 `下载简历`、`查看简历`、`下简历`、`附件简历` 等非姓名词，降低姓名误识别概率。
+
+- 同步版本：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.70`。
+  - `chrome_extension/manifest.json` 与 `chrome_extension/background.js` 扩展版本更新为 `1.44.0`。
+  - `chrome_extension/content.js` 内容脚本版本更新为 `1.44.0`。
+
+#### 测试提示
+
+- 需要在 `chrome://extensions/` 重新加载本地扩展，并刷新 BOSS 沟通页，确认页面版本为 `V1.70`、扩展版本为 `1.44.0` 后再测试。
+- 本版命中 PDF iframe 后应看到真实 `https://www.zhipin.com/wflow/zpgeek/download/preview4boss/...` 下载地址。
+- 若后台下载仍未创建，应根据新增的 `Chrome 后台收到直接下载请求`、`Chrome 后台准备启动直接下载`、`Chrome 后台直接下载响应` 或超时日志继续定位。
+
 ## 2026-05-14
 
 ### V1.51 BOSS 附件点击后直达真实弹窗识别

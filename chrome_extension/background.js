@@ -1,5 +1,5 @@
 const WS_URL = "ws://127.0.0.1:8765";
-const EXTENSION_VERSION = "1.36.0";
+const EXTENSION_VERSION = "1.44.0";
 const HEARTBEAT_INTERVAL_MS = 15000;
 let ws = null;
 let heartbeatTimer = null;
@@ -171,26 +171,65 @@ function notifyDownloadResult(type, data) {
   });
 }
 
+function normalizeDirectDownloadUrl(url = "") {
+  if (!url) return "";
+  try {
+    return new URL(url, "https://www.zhipin.com").href;
+  } catch {
+    return "";
+  }
+}
+
 function downloadDirectUrl(data = {}, sendResponse = () => {}) {
-  const url = data.url || data.iframe_src || data.src || "";
-  if (!url || !/^https?:\/\//i.test(url)) {
-    sendResponse({ ok: false, reason: "invalid_download_url" });
+  const rawUrl = data.url || data.direct_url || data.iframe_src || data.src || "";
+  const url = normalizeDirectDownloadUrl(rawUrl);
+  const baseIntent = { ...data, url, run_id: data.run_id || activeRunId, at: Date.now(), direct_url: url, raw_direct_url: rawUrl };
+  sendToServer({ type: "direct_download_request_received", data: { ...baseIntent, url_valid: Boolean(url && /^https:\/\//i.test(url)) } });
+
+  let responded = false;
+  const respondOnce = (response) => {
+    if (responded) return;
+    responded = true;
+    clearTimeout(responseTimer);
+    sendToServer({ type: "direct_download_response_sent", data: { ...baseIntent, ...response } });
+    try { sendResponse(response); } catch (error) {
+      sendToServer({ type: "direct_download_response_error", data: { ...baseIntent, reason: String(error) } });
+    }
+  };
+  const responseTimer = setTimeout(() => {
+    const reason = "chrome_download_callback_timeout";
+    sendToServer({ type: "direct_download_callback_timeout", data: { ...baseIntent, reason } });
+    notifyDownloadResult("download_failed", { ...baseIntent, reason });
+    respondOnce({ ok: false, reason });
+  }, 8000);
+
+  if (!url || !/^https:\/\//i.test(url)) {
+    respondOnce({ ok: false, reason: "invalid_download_url", raw_url: rawUrl });
     return;
   }
-  const intent = { ...data, run_id: data.run_id || activeRunId, at: Date.now(), direct_url: url };
+
+  const intent = baseIntent;
   lastDownloadIntent = intent;
-  chrome.downloads.download({ url, saveAs: false }, (downloadId) => {
-    if (chrome.runtime.lastError || !downloadId) {
-      const reason = chrome.runtime.lastError?.message || "download_start_failed";
-      sendToServer({ type: "direct_download_failed", data: { ...intent, reason } });
-      notifyDownloadResult("download_failed", { ...intent, reason });
-      sendResponse({ ok: false, reason });
-      return;
-    }
-    pendingDownloads.set(downloadId, { ...intent, download_id: downloadId, started_at: Date.now() });
-    sendToServer({ type: "download_created", data: { ...intent, download_id: downloadId, filename: url } });
-    sendResponse({ ok: true, download_id: downloadId });
-  });
+  sendToServer({ type: "direct_download_starting", data: intent });
+  try {
+    chrome.downloads.download({ url, saveAs: false }, (downloadId) => {
+      if (chrome.runtime.lastError || !downloadId) {
+        const reason = chrome.runtime.lastError?.message || "download_start_failed";
+        sendToServer({ type: "direct_download_failed", data: { ...intent, reason } });
+        notifyDownloadResult("download_failed", { ...intent, reason });
+        respondOnce({ ok: false, reason });
+        return;
+      }
+      pendingDownloads.set(downloadId, { ...intent, download_id: downloadId, started_at: Date.now() });
+      sendToServer({ type: "download_created", data: { ...intent, download_id: downloadId, filename: url } });
+      respondOnce({ ok: true, download_id: downloadId });
+    });
+  } catch (error) {
+    const reason = String(error);
+    sendToServer({ type: "direct_download_failed", data: { ...intent, reason } });
+    notifyDownloadResult("download_failed", { ...intent, reason });
+    respondOnce({ ok: false, reason });
+  }
 }
 
 chrome.downloads.onCreated.addListener((item) => {

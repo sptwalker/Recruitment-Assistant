@@ -149,6 +149,7 @@ class BossWSBridge:
         noisy_events = {
             "resume_attachment_debug",
             "resume_preview_diagnostics",
+            "pdf_iframe_preview_scan_started",
             "resume_preview_recognition_started",
             "resume_preview_wait_result",
             "resume_preview_weak_candidate_used",
@@ -210,9 +211,19 @@ class BossWSBridge:
                 pass
             case "download_intent_registered":
                 pass
+            case "direct_download_request_received":
+                sig = data.get("candidate_signature", "未知")
+                url = str(data.get("direct_url", "") or data.get("url", ""))[:180]
+                self._log("info", f"Chrome 后台收到直接下载请求: {sig}；URL有效={data.get('url_valid', False)}；url={url}")
+            case "direct_download_starting":
+                sig = data.get("candidate_signature", "未知")
+                url = str(data.get("direct_url", "") or data.get("url", ""))[:180]
+                self._log("info", f"Chrome 后台准备启动直接下载: {sig}；url={url}")
             case "download_created":
                 sig = data.get("candidate_signature", "未知")
-                self._log("info", f"Chrome 下载已创建: {sig} #{data.get('download_id', '')}")
+                source = "PDF iframe直接下载" if data.get("direct_url") else "Chrome点击下载"
+                filename = str(data.get("filename", ""))[:180]
+                self._log("info", f"Chrome 下载已创建: {sig} #{data.get('download_id', '')}；来源={source}；文件/链接={filename}")
             case "candidate_list_scroll_reset":
                 pass
             case "resume_request_confirm_clicked":
@@ -254,6 +265,85 @@ class BossWSBridge:
                 source = data.get("preview_source", "")
                 name = data.get("name", "未识别")
                 self._log("highlight", f"已识别简历预览页: {sig}；来源={source}；姓名={name}")
+            case "pdf_iframe_preview_scan_started":
+                sig = data.get("candidate_signature", "未知")
+                self._log("info", f"正在扫描 PDF iframe 预览页: {sig}；可见frame={data.get('total_frames', 0)}；强匹配={data.get('strong_candidates', 0)}")
+            case "pdf_iframe_preview_detected":
+                sig = data.get("candidate_signature", "未知")
+                src = str(data.get("iframe_src", "") or data.get("component_src", ""))[:180]
+                self._log("highlight", f"命中 PDF iframe 简历预览页: {sig}；src={src}")
+            case "resume_download_strategy_start":
+                sig = data.get("candidate_signature", "未知")
+                self._log("info", f"开始尝试捕获简历下载链接: {sig}；PDF iframe={data.get('pdf_iframe', False)}")
+            case "direct_iframe_download_resolved":
+                sig = data.get("candidate_signature", "未知")
+                raw = str(data.get("raw_src", ""))[:120]
+                extracted = str(data.get("extracted_src", ""))[:160]
+                url = str(data.get("download_url", ""))[:180]
+                extra = f"；提取资源={extracted}" if extracted else ""
+                self._log("highlight", f"已解析 PDF iframe 下载地址: {sig}；原始={raw}{extra}；最终={url}")
+            case "direct_iframe_download_start":
+                sig = data.get("candidate_signature", "未知")
+                url = str(data.get("url", ""))[:180]
+                self._log("highlight", f"尝试使用 PDF iframe 地址直接下载: {sig}；url={url}")
+            case "direct_download_message_send":
+                sig = data.get("candidate_signature", "未知")
+                url = str(data.get("url", ""))[:180]
+                self._log("info", f"已向 Chrome 后台发送直接下载请求: {sig}；超时={data.get('timeout_ms', '')}ms；url={url}")
+            case "direct_download_message_response":
+                sig = data.get("candidate_signature", "未知")
+                ok = data.get("ok", False)
+                reason = data.get("reason", "")
+                download_id = data.get("download_id", "")
+                self._log("highlight" if ok else "error", f"Chrome 后台直接下载响应: {sig}；ok={ok}；download_id={download_id}；原因={reason}")
+            case "direct_download_message_timeout":
+                sig = data.get("candidate_signature", "未知")
+                self._log("error", f"等待 Chrome 后台直接下载响应超时: {sig}；超时={data.get('timeout_ms', '')}ms")
+            case "direct_iframe_download_skipped":
+                sig = data.get("candidate_signature", "未知")
+                self._log("info", f"跳过 iframe 直接下载: {sig}；原因={data.get('reason', '')}")
+            case "direct_iframe_download_created":
+                sig = data.get("candidate_signature", "未知")
+                self._log("info", f"PDF iframe 直接下载已创建: {sig} #{data.get('download_id', '')}")
+            case "direct_iframe_download_link_captured":
+                sig = data.get("candidate_signature", "未知")
+                url = str(data.get("download_url", ""))[:180]
+                self._log("highlight", f"已通过 PDF iframe 捕获下载链接: {sig}；url={url}")
+            case "direct_iframe_download_failed":
+                sig = data.get("candidate_signature", "未知")
+                self._log("error", f"PDF iframe 下载链路失败: {sig}；原因={data.get('reason', '')}")
+            case "direct_download_response_sent":
+                sig = data.get("candidate_signature", "未知")
+                self._log("info", f"Chrome 后台已返回直接下载响应: {sig}；ok={data.get('ok', False)}；原因={data.get('reason', '')}")
+            case "direct_download_callback_timeout":
+                sig = data.get("candidate_signature", "未知")
+                self._log("error", f"Chrome downloads.download 回调超时: {sig}；原因={data.get('reason', '')}")
+            case "direct_download_response_error":
+                sig = data.get("candidate_signature", "未知")
+                self._log("error", f"Chrome 后台发送直接下载响应失败: {sig}；原因={data.get('reason', '')}")
+            case "direct_download_failed":
+                sig = data.get("candidate_signature", "未知")
+                self._log("error", f"Chrome 后台直接下载启动失败: {sig}；原因={data.get('reason', '')}")
+            case "boss_svg_download_icon_scan_started":
+                sig = data.get("candidate_signature", "未知")
+                self._log("info", f"开始扫描 boss-svg svg-icon [object SVGAnimatedString] 下载组件: {sig}")
+            case "boss_svg_download_icon_found":
+                sig = data.get("candidate_signature", "未知")
+                descriptor = str(data.get("component_descriptor", ""))[:160]
+                self._log("highlight", f"命中 boss-svg 下载组件: {sig}；组件={descriptor}")
+            case "boss_svg_download_icon_not_found":
+                sig = data.get("candidate_signature", "未知")
+                self._log("info", f"未命中 boss-svg 下载组件，继续尝试其他策略: {sig}")
+            case "boss_svg_download_icon_clicked":
+                sig = data.get("candidate_signature", "未知")
+                self._log("highlight", f"已点击 boss-svg 下载组件，等待 Chrome 下载事件: {sig}")
+            case "boss_svg_download_link_captured":
+                sig = data.get("candidate_signature", "未知")
+                url = str(data.get("download_url", ""))[:180]
+                self._log("highlight", f"boss-svg 下载链路已捕获下载链接: {sig}；url={url}")
+            case "boss_svg_download_link_capture_failed":
+                sig = data.get("candidate_signature", "未知")
+                self._log("error", f"boss-svg 点击后未捕获下载链接: {sig}；原因={data.get('reason', '')}")
             case "resume_preview_candidate_confirm":
                 sig = data.get("candidate_signature", "未知")
                 component_type = str(data.get("component_preview_type", "") or "dom_text")
@@ -296,7 +386,10 @@ class BossWSBridge:
                 self._log("error", f"等待人工点击下载超时: {sig}")
             case "auto_download_click_used":
                 sig = data.get("candidate_signature", "未知")
-                self._log("info", f"自动点击简历下载按钮: {sig}")
+                descriptor = str(data.get("descriptor", "") or data.get("tag", ""))[:120]
+                path = str(data.get("path", ""))[:120]
+                rect = data.get("rect") or {}
+                self._log("info", f"自动点击简历下载按钮: {sig}；组件={descriptor}；path={path}；rect=({rect.get('left')},{rect.get('top')},{rect.get('width')}x{rect.get('height')})")
             case "learned_download_click_used":
                 sig = data.get("candidate_signature", "未知")
                 self._log("info", f"自动复用已学习下载按钮: {sig}")

@@ -1,5 +1,5 @@
 const WS_URL = "ws://127.0.0.1:8765";
-const EXTENSION_VERSION = "1.53.0";
+const EXTENSION_VERSION = "1.66.0";
 const HEARTBEAT_INTERVAL_MS = 15000;
 let ws = null;
 let heartbeatTimer = null;
@@ -7,6 +7,7 @@ let reconnectDelay = 1000;
 let collectState = "idle";
 let activeRunId = "";
 let lastDownloadIntent = null;
+const downloadIntentQueue = [];
 const pendingDownloads = new Map();
 
 function connect() {
@@ -65,6 +66,9 @@ function handleServerCommand(msg) {
     case "probe_page":
       sendToContentScript({ type: "probe_page", run_id: activeRunId });
       break;
+    case "resume_persist_ack":
+      sendToContentScript({ type: "resume_persist_ack", data: msg.data || {}, run_id: activeRunId });
+      break;
   }
 }
 
@@ -86,7 +90,7 @@ async function ensureContentScript(tabId) {
 }
 
 function shouldTargetSingleTab(msg) {
-  return ["start_collect", "pause_collect", "resume_collect", "stop_collect", "reset_content_script"].includes(msg?.type);
+  return ["start_collect", "pause_collect", "resume_collect", "stop_collect", "reset_content_script", "resume_persist_ack"].includes(msg?.type);
 }
 
 function pickBossTab(candidateTabs) {
@@ -152,9 +156,35 @@ function updateBadge(state) {
   chrome.action.setBadgeBackgroundColor({ color });
 }
 
+function pruneDownloadIntentQueue() {
+  const now = Date.now();
+  while (downloadIntentQueue.length) {
+    const maxAge = downloadIntentQueue[0].click_strategy === "manual_user_click" ? 90000 : 15000;
+    if (now - downloadIntentQueue[0].at <= maxAge) break;
+    const expired = downloadIntentQueue.shift();
+    sendToServer({ type: "download_intent_expired", data: { ...expired, reason: "intent_queue_timeout" } });
+  }
+}
+
 function rememberDownloadIntent(data) {
-  lastDownloadIntent = { ...data, run_id: data.run_id || activeRunId, at: Date.now() };
-  sendToServer({ type: "download_intent_registered", data: lastDownloadIntent });
+  const intent = { ...data, run_id: data.run_id || activeRunId, at: Date.now() };
+  lastDownloadIntent = intent;
+  downloadIntentQueue.push(intent);
+  pruneDownloadIntentQueue();
+  while (downloadIntentQueue.length > 8) downloadIntentQueue.shift();
+  sendToServer({ type: "download_intent_registered", data: intent });
+}
+
+function takeQueuedDownloadIntent(item = {}) {
+  pruneDownloadIntentQueue();
+  if (pendingDownloads.has(item.id)) return null;
+  if (!downloadIntentQueue.length) return null;
+  const url = item.url || "";
+  const exactIndex = downloadIntentQueue.findIndex((intent) => intent.direct_url && url && normalizeDirectDownloadUrl(intent.direct_url) === normalizeDirectDownloadUrl(url));
+  const manualIndex = downloadIntentQueue.findIndex((intent) => intent.click_strategy === "manual_user_click" && Date.now() - intent.at <= 90000);
+  const index = exactIndex >= 0 ? exactIndex : (manualIndex >= 0 ? manualIndex : 0);
+  const [intent] = downloadIntentQueue.splice(index, 1);
+  return intent || null;
 }
 
 function makeSafeDownloadFilename(data = {}, fallbackExt = ".pdf") {
@@ -175,9 +205,11 @@ function makeSafeDownloadFilename(data = {}, fallbackExt = ".pdf") {
   return `Boss直聘/${name}-${age}-${education}-BOSS直聘-${stamp}${ext}`;
 }
 
-function getFreshDownloadIntent() {
+function getFreshDownloadIntent(allowManual = false) {
+  pruneDownloadIntentQueue();
   if (!lastDownloadIntent) return null;
-  if (Date.now() - lastDownloadIntent.at > 120000) return null;
+  const maxAge = allowManual || lastDownloadIntent.click_strategy === "manual_user_click" ? 90000 : 15000;
+  if (Date.now() - lastDownloadIntent.at > maxAge) return null;
   return lastDownloadIntent;
 }
 
@@ -226,7 +258,7 @@ function downloadDirectUrl(data = {}, sendResponse = () => {}) {
     return;
   }
 
-  const intent = baseIntent;
+  const intent = { ...baseIntent, download_source: "direct_iframe", direct_bound: true };
   lastDownloadIntent = intent;
   sendToServer({ type: "direct_download_starting", data: intent });
   try {
@@ -238,9 +270,9 @@ function downloadDirectUrl(data = {}, sendResponse = () => {}) {
         respondOnce({ ok: false, reason });
         return;
       }
-      pendingDownloads.set(downloadId, { ...intent, download_id: downloadId, started_at: Date.now() });
-      sendToServer({ type: "download_created", data: { ...intent, download_id: downloadId, filename: url } });
-      respondOnce({ ok: true, download_id: downloadId });
+      pendingDownloads.set(downloadId, { ...intent, download_id: downloadId, started_at: Date.now(), bound_by: "direct_download_callback" });
+      sendToServer({ type: "download_created", data: { ...intent, download_id: downloadId, filename: url, bound_by: "direct_download_callback" } });
+      respondOnce({ ok: true, download_id: downloadId, download_request_id: intent.download_request_id || "" });
     });
   } catch (error) {
     const reason = String(error);
@@ -251,12 +283,23 @@ function downloadDirectUrl(data = {}, sendResponse = () => {}) {
 }
 
 chrome.downloads.onCreated.addListener((item) => {
-  const intent = getFreshDownloadIntent();
-  if (!intent) return;
-  pendingDownloads.set(item.id, { ...intent, download_id: item.id, started_at: Date.now() });
+  if (pendingDownloads.has(item.id)) {
+    const pending = pendingDownloads.get(item.id);
+    sendToServer({
+      type: "download_created_seen_bound",
+      data: { ...pending, download_id: item.id, filename: item.filename || item.url || "", bound_by: pending.bound_by || "existing" },
+    });
+    return;
+  }
+  const intent = takeQueuedDownloadIntent(item);
+  if (!intent) {
+    sendToServer({ type: "download_created_unbound", data: { download_id: item.id, filename: item.filename || item.url || "", reason: "no_matching_intent" } });
+    return;
+  }
+  pendingDownloads.set(item.id, { ...intent, download_id: item.id, started_at: Date.now(), bound_by: "downloads_on_created_queue" });
   sendToServer({
     type: "download_created",
-    data: { ...intent, download_id: item.id, filename: item.filename || item.url || "" },
+    data: { ...intent, download_id: item.id, filename: item.filename || item.url || "", bound_by: "downloads_on_created_queue" },
   });
 });
 

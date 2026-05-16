@@ -1,18 +1,22 @@
 import html
 import json
+import os
 import time
+from datetime import datetime
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 from components.layout import inject_vibe_style, page_header
+from recruitment_assistant.config.settings import get_settings
 from recruitment_assistant.services.boss_ws_bridge import BossWSBridge
 from recruitment_assistant.services.crawl_task_service import CrawlTaskService
 from recruitment_assistant.services.ws_server import BossWSServer
 from recruitment_assistant.storage.db import create_session
 
 st.set_page_config(page_title="BOSS采集", layout="wide", initial_sidebar_state="collapsed")
-inject_vibe_style("BOSS采集")
-page_header("BOSS直聘采集（测试功能）", "通过 Chrome 扩展在页面内自动采集附件简历，完全绕过反检测。")
+inject_vibe_style("BOSS直聘采集")
+page_header("BOSS直聘采集", "通过 Chrome 扩展在页面内自动采集附件简历，完全绕过反检测。")
 
 st.markdown(
     """
@@ -20,7 +24,8 @@ st.markdown(
 .vibe-page-title { background:transparent !important; border:0 !important; box-shadow:none !important; padding:0 !important; margin:0 0 12px !important; }
 .vibe-page-title h1 { font-size:30px !important; line-height:1.04 !important; font-weight:900 !important; letter-spacing:-.8px !important; }
 .vibe-page-title p { font-size:13px !important; margin-top:4px !important; }
-.boss-section-title { margin:14px 0 7px; padding:0 0 6px; border-bottom:2px solid #DDE7F2; color:#172033; font-size:22px; line-height:1.2; font-weight:900; letter-spacing:-.3px; background:transparent; }
+.boss-section-title { display:flex; align-items:baseline; gap:14px; flex-wrap:wrap; margin:14px 0 7px; padding:0 0 6px; border-bottom:2px solid #DDE7F2; color:#172033; font-size:22px; line-height:1.2; font-weight:900; letter-spacing:-.3px; background:transparent; }
+.boss-section-note { color:#B7791F; font-size:13px; font-weight:600; letter-spacing:0; }
 [data-testid="stVerticalBlockBorderWrapper"] { background:#FFFFFF !important; border:1px solid #E5EAF2 !important; border-radius:14px !important; box-shadow:none !important; }
 [data-testid="stVerticalBlockBorderWrapper"] [data-testid="stVerticalBlock"] { gap:.45rem !important; }
 [data-testid="stMetric"] { background:#FFFFFF; border:1px solid #EEF2F7; border-radius:12px; padding:7px 9px; }
@@ -42,6 +47,15 @@ st.markdown(
 .boss-checklist { margin:0 0 0 18px; padding:0; }
 .boss-checklist li { margin:4px 0; line-height:1.38; font-size:12px; }
 .boss-log-box { height:300px; overflow-y:auto; background:#fff; border:1px solid #E5EAF2; border-radius:12px; padding:9px 10px; font-family:Consolas,monospace; font-size:12px; line-height:1.42; white-space:pre-wrap; }
+.boss-auto-scroll-frame { width:100%; height:316px; border:0; display:block; }
+.boss-candidate-box { height:300px; overflow-y:auto; background:#fff; border:1px solid #E5EAF2; border-radius:12px; padding:0; font-size:12px; }
+.boss-candidate-table { width:100%; border-collapse:collapse; table-layout:fixed; }
+.boss-candidate-table th { position:sticky; top:0; z-index:1; background:#F8FAFC; color:#475569; font-size:12px; text-align:left; padding:8px 7px; border-bottom:1px solid #E5EAF2; }
+.boss-candidate-table td { color:#1F2937; padding:7px; border-bottom:1px solid #EEF2F7; vertical-align:top; word-break:break-all; }
+.boss-candidate-table tr:last-child td { border-bottom:0; }
+.boss-candidate-status-downloaded { color:#168A45; font-weight:800; white-space:nowrap; }
+.boss-candidate-status-skipped { color:#B7791F; font-weight:800; white-space:nowrap; }
+.boss-empty-box { height:300px; overflow-y:auto; background:#fff; border:1px solid #E5EAF2; border-radius:12px; padding:9px 10px; color:#94A3B8; font-size:12px; }
 .boss-log-highlight { color:#E85D9E; font-weight:900; font-size:14px; }
 .boss-log-info { color:#1F2937; font-size:13px; }
 .boss-log-success { color:#168A45; font-weight:700; font-size:13px; }
@@ -51,6 +65,9 @@ st.markdown(
 .plain-section-title { display:flex; align-items:center; justify-content:space-between; gap:12px; margin:18px 0 10px; }
 .plain-section-title h3 { margin:0; font-size:18px; line-height:1.3; color:#1F2937; }
 .collect-panel-stat { color:#4A90E2; font-size:14px; font-weight:700; white-space:nowrap; }
+.boss-result-title { display:flex; align-items:center; justify-content:space-between; gap:10px; margin:0 0 8px; min-height:22px; }
+.boss-result-title strong { color:#172033; font-size:14px; line-height:1.2; }
+.boss-result-title span { color:#4A90E2; font-size:12px; font-weight:700; line-height:1.25; text-align:right; }
 [data-testid="stCaptionContainer"] { font-size:12px !important; }
 </style>
 """,
@@ -88,8 +105,9 @@ def translate_boss_detail(value: str) -> str:
     mapping = {
         "need_request_resume": "需要索要简历，已按设置跳过",
         "resume_requested": "已成功索要简历，等待候选人上传",
-        "resume_request_clicked": "已点击索要简历，等待确认结果",
-        "resume_request_already_sent": "简历请求已发送，等待候选人上传",
+        "resume_requested_by_user": "已成功索要简历，等待候选人上传",
+        "resume_request_unconfirmed": "已点击索要简历但未检测到请求发送成功",
+        "resume_request_confirm_not_found": "未找到索要简历确认按钮，未检测到请求发送成功",
         "resume_already_requested": "此前已索要简历，等待候选人上传",
         "download_button_not_found": "未找到简历下载按钮",
         "download_timeout": "下载等待超时",
@@ -105,6 +123,13 @@ def translate_boss_detail(value: str) -> str:
 
 
 def render_boss_history_task_table() -> None:
+    status_mapping = {
+        "running": "运行中",
+        "success": "成功",
+        "cancelled": "已停止",
+        "failed": "失败",
+        "pending": "待开始",
+    }
     try:
         with create_session() as session:
             task_service = CrawlTaskService(session)
@@ -127,12 +152,15 @@ def render_boss_history_task_table() -> None:
         [
             {
                 "批次ID": row.id,
-                "时间": row.started_at,
+                "时间": row.started_at.strftime("%Y-%m-%d %H:%M:%S") if row.started_at else "",
                 "目标网站": "BOSS直聘",
-                "目标数量": row.planned_count,
+                "目标数量": row.planned_count or 0,
                 "获取数量": row.success_count,
+                "跳过数量": row.failed_count,
                 "耗时": f"{int((row.finished_at - row.started_at).total_seconds())}秒" if row.started_at and row.finished_at else "运行中",
-                "状态": row.status,
+                "状态": status_mapping.get(row.status, row.status),
+                "任务名称": row.task_name,
+                "错误信息": (row.error_message or "")[:80],
             }
             for row in task_rows
         ],
@@ -142,8 +170,101 @@ def render_boss_history_task_table() -> None:
 
 
 
-def section_title(title: str) -> None:
-    st.markdown(f'<div class="boss-section-title">{title}</div>', unsafe_allow_html=True)
+def section_title(title: str, note: str | None = None) -> None:
+    if note:
+        st.markdown(
+            f'<div class="boss-section-title"><span>{title}</span><span class="boss-section-note">{note}</span></div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(f'<div class="boss-section-title">{title}</div>', unsafe_allow_html=True)
+
+
+def format_boss_duration(seconds: float) -> str:
+    total_seconds = max(0, int(seconds))
+    minutes, sec = divmod(total_seconds, 60)
+    return f"{minutes}分{sec:02d}秒"
+
+
+def boss_run_elapsed_seconds(runtime_state: dict) -> float:
+    started_at = runtime_state.get("run_started_at") or ""
+    if not started_at:
+        return 0
+    try:
+        return max(0, (datetime.now() - datetime.fromisoformat(started_at)).total_seconds())
+    except ValueError:
+        return 0
+
+
+def render_result_title(title: str, summary: str) -> None:
+    st.markdown(
+        f'<div class="boss-result-title"><strong>{html.escape(title)}</strong><span>{html.escape(summary)}</span></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def build_log_summary(runtime_state: dict) -> str:
+    candidates = runtime_state.get("candidates", []) or []
+    current_index = int(runtime_state.get("current_index") or 0)
+    progress_scanned = int(runtime_state.get("scanned_count") or 0)
+    fallback_scanned = current_index + 1 if candidates else 0
+    scanned_count = max(progress_scanned, fallback_scanned, len(candidates))
+    elapsed_seconds = boss_run_elapsed_seconds(runtime_state)
+    avg_seconds = elapsed_seconds / scanned_count if scanned_count else 0
+    return f"已扫描{scanned_count}位候选人，已扫描{format_boss_duration(elapsed_seconds)}，每人平均耗时{avg_seconds:.1f}秒"
+
+
+def build_candidate_summary(runtime_state: dict) -> str:
+    candidates = runtime_state.get("candidates", [])
+    skipped_count = int(runtime_state.get("skipped_count") or 0)
+    skip_counts = runtime_state.get("skip_reason_counts", {}) or {}
+    dedup_skipped_count = int(skip_counts.get("boss_dedup_hit") or 0)
+    resume_request_count = int(runtime_state.get("resume_request_count") or 0)
+    downloaded_count = int(runtime_state.get("downloaded_count") or 0)
+    return f"已记录{len(candidates)}位候选人，跳过{skipped_count}位候选人（其中去重{dedup_skipped_count}人），向{resume_request_count}位候选人索要了简历，成功下载{downloaded_count}份简历"
+
+
+def render_auto_scroll_html(body_html: str, anchor: str, height: int = 316) -> None:
+    components.html(
+        f"""
+<style>
+html, body {{ margin:0; padding:0; background:transparent; font-family:Arial, 'Microsoft YaHei', sans-serif; font-size:12px; overflow:hidden; }}
+.boss-log-box {{ height:300px; overflow-y:auto; background:#fff; border:1px solid #E5EAF2; border-radius:12px; padding:9px 10px; font-family:Consolas, 'Microsoft YaHei', monospace; font-size:12px; line-height:1.42; white-space:pre-wrap; box-sizing:border-box; }}
+.boss-candidate-box {{ height:300px; overflow-y:auto; background:#fff; border:1px solid #E5EAF2; border-radius:12px; padding:0; font-size:12px; box-sizing:border-box; }}
+.boss-candidate-table {{ width:100%; border-collapse:collapse; table-layout:fixed; font-size:12px; }}
+.boss-candidate-table th {{ position:sticky; top:0; z-index:1; background:#F8FAFC; color:#475569; font-size:12px; text-align:left; padding:8px 7px; border-bottom:1px solid #E5EAF2; }}
+.boss-candidate-table td {{ color:#1F2937; padding:7px; border-bottom:1px solid #EEF2F7; vertical-align:top; word-break:break-all; font-size:12px; line-height:1.35; }}
+.boss-candidate-table tr:last-child td {{ border-bottom:0; }}
+.boss-candidate-status-downloaded {{ color:#168A45; font-weight:800; white-space:nowrap; }}
+.boss-candidate-status-skipped {{ color:#B7791F; font-weight:800; white-space:nowrap; }}
+.boss-empty-box {{ height:300px; overflow-y:auto; background:#fff; border:1px solid #E5EAF2; border-radius:12px; padding:9px 10px; color:#94A3B8; font-size:12px; box-sizing:border-box; }}
+.boss-log-highlight {{ color:#E85D9E; font-weight:900; font-size:12px; }}
+.boss-log-info {{ color:#1F2937; font-size:12px; }}
+.boss-log-success {{ color:#168A45; font-weight:700; font-size:12px; }}
+.boss-log-error {{ color:#C73552; font-weight:700; font-size:12px; }}
+.boss-log-skipped {{ color:#B7791F; font-weight:700; font-size:12px; }}
+.boss-log-stat {{ color:#2563EB; font-weight:700; font-size:12px; }}
+</style>
+<div id="{anchor}-wrap">{body_html}</div>
+<script>
+function scrollBossResultToBottom() {{
+  const scrollers = document.querySelectorAll(".boss-log-box, .boss-candidate-box, .boss-empty-box");
+  scrollers.forEach((scroller) => {{
+    scroller.scrollTop = scroller.scrollHeight;
+    const lastRow = scroller.querySelector("tbody tr:last-child");
+    if (lastRow) {{
+      lastRow.scrollIntoView({{ block: "end", inline: "nearest" }});
+    }}
+  }});
+}}
+requestAnimationFrame(scrollBossResultToBottom);
+setTimeout(scrollBossResultToBottom, 50);
+setTimeout(scrollBossResultToBottom, 200);
+</script>
+""",
+        height=height,
+        scrolling=False,
+    )
 
 
 @st.cache_resource
@@ -193,17 +314,15 @@ with st.container(border=True):
     status_cols[3].metric("Run ID", runtime.get("run_id") or "-")
     status_cols[4].metric("最近事件", runtime.get("last_event_at") or "-")
 
-    action_cols = st.columns([1.25, 1.25, 1.1, 1.1, 1.25, 3.05], gap="medium")
+    action_cols = st.columns([1.25, 1.25, 1.1, 1.25, 4.15], gap="medium")
     action_cols[0].link_button("打开 BOSS 登录页面", "https://www.zhipin.com/web/user/?ka=header-login")
     if action_cols[1].button("重新检测 BOSS 页面", disabled=not ws_connected):
         bridge.probe_page()
         st.rerun()
-    if action_cols[2].button("重置本轮测试", disabled=runtime.get("running", False)):
+    if action_cols[2].button("重置日志信息", disabled=runtime.get("running", False)):
         bridge.reset_run()
         st.rerun()
-    if action_cols[3].button("生成本轮摘要"):
-        st.session_state["boss_run_summary"] = bridge.get_run_summary()
-    if action_cols[4].button("清除去重数据库", disabled=runtime.get("running", False)):
+    if action_cols[3].button("清除去重数据库", disabled=runtime.get("running", False)):
         try:
             deleted_count = bridge.clear_boss_dedup_records()
             st.session_state["boss_dedup_clear_message"] = f"已清除 BOSS 去重记录 {deleted_count} 条"
@@ -218,28 +337,33 @@ with st.container(border=True):
         st.code(json.dumps(summary, ensure_ascii=False, indent=2), language="json")
 
 # --- Collection & Results ---
-section_title("采集与结果")
+section_title("采集与结果", "注意：如果要自动保存简历，请在chorm浏览器设置中关闭“下载前询问每个文件的保存位置”")
 with st.container(border=True):
-    top_cols = st.columns([1.05, 1.05, 1.05, 1.05, 0.85, 0.85, 0.85, 0.95, 0.85])
-    max_resumes = top_cols[0].number_input("最大采集数量", min_value=1, max_value=100, value=5, step=1)
-    interval_ms = top_cols[1].number_input("点击间隔（毫秒）", min_value=500, max_value=30000, value=1500, step=500)
-    test_mode = top_cols[2].selectbox("测试模式", ["连续采集", "单步采集1人"])
-    request_resume_if_missing = top_cols[3].checkbox("需要时索要简历", value=False)
-    top_cols[4].metric("已下载", runtime.get("downloaded_count", 0))
-    top_cols[5].metric("已跳过", runtime.get("skipped_count", 0))
-    top_cols[6].metric("当前索引", runtime.get("current_index", 0))
-    top_cols[7].metric("新增去重", runtime.get("dedup_record_count", 0))
-    status_text = "采集中" if is_running and not is_paused else ("已暂停" if is_paused else "空闲")
-    top_cols[8].metric("状态", status_text)
-    st.caption("如果要自动保存简历，请在chorm浏览器设置中关闭“下载前询问每个文件的保存位置”")
+    top_cols = st.columns([1.1, 1.1, 1.1, 1.6, 3.1])
+    collect_mode = top_cols[0].selectbox("采集模式", ["按数量采集", "按时间采集"])
+    if collect_mode == "按时间采集":
+        collect_minutes = top_cols[1].number_input("采集时间（分钟）", min_value=5, max_value=120, value=10, step=5)
+        max_resumes = 0
+    else:
+        max_resumes = top_cols[1].number_input("目标下载份数", min_value=1, max_value=100, value=5, step=1)
+        collect_minutes = 0
+    request_resume_if_missing = top_cols[2].checkbox("索要简历", value=False)
+    try:
+        current_dedup_total = len(bridge._load_boss_candidate_keys())
+    except Exception:
+        current_dedup_total = 0
+    top_cols[3].metric("当前去重记录数", current_dedup_total)
 
-    btn_cols = st.columns([1, 1, 1, 1, 5])
+    btn_cols = st.columns([1, 1, 1, 1, 1.4, 4])
     if btn_cols[0].button("开始采集", disabled=is_running or not ws_connected, type="primary"):
-        effective_max = 1 if test_mode == "单步采集1人" else max_resumes
+        if collect_mode == "按时间采集":
+            effective_max = 0
+        else:
+            effective_max = max_resumes
         bridge.start_collect({
             "max_resumes": effective_max,
-            "interval_ms": interval_ms,
-            "test_mode": test_mode,
+            "collect_mode": collect_mode,
+            "collect_minutes": int(collect_minutes) if collect_mode == "按时间采集" else 0,
             "request_resume_if_missing": request_resume_if_missing,
         })
         st.rerun()
@@ -252,6 +376,15 @@ with st.container(border=True):
     if btn_cols[3].button("停止", disabled=not is_running):
         bridge.stop_collect()
         st.rerun()
+    if btn_cols[4].button("打开简历目录", use_container_width=True):
+        settings = get_settings()
+        boss_save_dir = (settings.attachment_dir / "boss" / datetime.now().strftime("%Y%m%d")).resolve()
+        boss_save_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.startfile(str(boss_save_dir))
+        except Exception as exc:
+            st.error(f"打开目录失败：{exc}")
+            st.code(str(boss_save_dir))
 
     skip_counts = runtime.get("skip_reason_counts", {})
     if skip_counts:
@@ -259,7 +392,7 @@ with st.container(border=True):
 
     result_cols = st.columns([1.15, 1])
     with result_cols[0]:
-        st.markdown("**实时日志**")
+        render_result_title("实时日志", build_log_summary(runtime))
         logs = runtime.get("logs", [])
         if logs:
             log_html = ""
@@ -270,29 +403,39 @@ with st.container(border=True):
                 at = html.escape(entry.get("at", ""))
                 css_class = classify_boss_log(raw_msg, level)
                 log_html += f'<div class="{css_class}">[{at}] {msg}</div>'
-            st.markdown(f'<div class="boss-log-box">{log_html}</div>', unsafe_allow_html=True)
+            render_auto_scroll_html(f'<div class="boss-log-box">{log_html}</div>', "boss-log-bottom")
         else:
-            st.markdown('<div class="boss-log-box"><span style="color:#94A3B8">等待采集开始...</span></div>', unsafe_allow_html=True)
+            render_auto_scroll_html('<div class="boss-empty-box">等待采集开始...</div>', "boss-log-bottom")
 
     with result_cols[1]:
-        st.markdown("**候选人列表**")
+        render_result_title("候选人列表", build_candidate_summary(runtime))
         candidates = runtime.get("candidates", [])
         if candidates:
-            rows = []
-            for c in reversed(candidates[-30:]):
+            candidate_rows = ""
+            for c in candidates[-30:]:
                 sig = c.get("signature", "")
                 parts = sig.split("/")
-                rows.append({
-                    "姓名": parts[0] if len(parts) > 0 else "",
-                    "年龄": parts[1] if len(parts) > 1 else "",
-                    "学历": parts[2] if len(parts) > 2 else "",
-                    "状态": "已下载" if "download" in c.get("status", "") else "已跳过",
-                    "详情": c.get("file", "") or c.get("reason_text", "") or translate_boss_detail(c.get("reason", "")),
-                    "时间": c.get("at", ""),
-                })
-            st.dataframe(rows, use_container_width=True, hide_index=True, height=300)
+                status = "已下载" if "download" in c.get("status", "") else "已跳过"
+                status_class = "boss-candidate-status-downloaded" if status == "已下载" else "boss-candidate-status-skipped"
+                detail = c.get("file", "") or c.get("reason_text", "") or translate_boss_detail(c.get("reason", ""))
+                candidate_rows += (
+                    "<tr>"
+                    f"<td>{html.escape(parts[0] if len(parts) > 0 else '')}</td>"
+                    f"<td>{html.escape(parts[1] if len(parts) > 1 else '')}</td>"
+                    f"<td>{html.escape(parts[2] if len(parts) > 2 else '')}</td>"
+                    f"<td class=\"{status_class}\">{html.escape(status)}</td>"
+                    f"<td>{html.escape(detail)}</td>"
+                    f"<td>{html.escape(c.get('at', ''))}</td>"
+                    "</tr>"
+                )
+            table_html = (
+                '<div class="boss-candidate-box"><table class="boss-candidate-table">'
+                "<thead><tr><th>姓名</th><th>年龄</th><th>学历</th><th>状态</th><th>详情</th><th>时间</th></tr></thead>"
+                f"<tbody>{candidate_rows}</tbody></table></div>"
+            )
+            render_auto_scroll_html(table_html, "boss-candidate-bottom")
         else:
-            st.markdown('<div class="boss-log-box"><span style="color:#94A3B8">暂无候选人。采集后会自动出现在这里。</span></div>', unsafe_allow_html=True)
+            render_auto_scroll_html('<div class="boss-empty-box">暂无候选人。采集后会自动出现在这里。</div>', "boss-candidate-bottom")
 
 # --- History Tasks ---
 if not is_running:

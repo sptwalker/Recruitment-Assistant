@@ -1,5 +1,286 @@
 # 开发日志
 
+## 2026-05-17
+
+### V2.00 BOSS 采集流程定型 + HTML弹窗下载修复
+
+#### 已完成内容
+
+**流程定型（Python 端）：**
+
+- 日志精简：`manual_download_learning_success` 12行→2行、`learned_download_click_used` 7行→1行、5个纯诊断事件降级为 logger.debug 不再进 UI 实时日志
+- `resume_button_found` 仅"暗淡"状态进 UI 日志，"明亮"降级 debug
+- `resume_attachment_click_dispatched` 简化为单行摘要
+- 新增 `_on_task_finished(status)` 方法：任务结束时发送关闭弹窗指令、Chrome 下载目录对账、输出本轮采集指标汇总
+- 新增"打开简历目录"按钮（`08_BOSS采集.py`），复用智联采集页的 `os.startfile` 模式
+
+**HTML弹窗下载修复（content.js）：**
+
+- 问题：BOSS 附件简历的 HTML 弹窗（dom_text 形态）中，下载按钮 `use[xlink:href="#icon-attacthment-download"]` 无法被 `findBossSvgDownloadIcon` 识别，原因是 SVG 元素缺少 `boss-svg svg-icon` 类名导致 `isBossSvgDownloadDescriptor` 检查失败
+- 修复1：在 `findBossSvgDownloadIcon` 中增加 xlink:href 回退路径——当元素的 href/xlink:href 含 "download" 且位于 `attachment-resume-btns` 内时，绕过 `isBossSvgDownloadDescriptor` 和 `isStrictResumeActionArea` 的严格检查
+- 修复2：新增 `tryVueDirectDownload(target)` 函数——通过 Vue 组件实例 `__vue__.$parent.href` 直接提取下载 URL，用 `<a download>` 触发下载，彻底绕过合成事件无法触发 Vue 处理器的问题
+- 修复3：`clickBossSvgDownloadIcon` 优先尝试 Vue 直链下载，失败时回退 `clickElementReliably`
+- 诊断发现：`.click()` 和 `dispatchEvent(MouseEvent)` 均无法触发 BOSS 的 Vue 事件处理器，仅真实浏览器输入事件或直接调用下载 URL 有效
+
+**版本同步：**
+
+- `app/components/layout.py` APP_VERSION → V2.00
+- `recruitment_assistant/services/boss_ws_bridge.py` BOSS_BRIDGE_VERSION → 1.73.1
+- Chrome 扩展端版本未变（content.js 逻辑修改不涉及版本号协商）
+
+#### 扩展端清理待办（后续执行）
+
+- 删除 `results.downloaded` 字段（content.js:57，从未读取）
+- 删除 `emitResumePreviewDiagnostics`、`clickPointReliably`、`collectResumePreviewDiagnostics` 三个未调用函数
+- 删除 `emitAttachmentDebug` 空壳及其调用点
+- `candidateResourceIdMap.clear()` 在 stop_collect 分支补齐
+
+#### 长跑稳定性观察点
+
+- 每轮跑完读 `<run_id>_events.jsonl` 末尾的 `run_metrics_summary`
+- 关注 avg 下载时长是否随候选人数上升劣化
+- 关注"持久化拒绝"是否反复出现（hash/命名冲突）
+- 关注 Chrome 下载目录遗漏数是否非零（扩展 ack 链路偶发丢失）
+
+## 2026-05-16
+
+### V1.99 BOSS 下载失败手动示范学习
+
+#### 已完成内容
+
+- 实现自动下载失败后的手动示范学习流程：当 boss-svg、已学习按钮或通用自动下载点击后仍未触发 Chrome 下载事件时，内容脚本暂停采集并提示用户手动点击当前页面真实下载按钮。
+- 新增紫色实时日志提示：`无法触发下载按钮，请你手动点击下载按钮供系统分析学习。`
+- 用户手动点击后，系统捕获点击组件的 DOM 路径、描述、窗口相对坐标、iframe 相对坐标、iframe src 等信息，并等待 Chrome 下载完成事件确认该点击确实触发下载。
+- 下载确认成功后保存学习结果到浏览器 `localStorage`，后续候选人优先复用已学习下载按钮；实时日志输出：`刚才用户的手动点击 ... 完成下载，我已经记录了如下信息...`。
+- Chrome 后台将 `manual_user_click` 下载意图有效期扩展到 90 秒，避免用户手动操作耗时较长导致下载意图提前过期。
+
+- 同步版本：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.99`。
+  - `recruitment_assistant/services/boss_ws_bridge.py` BOSS 后端桥接版本更新为 `1.69.0`，期望扩展与内容脚本版本更新为 `1.65.0`。
+  - `chrome_extension/manifest.json` 与 `chrome_extension/background.js` 扩展版本更新为 `1.65.0`。
+  - `chrome_extension/content.js` 内容脚本版本更新为 `1.65.0`。
+
+### V1.98 BOSS 下载失败诊断与旧预览兜底
+
+#### 已完成内容
+
+- 针对叶宇琪、赵女士下载点击后无 Chrome 下载事件的问题，增加下载按钮候选与点击后诊断日志：记录首选按钮路径、描述、SVG/use 图标线索、相邻按钮、可见 iframe 与页面提示，便于确认 `popover icon-content` 是否真实下载按钮。
+- 针对简永杰、蔡金昌出现 PDF iframe 但被判定为 stale 的问题，增强旧预览关闭诊断：记录关闭按钮候选数量与剩余预览信息。
+- 加入旧预览兜底判断：当预览 fingerprint 未变化，但预览内容中的姓名/年龄与当前候选人匹配时，允许继续使用该预览进入下载链路，减少关闭旧预览失败导致的误跳过。
+- 后端实时日志显示关键诊断摘要，包括 boss-svg 命中路径、自动下载按钮路径、下载点击后 frame/toast 状态、旧预览 stale 判断结果。
+
+- 同步版本：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.98`。
+  - `recruitment_assistant/services/boss_ws_bridge.py` BOSS 后端桥接版本更新为 `1.68.0`，期望扩展与内容脚本版本更新为 `1.64.0`。
+  - `chrome_extension/manifest.json` 与 `chrome_extension/background.js` 扩展版本更新为 `1.64.0`。
+  - `chrome_extension/content.js` 内容脚本版本更新为 `1.64.0`。
+
+### V1.97 BOSS 下载控件识别与扫描统计修复
+
+#### 已完成内容
+
+- 收紧 BOSS 简历下载控件识别：`boss-svg` 下载图标只在简历弹窗的 `attachment-resume-btns`、`resume-footer`、`resume-detail` 等区域内匹配，避免误点右侧栏 `rightbar-item.add-to-label` 等非下载图标。
+- 加固通用下载按钮识别：排除 `rightbar`、`page-content`、聊天主容器等大面积非按钮节点，降低将页面容器误当下载按钮点击的概率。
+- 保留并强化点击真实交互父级的策略，优先点击 `icon-content`、`popover`、按钮等可交互节点。
+- 修复实时日志标题栏扫描人数比候选人列表少一人的问题：内容脚本上报 `scanned_count`，后端保存该字段，页面显示时优先使用明确扫描人数，并兼容候选人列表数量兜底。
+
+- 同步版本：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.97`。
+  - `recruitment_assistant/services/boss_ws_bridge.py` BOSS 后端桥接版本更新为 `1.67.0`，期望扩展与内容脚本版本更新为 `1.63.0`。
+  - `chrome_extension/manifest.json` 与 `chrome_extension/background.js` 扩展版本更新为 `1.63.0`。
+  - `chrome_extension/content.js` 内容脚本版本更新为 `1.63.0`。
+
+### V1.96 Streamlit / WebSocket 单实例启动保护
+
+#### 已完成内容
+
+- 修复重复启动两套 Streamlit / BOSS WebSocket 服务导致 `8765` 端口占用并触发 `[Errno 10048]` 的问题。
+- `scripts/run_streamlit.py` 启动前会检测 `8501` 与 `8765` 端口；只要发现页面服务或 BOSS WebSocket 已运行，就直接提示访问现有页面并阻止重复启动。
+- Streamlit 启动参数固定为 `--server.address 127.0.0.1 --server.port 8501`，减少访问地址和端口漂移。
+
+- 同步版本：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.96`。
+
+### V1.95 BOSS 下载候选人绑定防串档
+
+#### 已完成内容
+
+- 加固 Chrome 扩展下载事件与候选人绑定：为每次下载生成 `download_request_id`，内容脚本仅接受当前请求 ID 与当前轮次匹配的下载结果，避免上一位候选人的下载事件污染后一位候选人。
+- 将后台脚本的下载意图从单个 `lastDownloadIntent` 扩展为短时队列，下载事件绑定后立即消费；未匹配到下载意图的 Chrome 下载事件不再强行绑定到最近候选人。
+- 直接 PDF iframe 下载改为以 `chrome.downloads.download()` 回调返回的 `downloadId` 显式绑定，`downloads.onCreated` 发现已有绑定时不再覆盖候选人信息。
+- 点击附件简历前主动关闭旧简历预览，并在点击后只接受 fingerprint 变化的新预览，降低旧 PDF iframe / 旧弹窗污染后续候选人的风险。
+- 后端保存简历时增加本轮内容 hash 防串档兜底：同一份简历内容如果已归属其他候选人，本次保存会被拦截且不会计入下载。
+
+- 同步版本：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.95`。
+  - `recruitment_assistant/services/boss_ws_bridge.py` BOSS 后端桥接版本更新为 `1.65.0`。
+  - `chrome_extension/manifest.json` 与 `chrome_extension/background.js` 扩展版本更新为 `1.61.0`。
+  - `chrome_extension/content.js` 内容脚本版本更新为 `1.61.0`。
+
+### V1.94 BOSS 历史批次任务记录
+
+#### 已完成内容
+
+- 参考智联采集模块的 `CrawlTaskService` 方式，为 BOSS 采集建立历史批次任务记录。
+- BOSS 采集开始时自动创建 `platform_code="boss"` 的 `crawl_task` 记录，记录任务名称、任务类型、采集配置与目标下载份数。
+- BOSS 采集完成、停止、扩展断开或扩展错误时，自动更新历史任务状态、获取数量、跳过数量、完成时间与错误信息。
+- BOSS 简历保存时将当前历史任务 ID 写入 BOSS 候选人去重记录，便于候选人与批次任务关联追溯。
+- 优化页面底部 `BOSS直聘历史批次任务列表`：显示真实任务记录、中文状态、跳过数量、任务名称和错误信息。
+
+- 同步版本：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.94`。
+  - `recruitment_assistant/services/boss_ws_bridge.py` BOSS 后端桥接版本更新为 `1.64.0`。
+  - Chrome 扩展与内容脚本未修改，期望版本保持 `1.60.0`。
+
+### V1.93 BOSS 暗淡附件简历索要流程加固
+
+#### 已完成内容
+
+- 将 BOSS 采集页复选框 `需要时索要简历` 改名为 `索要简历`，保持配置字段 `request_resume_if_missing` 不变。
+- 暗淡 `附件简历` 按钮流程继续先检查聊天窗口是否存在 `简历请求已发送` 等已索要标记，命中时直接跳过，避免重复索要。
+- 加固自动索要简历结果判定：点击暗淡附件按钮并点击确认弹窗后，只有检测到新增 `简历请求已发送` 等文本时才上报 `resume_request_success` 并计入索要人数。
+- 新增 `resume_request_unconfirmed` 事件：区分“已点击确认但未检测到请求发送成功”和“未找到确认按钮”，页面候选人列表与实时日志同步显示明确原因。
+- 同步扩展版本，确保下一轮测试可识别浏览器实际加载的新内容脚本。
+
+- 同步版本：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.93`。
+  - `recruitment_assistant/services/boss_ws_bridge.py` BOSS 后端桥接版本更新为 `1.63.0`。
+  - `chrome_extension/manifest.json` 与 `chrome_extension/background.js` 扩展版本更新为 `1.60.0`。
+  - `chrome_extension/content.js` 内容脚本版本更新为 `1.60.0`。
+
+### V1.92 BOSS 结果窗口自动滚动加固与实时日志精简
+
+#### 已完成内容
+
+- 加固 `实时日志` 与 `候选人列表` 的自动滚动：不再依赖锚点相邻关系，改为在 iframe 内直接查找 `.boss-log-box` / `.boss-candidate-box` / `.boss-empty-box` 并滚动到底部，同时对候选人表格最后一行执行 `scrollIntoView()`。
+- 自动滚动增加多次延迟触发：`requestAnimationFrame`、50ms、200ms，避免 Streamlit iframe 内容尚未完成布局时滚动失效。
+- 根据本轮测试日志精简页面实时日志：隐藏下载链路中的 Chrome 后台请求/响应握手、PDF iframe 地址解析、直接下载创建等中间过程，只保留候选人识别、去重、附件按钮状态、预览识别、下载创建、保存和最终统计等关键信息。
+- 将 `最大采集数量` 调整为 `目标下载份数`，并将日志中的 `最大数量` 调整为 `目标下载数`，避免用户误解为最多扫描候选人数；当前逻辑是持续扫描，直到成功下载目标份数或任务结束。
+
+- 同步版本：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.92`。
+  - `recruitment_assistant/services/boss_ws_bridge.py` BOSS 后端桥接版本更新为 `1.62.0`。
+  - Chrome 扩展与内容脚本未修改，期望版本保持 `1.59.0`。
+
+### V1.91 BOSS 采集结果标题统计增强
+
+#### 已完成内容
+
+- `实时日志` 与 `候选人列表` 继续使用 iframe 内部容器自动滚动到底部，采集刷新时随最新输出自动定位。
+- `实时日志` 标题栏右侧新增扫描摘要：已扫描候选人数、已扫描耗时、每人平均耗时。
+- `候选人列表` 标题栏右侧新增结果摘要：已记录候选人数、跳过人数、去重跳过人数、索要简历人数、成功下载份数。
+- BOSS 后端运行状态新增 `resume_request_count`，在成功索要简历时累计，供页面标题统计和本轮摘要使用。
+
+- 同步版本：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.91`。
+  - `recruitment_assistant/services/boss_ws_bridge.py` BOSS 后端桥接版本更新为 `1.61.0`。
+  - Chrome 扩展与内容脚本未修改，期望版本保持 `1.59.0`。
+
+### V1.90 BOSS 日志窗口样式修复与耗时日志精简
+
+#### 已完成内容
+
+- 修复 `实时日志` 与 `候选人列表` 改为 `components.html()` 后样式丢失的问题：将日志/候选人列表所需 CSS 注入到 iframe 内部，恢复颜色、字号、固定高度和内部滚动条。
+- 修正自动滚动方式：改为滚动 iframe 内部的 `.boss-log-box` / `.boss-candidate-box` 容器，避免只滚动外层页面导致内部滚动条不可见。
+- 精简页面实时日志中的冗余调试信息，去掉候选人识别位置、DOM path、rect、具体下载链接、iframe src 等长文本。
+- 新增关键步骤耗时输出：候选人信息识别耗时、下载前去重检查耗时、附件简历按钮查找耗时，便于后续定位采集速度瓶颈。
+- 保留完整事件数据写入 `logs/boss_extension/YYYYMMDD/run_*.jsonl`，页面只显示适合观察流程的简洁日志。
+
+- 同步版本：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.90`。
+  - `recruitment_assistant/services/boss_ws_bridge.py` BOSS 后端桥接版本更新为 `1.60.0`。
+  - `chrome_extension/manifest.json` 与 `chrome_extension/background.js` 扩展版本更新为 `1.59.0`。
+  - `chrome_extension/content.js` 内容脚本版本更新为 `1.59.0`。
+
+### V1.89 BOSS 采集结果窗口自动滚动
+
+#### 已完成内容
+
+- 将 BOSS 采集页面的 `实时日志` 输出窗口改为自动滚动到最新日志，采集刷新时默认显示底部最新内容。
+- 将 `候选人列表` 从 `st.dataframe` 改为自定义滚动表格，按采集顺序展示并自动滚动到最新候选人。
+- 保留候选人列表 300px 高度、固定表头、下载/跳过状态颜色区分，减少长任务时手动滚动查看最新结果的操作。
+
+- 同步版本：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.89`。
+  - `recruitment_assistant/services/boss_ws_bridge.py` BOSS 后端桥接版本更新为 `1.59.0`。
+  - Chrome 扩展与内容脚本未修改，期望版本保持 `1.58.0`。
+
+### V1.88 BOSS 测试轮次模块版本日志
+
+#### 已完成内容
+
+- 每次重置 BOSS 测试轮次后，实时日志在 `新测试轮次已创建` 后立即输出模块版本信息。
+- 版本信息包含：页面版本、BOSS 后端桥接版本、期望 Chrome 扩展版本、期望内容脚本版本、当前已连接扩展版本。
+- 事件日志同步写入 `module_versions`，便于通过 `logs/boss_extension/YYYYMMDD/run_*.jsonl` 追溯测试时实际模块版本。
+- 扩展连接时输出当前扩展版本与期望版本；版本不匹配时提示在 `chrome://extensions/` 重新加载扩展。
+- 内容脚本启动采集时输出当前内容脚本版本、期望版本、下载前去重 key/签名数量和后端确认状态；版本不匹配时提示刷新 BOSS 页面。
+
+- 同步版本：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.88`。
+  - `chrome_extension/manifest.json` 与 `chrome_extension/background.js` 扩展版本更新为 `1.58.0`。
+  - `chrome_extension/content.js` 内容脚本版本更新为 `1.58.0`。
+  - `recruitment_assistant/services/boss_ws_bridge.py` BOSS 后端桥接版本更新为 `1.58.0`。
+
+### V1.87 BOSS 下载前去重未确认时强制阻断采集
+
+#### 已完成内容
+
+- 针对测试中后端运行实例未加载最新 `boss_ws_bridge.py`，导致前端收到的采集配置缺少 `boss_candidate_keys` / `boss_candidate_signatures` 的问题，增加前端强制保护。
+- 后端最新采集配置新增 `boss_pre_dedup_ready=True` 标记，表示下载前去重数据已由后端确认下发。
+- 内容脚本收到采集命令后，如果没有收到 `boss_pre_dedup_ready=True`，立即停止采集并输出错误：`BOSS 下载前去重数据未由后端确认下发，已阻止采集以避免重复下载；请重启后端服务后重试`。
+- 该保护可防止后端未重启或运行旧代码时，候选人继续进入附件按钮、PDF iframe 和 Chrome 下载链路。
+
+- 同步版本：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.87`。
+  - `chrome_extension/manifest.json` 与 `chrome_extension/background.js` 扩展版本更新为 `1.57.0`。
+  - `chrome_extension/content.js` 内容脚本版本更新为 `1.57.0`。
+
+### V1.86 BOSS 下载前去重诊断与强制签名拦截
+
+#### 已完成内容
+
+- BOSS 采集开始时，后端除下发 `boss_candidate_keys` 外，新增下发 BOSS 已入库候选人签名集合 `boss_candidate_signatures`。
+- 内容脚本在点击候选人并识别 `姓名/年龄/学历` 后，先执行下载前去重诊断，输出 `BOSS 下载前去重检查: 候选人；key=...；下发key=N 条；下发签名=M 条；key命中=True/False；签名命中=True/False`。
+- 下载前去重命中条件扩展为 `candidate_key` 命中或候选人签名命中，避免 JS/Python 归一化差异导致重复候选人进入 PDF iframe 下载链路。
+- 下载前去重未命中时，新增日志 `BOSS 下载前去重未命中，开始查找附件简历按钮: 候选人`，用于确认附件按钮状态判断一定发生在去重之后。
+- 内容脚本收到采集命令后输出版本和去重数据数量，便于确认浏览器实际加载的是最新扩展脚本。
+
+- 同步版本：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.86`。
+  - `chrome_extension/manifest.json` 与 `chrome_extension/background.js` 扩展版本更新为 `1.56.0`。
+  - `chrome_extension/content.js` 内容脚本版本更新为 `1.56.0`。
+
+### V1.85 BOSS 附件简历按钮明暗态流程修正
+
+#### 已完成内容
+
+- 将 BOSS 附件简历按钮状态统一清理为两类：`明亮`、`暗淡`，不再在附件按钮流程中使用“索要简历状态”。
+- 去重检查通过后，在右上角寻找“附件简历”按钮，并输出按钮状态日志：`附件简历按钮状态: 候选人；状态=明亮/暗淡`。
+- 暗淡按钮时先检查聊天窗口是否已有 `简历请求已发送`：有则直接跳过并输出 `跳过已索要简历的候选人xxx`。
+- 暗淡按钮且未发送过请求时，如果用户勾选“索要简历”，自动点击附件按钮并在弹窗点击确认，输出 `根据用户需求，将候选人xxx索要了简历`。
+- 暗淡按钮且用户未勾选索要简历时，直接跳过并输出 `跳过无简历候选人xxx`。
+- 明亮按钮时直接点击“附件简历”，继续进入 PDF iframe 弹窗识别和下载链路。
+
+- 同步版本：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.85`。
+  - `chrome_extension/manifest.json` 与 `chrome_extension/background.js` 扩展版本更新为 `1.55.0`。
+  - `chrome_extension/content.js` 内容脚本版本更新为 `1.55.0`。
+
+### V1.84 BOSS 下载前去重与真实下载统计
+
+#### 已完成内容
+
+- BOSS 采集开始时后端加载 `boss_candidate_record` 已有去重 key，并下发到 Chrome 内容脚本。
+- 内容脚本在点击候选人并从右侧顶部红框识别 `姓名/年龄/学历` 后，先按同一规则生成 BOSS 候选人 key；如果命中去重库，立即输出 `boss_dedup_hit` 跳过记录，不再点击“附件简历”、不再识别 PDF iframe、不再触发 Chrome 下载。
+- 修正候选人结果列表：下载前去重命中会记录为 `dedup_skipped`，并输出 `BOSS 下载前去重命中，跳过附件识别` 日志。
+- 修正完成统计：`collect_finished` 改用后端真实 `downloaded_count` 输出，只有简历成功复制到 `data/attachments/boss/YYYYMMDD/` 后才计入已下载；Chrome 下载完成但后端找不到归档文件时不再计入下载。
+- 任务完成摘要新增本轮新增去重数量。
+
+- 同步版本：
+  - `app/components/layout.py` 中 `APP_VERSION` 更新为 `V1.84`。
+  - `chrome_extension/manifest.json` 与 `chrome_extension/background.js` 扩展版本更新为 `1.54.0`。
+  - `chrome_extension/content.js` 内容脚本版本更新为 `1.54.0`。
+
 ## 2026-05-15
 
 ### V1.83 BOSS 去重入库成功日志
@@ -1265,3 +1546,36 @@ python scripts/capture_zhilian_manual_pages.py --account default --max-pages 5
 3. 实现字段解析：姓名、联系方式、城市、学历、工作经历、教育经历、期望薪资等。
 4. 将解析结果写入 `candidate`、`resume`、经历、技能等结构化表。
 5. 再开发列表页自动采集与附件下载。
+
+## 2026-05-17 BOSS 采集流程定型（bridge 1.73.0 / 页面 V2.00）
+
+经 23:50 批次实测 3/3 全部下载成功后，把流程"定型"为长期可跑状态。本轮只动 Python 端，扩展端清理另列待办。
+
+### Python 端落地
+- `boss_ws_bridge.py`
+  - `BOSS_BRIDGE_VERSION` → `1.73.0`
+  - 日志精简：`resume_attachment_click_dispatched` / `manual_download_learning_success` / `learned_download_click_used` 三个块从多行 UI 日志压成 1-2 行，详细字段降级到 `logger.debug`
+  - 诊断事件 `boss_svg_download_icon_scan_started` / `boss_svg_download_icon_not_found` / `download_button_candidates_detailed` / `download_click_post_diagnostics` / `stale_preview_close_diagnostics` 全部改为 `logger.debug`（仍写入 JSONL 事件日志，不进 UI 实时日志）
+  - 新增 `_on_task_finished(status)`，在 `collect_finished` 与 `error` 处理末尾调用，承担：
+    1. 向扩展下发 `close_all_resume_previews` 指令（扩展端待支持，先把命令发出去）
+    2. 扫描 `~/Downloads/Boss直聘/` 中 `mtime >= run_started_at` 且未在 `data/attachments/boss/YYYYMMDD/` 归档的 PDF，输出高亮提示
+    3. 计算并输出 `run_metrics_summary`（总耗时、avg/份、跳过分布、失败分布、Chrome 下载遗漏数），同时写入 JSONL 事件日志
+- `app/pages/08_BOSS采集.py`：按钮行从 4 列扩为 5 列，新增"打开简历目录"按钮（复用 `06_智联采集.py` 的 `os.startfile` 模式）
+- `app/components/layout.py`：`APP_VERSION` → `V2.00`
+
+### 扩展端清理待办（待解除限制后单独提交）
+- `chrome_extension/content.js`
+  - 删除 `results.downloaded` 字段（仅写未读）
+  - 删除未调用函数 `emitResumePreviewDiagnostics`、`clickPointReliably`、`collectResumePreviewDiagnostics`
+  - 删除空壳 `emitAttachmentDebug` 及其 6 个调用点
+  - 在 `stop_collect` 分支补齐 `candidateResourceIdMap.clear()`（与 `pendingPersistAcks` 一致）
+  - 增加 `close_all_resume_previews` 指令监听：收到后调一次 `forceRemoveStalePdfPreviewFrames("")`
+- `chrome_extension/background.js` / `manifest.json`：无需变更
+
+### 后续长跑观察点（埋点已落地）
+每轮跑完读 `<run_id>_events.jsonl` 末尾的 `run_metrics_summary`，关注：
+- avg 时长是否随候选人数上升而劣化（揣测：候选人列表滚动后 DOM 重渲变慢）
+- 失败分布中"持久化拒绝"是否反复出现（说明 hash 冲突 / 命名冲突没解决干净）
+- Chrome 下载目录遗漏数是否非零（说明扩展回传 ack 偶发丢失）
+
+攒 3-5 轮可看出趋势，下一轮针对性优化。

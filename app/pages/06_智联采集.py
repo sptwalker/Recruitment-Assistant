@@ -27,7 +27,7 @@ init_database()
 
 settings = get_settings()
 st.set_page_config(page_title="采集任务", layout="wide", initial_sidebar_state="collapsed")
-inject_vibe_style("采集任务")
+inject_vibe_style("智联招聘采集")
 page_header("采集任务", "创建、编辑并追踪招聘平台简历采集任务。")
 
 st.markdown(

@@ -28,7 +28,7 @@ init_database()
 settings = get_settings()
 st.set_page_config(page_title="采集任务", layout="wide", initial_sidebar_state="collapsed")
 inject_vibe_style("智联招聘采集")
-page_header("采集任务", "创建、编辑并追踪招聘平台简历采集任务。")
+page_header("智联招聘采集", "创建、执行并追踪智联招聘平台的简历采集任务。")
 
 st.markdown(
     """
@@ -62,10 +62,83 @@ st.markdown(
 .collect-running-text { color:#F59E0B; font-size:14px; font-weight:700; white-space:nowrap; }
 .collect-task-progress { color:#4A90E2; font-size:14px; font-weight:700; white-space:nowrap; }
 .collect-empty { color:#94A3B8; font-size:13px; }
+.zhilian-section-title { display:flex; align-items:baseline; gap:14px; flex-wrap:wrap; margin:14px 0 7px; padding:0 0 6px; border-bottom:2px solid #DDE7F2; color:#172033; font-size:22px; line-height:1.2; font-weight:900; letter-spacing:-.3px; background:transparent; }
+.zhilian-section-note { color:#B7791F; font-size:13px; font-weight:600; letter-spacing:0; }
+.zhilian-status-banner { min-height:84px; box-sizing:border-box; background:#FFFFFF; border:1px solid #EEF2F7; border-radius:12px; padding:10px 14px; display:flex; flex-direction:column; justify-content:center; gap:4px; overflow:hidden; }
+.zhilian-status-banner.one-line { flex-direction:row; align-items:center; justify-content:space-between; gap:8px; min-height:0; height:58px; }
+.zhilian-status-label { font-size:12px; color:#64748B; line-height:1.1; font-weight:600; letter-spacing:.2px; }
+.zhilian-status-value { font-size:20px; font-weight:900; color:#172033; line-height:1.2; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.zhilian-status-sub { font-size:13px; color:#475569; line-height:1.3; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.zhilian-status-banner-meta { gap:6px; padding:10px 14px; }
+.zhilian-meta-row { display:flex; align-items:baseline; justify-content:space-between; gap:10px; }
+.zhilian-meta-label { font-size:14px; font-weight:800; color:#172033; letter-spacing:.2px; }
+.zhilian-meta-value { font-size:12px; color:#475569; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.zhilian-status-on { color:#168A45; }
+.zhilian-status-off { color:#94A3B8; }
+.zhilian-status-login-on { color:#16A34A; }
+.zhilian-status-login-off { color:#B91C1C; }
+.zhilian-status-idle { color:#6EE7B7; }
+.zhilian-result-title { display:flex; align-items:center; justify-content:space-between; gap:10px; margin:0 0 8px; min-height:28px; }
+.zhilian-result-title strong { color:#172033; font-size:18px; line-height:1.2; font-weight:900; letter-spacing:-.2px; }
+.zhilian-result-title span { color:#4A90E2; font-size:13px; font-weight:700; line-height:1.25; text-align:right; }
 </style>
 """,
     unsafe_allow_html=True,
 )
+
+
+def section_title(title: str, note: str | None = None) -> None:
+    if note:
+        st.markdown(
+            f'<div class="zhilian-section-title"><span>{title}</span><span class="zhilian-section-note">{note}</span></div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(f'<div class="zhilian-section-title">{title}</div>', unsafe_allow_html=True)
+
+
+def render_result_title(title: str, summary: str) -> None:
+    st.markdown(
+        f'<div class="zhilian-result-title"><strong>{html.escape(title)}</strong><span>{html.escape(summary)}</span></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def format_zhilian_duration(seconds: float) -> str:
+    total_seconds = max(0, int(seconds))
+    minutes, sec = divmod(total_seconds, 60)
+    return f"{minutes}分{sec:02d}秒"
+
+
+def zhilian_run_elapsed_seconds(runtime_state: dict) -> float:
+    started_at = runtime_state.get("run_started_at") or ""
+    if not started_at:
+        return 0
+    try:
+        return max(0, (datetime.now() - datetime.fromisoformat(started_at)).total_seconds())
+    except ValueError:
+        return 0
+
+
+def build_zhilian_log_summary(runtime_state: dict) -> str:
+    candidates = runtime_state.get("candidates", []) or []
+    progress_scanned = int(runtime_state.get("scanned_count") or 0)
+    fallback_scanned = len(candidates)
+    scanned_count = max(progress_scanned, fallback_scanned)
+    elapsed_seconds = zhilian_run_elapsed_seconds(runtime_state)
+    avg_seconds = elapsed_seconds / scanned_count if scanned_count else 0
+    return f"已扫描{scanned_count}位候选人，已扫描{format_zhilian_duration(elapsed_seconds)}，每人平均耗时{avg_seconds:.1f}秒"
+
+
+def build_zhilian_candidate_summary(runtime_state: dict) -> str:
+    candidates = runtime_state.get("candidates", []) or []
+    skipped_count = int(runtime_state.get("skipped_count") or 0)
+    dedup_skipped = int(runtime_state.get("dedup_skipped_count") or 0)
+    resume_request_count = int(runtime_state.get("resume_request_count") or 0)
+    downloaded_count = sum(1 for c in candidates if c.get("简历文件名") and c.get("简历文件名") != "待识别")
+    if not downloaded_count:
+        downloaded_count = len(candidates)
+    return f"已记录{len(candidates)}位候选人，跳过{skipped_count}位候选人（其中去重{dedup_skipped}人），向{resume_request_count}位候选人索要了简历，成功下载{downloaded_count}份简历"
 
 
 def get_platform_collect_meta(target_site: str | None) -> dict:
@@ -91,6 +164,8 @@ def default_task_config() -> dict:
         "搜索时间分钟": None,
         "采集速度": "快速采集（5-15s间隔）",
         "每候选人最大等待秒数": 20,
+        "索要简历": False,
+        "request_resume_if_missing": False,
         "账号标识": "default",
         "间隔秒": "5-15",
         "任务状态": "等待启动",
@@ -842,60 +917,66 @@ def legacy_render_log_html() -> None:
 
 
 def render_task_editor(task_config: dict, login_states: dict[str, bool], disabled: bool = False) -> dict:
-    st.markdown('<div class="plain-section-title"><h3>当前采集任务</h3></div>', unsafe_allow_html=True)
-    task_banner = st.container(border=True)
-    with task_banner:
-        col1, col2, col3 = st.columns(3)
-        target_options = ["智联招聘"]
-        target_site = col1.selectbox(
-            "目标网站",
-            target_options,
-            index=target_options.index(task_config.get("目标网站", "智联招聘")) if task_config.get("目标网站", "智联招聘") in target_options else 0,
-            disabled=disabled,
-            key="collect_target_site",
-        )
-        target_mode = col2.radio(
-            "采集目标",
-            ["指定数量简历", "按时间采集"],
-            index=0 if task_config.get("采集目标", "指定数量简历") == "指定数量简历" else 1,
-            horizontal=True,
-            disabled=disabled,
-        )
-        speed_mode = col3.radio(
-            "采集速度",
-            ["快速采集（5-15s间隔）", "慢速采集（10-45s间隔）"],
-            index=0 if str(task_config.get("采集速度", "快速采集（5-15s间隔）")).startswith("快速") else 1,
-            horizontal=True,
-            disabled=disabled,
-        )
+    target_site = "智联招聘"
+    target_mode_options = ["指定数量简历", "按时间采集"]
+    speed_options = ["快速采集（5-15s间隔）", "慢速采集（10-45s间隔）"]
+    request_options = ["不索要", "索要"]
 
-        col4, col5, col6 = st.columns(3)
-        resume_count = int(task_config.get("简历数量") or 5)
-        search_minutes = int(task_config.get("搜索时间分钟") or 60)
-        per_candidate_wait_seconds = int(task_config.get("每候选人最大等待秒数") or task_config.get("每候选人等待秒数") or 20)
-        if target_mode == "指定数量简历":
-            resume_count = int(col4.number_input("简历数量", min_value=1, max_value=500, value=resume_count, step=1, disabled=disabled))
-            search_minutes_value = None
-        else:
-            search_minutes = int(col4.number_input("搜索时间（分钟）", min_value=10, max_value=900, value=search_minutes, step=10, disabled=disabled))
-            search_minutes_value = search_minutes
-            resume_count = settings.crawler_max_resumes_per_task
-        per_candidate_wait_seconds = int(col5.number_input("每候选人最大等待秒数", min_value=5, max_value=180, value=per_candidate_wait_seconds, step=5, disabled=disabled))
-        task_status = task_config.get("任务状态", "等待启动")
-        has_login_state = bool(login_states.get(target_site))
-        login_state_text = "已登录" if has_login_state else "未登录 / 请登录"
-        login_state_color = "#16A34A" if has_login_state else "#DC2626"
-        login_state_bg = "#E6F4EA" if has_login_state else "#FEE2E2"
-        login_state_border = "#BBF7D0" if has_login_state else "#FECACA"
-        zhilian_state = "已保存" if login_states.get("智联招聘") else "未保存"
-        col6.markdown(
-            f'<div class="collect-info-item" style="border-color:{login_state_border};background:{login_state_bg};">'
-            f'<div class="collect-info-label">当前平台登录态 / 任务状态</div>'
-            f'<div class="collect-info-value" style="font-size:13px;color:{login_state_color};">{target_site}：{login_state_text}</div>'
-            f'<div class="collect-info-value" style="font-size:12px;color:#6B7280;">智联招聘：{zhilian_state}</div>'
-            f'<div class="collect-info-value" style="font-size:13px;">{task_status}</div></div>',
-            unsafe_allow_html=True,
-        )
+    row = st.columns([1.05, 1, 1.25, 1, 1.05])
+    target_mode = row[0].selectbox(
+        "采集模式",
+        target_mode_options,
+        index=target_mode_options.index(task_config.get("采集目标", "指定数量简历"))
+        if task_config.get("采集目标", "指定数量简历") in target_mode_options
+        else 0,
+        disabled=disabled,
+    )
+    resume_count = int(task_config.get("简历数量") or 5)
+    search_minutes = int(task_config.get("搜索时间分钟") or 60)
+    if target_mode == "指定数量简历":
+        resume_count = int(row[1].number_input(
+            "目标数量（份）",
+            min_value=1,
+            max_value=500,
+            value=resume_count,
+            step=1,
+            disabled=disabled,
+        ))
+        search_minutes_value = None
+    else:
+        search_minutes = int(row[1].number_input(
+            "搜索时间（分钟）",
+            min_value=10,
+            max_value=900,
+            value=search_minutes,
+            step=10,
+            disabled=disabled,
+        ))
+        search_minutes_value = search_minutes
+        resume_count = settings.crawler_max_resumes_per_task
+    speed_mode = row[2].selectbox(
+        "采集速度",
+        speed_options,
+        index=0 if str(task_config.get("采集速度", "快速采集（5-15s间隔）")).startswith("快速") else 1,
+        disabled=disabled,
+    )
+    request_resume_default = bool(task_config.get("索要简历", task_config.get("request_resume_if_missing", False)))
+    request_resume_label = row[3].selectbox(
+        "索要简历",
+        request_options,
+        index=1 if request_resume_default else 0,
+        disabled=disabled,
+    )
+    request_resume_if_missing = request_resume_label == "索要"
+    per_candidate_wait_seconds = int(task_config.get("每候选人最大等待秒数") or task_config.get("每候选人等待秒数") or 20)
+    per_candidate_wait_seconds = int(row[4].number_input(
+        "每候选人最大等待秒数",
+        min_value=5,
+        max_value=180,
+        value=per_candidate_wait_seconds,
+        step=5,
+        disabled=disabled,
+    ))
 
     updated_task = {
         **task_config,
@@ -905,6 +986,8 @@ def render_task_editor(task_config: dict, login_states: dict[str, bool], disable
         "搜索时间分钟": search_minutes_value,
         "采集速度": speed_mode,
         "每候选人最大等待秒数": per_candidate_wait_seconds,
+        "索要简历": request_resume_if_missing,
+        "request_resume_if_missing": request_resume_if_missing,
         "账号标识": task_config.get("账号标识") or "default",
         "间隔秒": "5-15" if speed_mode.startswith("快速") else "10-45",
     }
@@ -1172,6 +1255,8 @@ def run_collect_task(task_config: dict, runtime: dict | None = None) -> None:
             }.get(skip_stage, skip_stage)
             runtime["skipped_count"] = int(runtime.get("skipped_count") or 0) + 1
             skipped_count = runtime["skipped_count"]
+            if skip_stage in {"before_download_profile", "before_click_signature", "duplicate_content_hash"}:
+                runtime["dedup_skipped_count"] = int(runtime.get("dedup_skipped_count") or 0) + 1
             log_event(
                 "candidate",
                 "skip",
@@ -1189,6 +1274,8 @@ def run_collect_task(task_config: dict, runtime: dict | None = None) -> None:
                 status = str(message.get("status") or "")
                 cost_ms = message.get("cost_ms")
                 wait_ms = message.get("wait_ms")
+                if stage == "attachment" and action == "request_wait" and status == "ready":
+                    runtime["resume_request_count"] = int(runtime.get("resume_request_count") or 0) + 1
                 if stage == "candidate" and action == "summary" and cost_ms is not None:
                     runtime.setdefault("performance_candidates", []).append({
                         "status": status,
@@ -1257,6 +1344,7 @@ def run_collect_task(task_config: dict, runtime: dict | None = None) -> None:
             "wait_seconds": run_seconds,
             "per_candidate_wait_seconds": per_candidate_wait,
             "min_download_interval_seconds": min_download_interval,
+            "request_resume_if_missing": bool(task_config.get("索要简历", task_config.get("request_resume_if_missing", False))),
             "on_resume_saved": on_resume_saved,
             "on_resume_skipped": on_resume_skipped,
             "should_continue": should_pause_or_stop,
@@ -1277,6 +1365,8 @@ def run_collect_task(task_config: dict, runtime: dict | None = None) -> None:
 
         if "on_resume_skipped" not in collect_signature.parameters:
             collect_kwargs.pop("on_resume_skipped", None)
+        if "request_resume_if_missing" not in collect_signature.parameters:
+            collect_kwargs.pop("request_resume_if_missing", None)
         if "min_download_interval_seconds" not in collect_signature.parameters:
             collect_kwargs.pop("min_download_interval_seconds", None)
         if "should_continue" not in collect_signature.parameters:
@@ -1405,6 +1495,40 @@ def run_collect_task(task_config: dict, runtime: dict | None = None) -> None:
         runtime["ui_refresh_requested"] = True
 
 
+def run_login_only_task(account_name: str, runtime: dict) -> None:
+    """仅打开浏览器完成登录并保存登录态，不进入采集循环。"""
+    try:
+        platform_meta, adapter = create_platform_adapter("智联招聘", account_name)
+    except Exception as exc:
+        append_collect_log(f"登录初始化失败：{exc}")
+        runtime["login_busy"] = False
+        runtime["status_dirty"] = True
+        runtime["ui_refresh_requested"] = True
+        return
+    platform_code = platform_meta["code"]
+    platform_name = platform_meta["name"]
+    try:
+        runtime["login_busy"] = True
+        append_collect_log(f"正在打开{platform_name}登录页面，请在浏览器中完成登录...")
+        adapter.login_manually(wait_seconds=900, keep_open=False)
+        st.session_state[f"{platform_code}_login_status_{account_name}"] = "已登录"
+        append_collect_log(f"{platform_name}登录态已保存。")
+    except Exception as exc:
+        append_collect_log(f"登录失败：{exc}")
+        st.session_state[f"{platform_code}_login_status_{account_name}"] = "未登录或已失效"
+    finally:
+        runtime["login_busy"] = False
+        runtime["status_dirty"] = True
+        runtime["ui_refresh_requested"] = True
+
+
+def start_login_only_task(account_name: str, runtime: dict) -> None:
+    runtime["login_busy"] = True
+    runtime["status_dirty"] = True
+    thread = threading.Thread(target=run_login_only_task, args=(account_name, runtime), daemon=True)
+    thread.start()
+
+
 def start_collect_task(task_config: dict, runtime: dict) -> None:
     task_to_run = {**task_config, "任务状态": "运行中"}
     runtime["running"] = True
@@ -1415,6 +1539,9 @@ def start_collect_task(task_config: dict, runtime: dict) -> None:
     runtime["scanned_count"] = 0
     runtime["skipped_count"] = 0
     runtime["download_failed_count"] = 0
+    runtime["resume_request_count"] = 0
+    runtime["dedup_skipped_count"] = 0
+    runtime["run_started_at"] = datetime.now().isoformat(timespec="seconds")
     runtime["last_heartbeat_at"] = time.monotonic()
     runtime["last_log_at"] = 0.0
     runtime["last_log_count"] = 0
@@ -1432,11 +1559,11 @@ def start_collect_task(task_config: dict, runtime: dict) -> None:
 init_state()
 runtime = sync_runtime_to_session()
 pending_task = st.session_state.get("pending_collect_task") or default_task_config()
+pending_task["目标网站"] = "智联招聘"
 account_name = pending_task.get("账号标识") or "default"
 login_states = get_platform_login_states(account_name)
-current_target_site = pending_task.get("目标网站") or "智联招聘"
-has_login_state = bool(login_states.get(current_target_site))
-start_label = f"开始{current_target_site}任务" if has_login_state else f"登录并开始{current_target_site}任务"
+has_login_state = bool(login_states.get("智联招聘"))
+login_busy = bool(runtime.get("login_busy"))
 
 if runtime.pop("ui_refresh_requested", False):
     sync_runtime_to_session()
@@ -1449,74 +1576,146 @@ if collect_action_feedback:
 if st.session_state.pop("auto_start_collect_task", False) and not runtime.get("running"):
     start_collect_task(pending_task, runtime)
     st.rerun()
-pending_task = render_task_editor(pending_task, login_states, disabled=is_running)
-current_target_site = pending_task.get("目标网站") or "智联招聘"
-has_login_state = bool(login_states.get(current_target_site))
-start_label = f"开始{current_target_site}任务" if has_login_state else f"登录并开始{current_target_site}任务"
 
-b1, b2, b3, b4, b5, b6 = st.columns(6)
-with b1:
-    if st.button(start_label, type="primary", use_container_width=True, disabled=is_running):
+# --- 初始化状态 ---
+section_title("初始化状态")
+with st.container(border=True):
+    last_log = (runtime.get("logs") or [])[-1] if runtime.get("logs") else ""
+    last_log_at = ""
+    if last_log:
+        match = re.match(r"^\[(\d{2}:\d{2}:\d{2})\]", last_log)
+        if match:
+            last_log_at = match.group(1)
+    task_status_text = pending_task.get("任务状态") or "等待启动"
+
+    status_cols = st.columns([1.6, 1.6, 1.4])
+    if has_login_state:
+        login_value = "已保存"
+        login_sub = "登录态已保存，可直接采集"
+        login_value_class = "zhilian-status-login-on"
+    else:
+        login_value = "未保存"
+        login_sub = "请点击下方按钮完成登录"
+        login_value_class = "zhilian-status-login-off"
+    status_cols[0].markdown(
+        f'<div class="zhilian-status-banner"><div class="zhilian-status-label">登录态</div><div class="zhilian-status-value {login_value_class}">{html.escape(login_value)}</div><div class="zhilian-status-sub">{html.escape(login_sub)}</div></div>',
+        unsafe_allow_html=True,
+    )
+    if login_busy:
+        run_value = "登录中"
+        run_sub = "正在等待用户在浏览器完成登录"
+        run_class = "zhilian-status-on"
+    elif is_running:
+        run_value = "采集中"
+        run_sub = task_status_text
+        run_class = "zhilian-status-on"
+    else:
+        run_value = task_status_text
+        run_sub = "无活动任务"
+        run_class = "zhilian-status-idle" if run_value == "等待启动" else "zhilian-status-off"
+    status_cols[1].markdown(
+        f'<div class="zhilian-status-banner"><div class="zhilian-status-label">运行状态</div><div class="zhilian-status-value {run_class}">● {html.escape(run_value)}</div><div class="zhilian-status-sub">{html.escape(run_sub)}</div></div>',
+        unsafe_allow_html=True,
+    )
+    status_cols[2].markdown(
+        f'<div class="zhilian-status-banner zhilian-status-banner-meta">'
+        f'<div class="zhilian-meta-row"><span class="zhilian-meta-label">平台</span><span class="zhilian-meta-value">智联招聘</span></div>'
+        f'<div class="zhilian-meta-row"><span class="zhilian-meta-label">页面版本</span><span class="zhilian-meta-value">{html.escape(APP_VERSION)}</span></div>'
+        f'<div class="zhilian-meta-row"><span class="zhilian-meta-label">最近事件</span><span class="zhilian-meta-value">{html.escape(last_log_at or "-")}</span></div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    action_cols = st.columns([1.6, 1.6, 1.4])
+    login_btn_label = "登录并保存登录态" if not has_login_state else "已保存登录态"
+    if action_cols[0].button(
+        login_btn_label,
+        type="primary" if not has_login_state else "secondary",
+        disabled=has_login_state or is_running or login_busy,
+        use_container_width=True,
+    ):
+        start_login_only_task(account_name, runtime)
+        st.rerun()
+    action_cols[1].link_button("打开智联登录页", "https://passport.zhaopin.com/", use_container_width=True)
+    if action_cols[2].button("重新校验登录态", disabled=is_running or login_busy, use_container_width=True):
+        try:
+            _, adapter = create_platform_adapter("智联招聘", account_name)
+            verified = check_login_state(adapter, verify=True)
+            append_collect_log("登录态校验通过。" if verified else "登录态校验未通过，请重新登录。")
+        except Exception as exc:
+            append_collect_log(f"登录态校验异常：{exc}")
+        st.rerun()
+
+# --- 采集与结果 ---
+section_title("采集与结果", "注意：自动保存简历前请在 Chrome 设置中关闭\"下载前询问每个文件的保存位置\"")
+with st.container(border=True):
+    pending_task = render_task_editor(pending_task, login_states, disabled=is_running)
+
+    btn_cols = st.columns([1.1, 1, 1, 1.1, 1.1, 1.1])
+    if btn_cols[0].button(
+        "开始采集任务",
+        type="primary",
+        disabled=is_running or login_busy or not has_login_state,
+        use_container_width=True,
+    ):
         start_collect_task(pending_task, runtime)
         st.rerun()
-with b2:
     pause_label = "继续任务" if runtime.get("paused") else "暂停任务"
-    if st.button(pause_label, use_container_width=True, disabled=not runtime.get("running")):
+    if btn_cols[1].button(pause_label, use_container_width=True, disabled=not runtime.get("running")):
         runtime["paused"] = not runtime.get("paused")
         runtime["task_config"] = {**pending_task, "任务状态": "已暂停" if runtime["paused"] else "运行中"}
         append_collect_log("任务已暂停。" if runtime["paused"] else "任务已继续。")
         st.rerun()
-with b3:
-    if st.button("停止任务", use_container_width=True, disabled=not runtime.get("running")):
+    if btn_cols[2].button("停止任务", use_container_width=True, disabled=not runtime.get("running")):
         runtime["stopped"] = True
         runtime["paused"] = False
         runtime["task_config"] = {**pending_task, "任务状态": "正在停止"}
         append_collect_log("已请求停止任务；当前浏览器操作结束后停止。")
         st.rerun()
-with b4:
-    if st.button("打开简历目录", use_container_width=True):
-        open_platform_meta = get_platform_collect_meta(pending_task.get("目标网站"))
-        resume_dir = (settings.attachment_dir / open_platform_meta["code"]).resolve()
+    if btn_cols[3].button("打开简历目录", use_container_width=True):
+        resume_dir = (settings.attachment_dir / "zhilian").resolve()
         resume_dir.mkdir(parents=True, exist_ok=True)
         try:
             os.startfile(resume_dir)
-            append_collect_log(f"已打开{open_platform_meta['name']}简历目录：{resume_dir}")
+            append_collect_log(f"已打开智联招聘简历目录：{resume_dir}")
         except Exception as exc:
             append_collect_log(f"打开简历目录失败：{exc}；目录路径：{resume_dir}")
             st.code(str(resume_dir))
-with b5:
-    if st.button("清空任务记录", use_container_width=True, disabled=runtime.get("running", False)):
+    if btn_cols[4].button("清空任务记录", use_container_width=True, disabled=runtime.get("running", False)):
         runtime["logs"] = []
         runtime["candidates"] = []
         runtime["task_config"] = default_task_config()
         sync_runtime_to_session()
         st.rerun()
-with b6:
-    if st.button("清空去重索引", use_container_width=True, disabled=runtime.get("running", False)):
-        clear_platform_meta = get_platform_collect_meta(pending_task.get("目标网站"))
-        clear_platform_code = clear_platform_meta["code"]
-        clear_platform_name = clear_platform_meta["name"]
+    if btn_cols[5].button("清空去重记录", use_container_width=True, disabled=runtime.get("running", False)):
         with create_session() as session:
             before_count = session.scalar(
                 select(func.count())
                 .select_from(platform_candidate_record)
-                .where(platform_candidate_record.c.platform_code == clear_platform_code)
+                .where(platform_candidate_record.c.platform_code == "zhilian")
             ) or 0
-            session.execute(delete(platform_candidate_record).where(platform_candidate_record.c.platform_code == clear_platform_code))
+            session.execute(delete(platform_candidate_record).where(platform_candidate_record.c.platform_code == "zhilian"))
             session.commit()
         feedback_message = f"清空去重索引成功：删除 {before_count} 条索引记录。"
-        append_collect_log(f"已清空{clear_platform_name}下载前个人信息去重库：删除 {before_count} 条索引记录。")
+        append_collect_log(f"已清空智联招聘下载前个人信息去重库：删除 {before_count} 条索引记录。")
         st.session_state.collect_action_feedback = feedback_message
         st.rerun()
 
-render_auto_status_and_candidates_panel(pending_task)
+    result_cols = st.columns([1.15, 1])
+    with result_cols[0]:
+        render_result_title("实时日志", build_zhilian_log_summary(runtime))
+        render_live_log_panel()
+    with result_cols[1]:
+        render_result_title("候选人列表", build_zhilian_candidate_summary(runtime))
+        render_candidate_table()
 
+# --- History Tasks ---
 if not runtime.get("running"):
-    history_platform_meta = get_platform_collect_meta(pending_task.get("目标网站"))
-    render_history_task_table(history_platform_meta["code"], history_platform_meta["name"])
+    render_history_task_table("zhilian", "智联招聘")
 
-if runtime.get("running"):
-    st.caption("任务正在后台执行。任务输出窗口会自动刷新并滚动到底部，不会刷新整个页面框架。")
+if runtime.get("running") or login_busy:
+    time.sleep(2)
+    st.rerun()
 elif runtime.pop("needs_status_refresh", False):
     st.caption("任务状态已更新，任务输出窗口会自动同步最新日志。")
 

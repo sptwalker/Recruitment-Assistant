@@ -2,6 +2,89 @@
 
 ## 2026-05-17
 
+### V2.02 智联招聘采集页重构
+
+#### 已完成内容
+
+**页面布局重写为两栏（仿 BOSS 直聘采集页风格）：**
+
+- 头部标题改为"智联招聘采集"，副标题"创建、执行并追踪智联招聘平台的简历采集任务"
+- 第一栏"初始化状态"：
+  - 三栏布局：登录态 banner / 运行状态 banner / 平台信息 banner（合并平台名/页面版本/最近事件）
+  - 登录态"已保存"绿色（#16A34A），"未保存"深红（#B91C1C）；运行状态"等待启动"淡绿（#6EE7B7），"采集中/登录中"深绿（#168A45）
+  - 操作按钮三列：登录并保存登录态（有登录态时禁用） / 打开智联登录页（外链）/ 重新校验登录态
+  - 移除"目标网站选择"控件（智联页默认且唯一）
+- 第二栏"采集与结果"：
+  - 参数行 5 列：采集模式（下拉）/ 目标数量或搜索时间（数字输入）/ 采集速度（下拉）/ 索要简历（下拉）/ 每候选人最大等待秒数（数字输入）
+  - 按钮行 6 列：开始采集任务（无登录态禁用）/ 暂停 / 停止 / 打开简历目录 / 清空任务记录 / 清空去重记录
+  - 双栏结果区参考 BOSS 页：左 1.15 实时日志、右 1 候选人列表，title 字号 18px 黑体，副标题为蓝色统计文案
+- 实时日志副标题：`已扫描N位候选人，已扫描M分SS秒，每人平均耗时X.Xs`
+- 候选人列表副标题：`已记录N位候选人，跳过M位候选人（其中去重K人），向J位候选人索要了简历，成功下载D份简历`
+
+**新增"登录态独立按钮"流程：**
+
+- 新增 `run_login_only_task` / `start_login_only_task`：单独打开浏览器走 `adapter.login_manually(wait_seconds=900)`，登录态保存后即结束
+- runtime 增加 `login_busy` 标志位，区别于 `running`，UI 期间会显示"登录中"
+- 登录态判定保留旧的 `check_login_state(verify=False)` 文件存在判定，新增"重新校验登录态"按钮按需走 headless 验证
+
+**"索要简历"开关贯通三层：**
+
+- UI 默认值 `False`（与 BOSS 页一致）
+- `auto_click_chat_attachment_resumes` 新增形参 `request_resume_if_missing: bool = False`；遇到"索要附件简历"按钮可点击但开关关闭时，将 `request_button_state` 强制改写为 `disabled` 复用既有跳过链路
+- `collect_kwargs` 透传该参数，并加 `inspect.signature` 兼容判断防止旧版本 adapter 出现 TypeError
+
+**新增 runtime 计数：**
+
+- `run_started_at`：start_collect_task 写入，供 summary 计算耗时
+- `resume_request_count`：on_diagnostic 看到 `attachment.request_wait status=ready` 时增计
+- `dedup_skipped_count`：on_resume_skipped 命中 `before_download_profile` / `before_click_signature` / `duplicate_content_hash` 时增计
+
+**版本同步：**
+
+- 仅 UI / Python 后端调整，未涉及扩展端代码与契约版本
+
+### V2.01 任务初始化/结束语义完善 + HTML弹窗selector固化
+
+#### 已完成内容
+
+**Python 端（boss_ws_bridge.py）：**
+
+- 新增 `_log_task_initialization(config, collect_mode, collect_minutes)`：采集开始时输出 9 行任务初始化信息块（执行日期 / 运行 ID / 任务目标 / 配置 / 去重基线 / 版本四件套 / 当前会话），并写 `boss_task_initialization_logged` 事件
+- `collect_finished` 处理器区分三种结束语义：`success`（达成目标）/ `partial`（候选人列表已逛完但未达目标）/ `cancelled`（用户手动停止），不再把 5/10 这种欠完成情况误标 success
+- 结束日志改为"采集结束：{原因}（n/m，达成率 X%）"格式，没有目标数时回退到旧格式
+- 指标块增强：增加"结束原因"行；下载行加 `下载=N/M（达成率 X%）`；跳过分布按业务语义合并（去重命中 / 待候选人上传 / 索要未确认 / 无附件且未索要 / 未识别 / 其他），不再直接显示扩展端的英文 reason；`download_failed` 类从"跳过"挪到独立"失败"行
+- 仅 `partial` 状态时打印针对性 warning 提示（去重命中过半 → 建议刷新列表；待候选人上传过半 → 建议等几小时再来）
+- Chrome 下载目录对账遗漏文件由 `highlight` 升级为 `warning` 级别，以 `├─/└─` 树形列出，超过 10 个折叠
+
+**Chrome 扩展端（content.js）：**
+
+- 把 HTML 弹窗形态的下载控件特征固化进自动查找链：`findBossSvgDownloadIcon` selector 集合追加 `span.card-btn, [class*='card-btn']`，并增加硬性过滤要求 descriptor 命中 `card-btn` + 文案命中"附件简历/下载" + 位于弹窗容器内（`[class*='preview/dialog/modal/drawer/popup/layer']` 或 `[role='dialog']`），命中给 +30 评分
+- `findDownloadButton` 评分块同步加 `card-btn` + "附件简历/下载" 文案命中 +24 评分作为兜底
+- 这条规则来自 2026-05-17 宗绪杰候选人 HTML 弹窗形态首次自动失败后用户手动点学到的特征（`SPAN, descriptor: 点击预览附件简历 card-btn card-btn`），固化进代码后不再依赖 localStorage 跨机器/跨用户共享
+- 弹窗容器约束防止聊天列表中同名 class 误中
+
+**实战验证（任务 #93，目标 15 份）：**
+
+- 达成率 15/15 = 100%，平均 3.4s/份（V2.00 长跑批 ~9.2s/份的 2.7 倍）
+- 全部下载策略 `pdf_iframe_direct`，零次学习触发，零次人工介入
+- 跳过分布：待候选人上传 9 + 无附件且未索要 9（业务正常）
+- Chrome 下载目录对账无遗漏
+
+**版本同步：**
+
+- `recruitment_assistant/services/boss_ws_bridge.py` BOSS_BRIDGE_VERSION → 1.74.0；期望扩展 → 1.67.0；期望内容脚本 → 1.68.0
+- `chrome_extension/manifest.json` 扩展版本 → 1.67.0
+- `chrome_extension/content.js` CONTENT_SCRIPT_VERSION → 1.68.0
+- `app/components/layout.py` APP_VERSION 保持 V2.00（页面行为未变）
+
+#### 未实战验证 / 后续观察点
+
+- 新加的 `card-btn` HTML 弹窗 selector：本轮 15 份全部命中 PDF-iframe 形态，没机会验证。下次遇到 `dom_text` 来源的候选人时确认是否自动通过，不再触发学习
+- 候选人列表懒加载：`content.js` 行 2082 `getCandidateItems()` 仍只取一次快照，列表只有 N 个 DOM 节点扫完即退出。本轮没复发是因为去重基线低，可下载候选人足够覆盖目标。当去重数据库继续增长、单屏可下载候选人少于目标时会再次跑成 `partial`，届时需要在 collectLoop 里加滚动加载
+- "新窗口"形态从未在生产日志出现，manifest 当前不匹配新标签页，遇到再评估
+
+## 2026-05-17
+
 ### V2.00 BOSS 采集流程定型 + HTML弹窗下载修复
 
 #### 已完成内容

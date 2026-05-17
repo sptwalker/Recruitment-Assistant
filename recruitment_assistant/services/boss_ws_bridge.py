@@ -20,9 +20,9 @@ from recruitment_assistant.utils.hash_utils import text_hash
 from recruitment_assistant.utils.snapshot_utils import safe_filename
 
 
-BOSS_BRIDGE_VERSION = "1.73.1"
-BOSS_EXTENSION_EXPECTED_VERSION = "1.66.0"
-BOSS_CONTENT_SCRIPT_EXPECTED_VERSION = "1.67.0"
+BOSS_BRIDGE_VERSION = "1.74.0"
+BOSS_EXTENSION_EXPECTED_VERSION = "1.67.0"
+BOSS_CONTENT_SCRIPT_EXPECTED_VERSION = "1.68.0"
 
 
 class BossWSBridge:
@@ -162,6 +162,55 @@ class BossWSBridge:
             self.runtime_state["task_status"] = "create_failed"
             self._log("warning", f"BOSS 历史批次任务创建失败: {exc}")
 
+    def _log_task_initialization(self, config: dict, collect_mode: str, collect_minutes: int) -> None:
+        """采集开始时输出任务初始化信息块，便于事后追溯任务上下文。"""
+        try:
+            now = datetime.now()
+            task_id = self.runtime_state.get("task_id")
+            run_id = self.runtime_state.get("run_id", "")
+            max_resumes = int(config.get("max_resumes") or 0)
+            interval_ms = config.get("interval_ms", config.get("scan_interval_ms", ""))
+            request_resume = bool(config.get("request_resume_if_missing"))
+            test_mode = config.get("test_mode")
+            test_mode_label = test_mode if test_mode not in (None, "", False) else "正式"
+            key_count = len(config.get("boss_candidate_keys") or [])
+            signature_count = len(config.get("boss_candidate_signatures") or [])
+            ext_version = self.runtime_state.get("extension_version") or "未连接"
+
+            if collect_mode == "按时间采集":
+                target_text = f"按时间采集 {collect_minutes} 分钟"
+            else:
+                target_text = f"{max_resumes} 份简历" if max_resumes else "未指定"
+
+            interval_text = f"{interval_ms}ms" if interval_ms not in ("", None) else "默认"
+            task_label = f"#{task_id}" if task_id else "未创建"
+
+            self._log("highlight", f"━━━ 任务初始化 {task_label} ━━━")
+            self._log("highlight", f"执行日期：{now.strftime('%Y-%m-%d %H:%M:%S')}")
+            self._log("highlight", f"运行 ID：{run_id}")
+            self._log("highlight", f"任务目标：{target_text}（test_mode={test_mode_label}）")
+            self._log("highlight", f"配置：request_resume_if_missing={request_resume}；扫描间隔={interval_text}")
+            self._log("highlight", f"去重基线：{key_count} 条 key / {signature_count} 条签名")
+            self._log("highlight", f"版本：页面 {APP_VERSION} / 桥接 {BOSS_BRIDGE_VERSION} / 扩展 {BOSS_EXTENSION_EXPECTED_VERSION} / 脚本 {BOSS_CONTENT_SCRIPT_EXPECTED_VERSION}")
+            self._log("highlight", f"当前会话：扩展已连接 {ext_version}")
+            self._log("highlight", "━━━━━━━━━━━━━━━━━━━━")
+
+            self._write_event_log("boss_task_initialization_logged", {
+                "task_id": task_id,
+                "run_id": run_id,
+                "max_resumes": max_resumes,
+                "collect_mode": collect_mode,
+                "collect_minutes": collect_minutes,
+                "interval_ms": interval_ms,
+                "request_resume_if_missing": request_resume,
+                "test_mode": test_mode_label,
+                "key_count": key_count,
+                "signature_count": signature_count,
+                "extension_version": ext_version,
+            })
+        except Exception as exc:
+            self._log("warning", f"输出任务初始化信息块失败：{exc}")
+
     def _finish_crawl_task(self, status: str, error_message: str | None = None) -> None:
         task_id = self.runtime_state.get("task_id")
         if not task_id or self.runtime_state.get("task_status") not in {"running", "create_failed"}:
@@ -243,10 +292,14 @@ class BossWSBridge:
                         except OSError:
                             missed_files.append((pdf.resolve(), 0))
             if missed_files:
-                self._log("highlight", f"⚠ Chrome 下载目录有 {len(missed_files)} 个未归档的 BOSS PDF：")
-                for idx, (path, size) in enumerate(missed_files[:10], 1):
+                self._log("warning", f"⚠ Chrome 下载目录有 {len(missed_files)} 个未归档的 BOSS PDF：")
+                shown = missed_files[:10]
+                for idx, (path, size) in enumerate(shown, 1):
                     kb = size / 1024 if size else 0
-                    self._log("highlight", f"  {idx}) {path} ({kb:.1f} KB)")
+                    branch = "└─" if idx == len(shown) and len(missed_files) <= 10 else "├─"
+                    self._log("warning", f"  {branch} {path.name}（{kb:.1f} KB）")
+                if len(missed_files) > 10:
+                    self._log("warning", f"  └─ 另有 {len(missed_files) - 10} 个未列出，详见运行日志 jsonl")
             else:
                 self._log("info", "Chrome 下载目录已与归档目录对账完成（无遗漏）")
         except Exception as exc:
@@ -263,36 +316,84 @@ class BossWSBridge:
                     elapsed_sec = 0.0
             downloaded = int(self.runtime_state.get("downloaded_count", 0) or 0)
             skipped = int(self.runtime_state.get("skipped_count", 0) or 0)
+            target = int(self.runtime_state.get("task_planned_count") or 0)
+            achievement_pct = round(downloaded / target * 100, 1) if target else 0.0
             avg_per_download = (elapsed_sec / downloaded) if downloaded else 0.0
             skip_reason_counts = dict(self.runtime_state.get("skip_reason_counts", {}) or {})
+
+            # 跳过分布按业务语义合并
+            skip_groups_def: list[tuple[str, list[str]]] = [
+                ("去重命中", ["boss_dedup_hit", "duplicate_in_run"]),
+                ("待候选人上传", ["resume_request_already_sent", "resume_requested_by_user"]),
+                ("索要未确认", ["resume_request_unconfirmed"]),
+                ("无附件且未索要", ["no_resume_attachment"]),
+                ("未识别", ["candidate_info_unrecognized"]),
+            ]
+            failure_keys = {"download_failed", "download_button_not_found", "resume_preview_not_found", "resume_attachment_click_guarded"}
+            skip_groups: dict[str, int] = {}
+            consumed: set[str] = set()
+            for label, keys in skip_groups_def:
+                total_in_group = sum(int(skip_reason_counts.get(k, 0)) for k in keys)
+                if total_in_group:
+                    skip_groups[label] = total_in_group
+                consumed.update(keys)
+            other_skip = sum(int(v) for k, v in skip_reason_counts.items() if k not in consumed and k not in failure_keys)
+            if other_skip:
+                skip_groups["其他"] = other_skip
+
             candidates = self.runtime_state.get("candidates", []) or []
             failure_counts: Counter[str] = Counter()
             for c in candidates:
                 if c.get("status") in {"failed", "error", "download_failed"}:
                     failure_counts[str(c.get("reason") or c.get("status") or "unknown")] += 1
+            # 把跳过维度里属于 failure 的项也并入失败分布
+            for k in failure_keys:
+                v = int(skip_reason_counts.get(k, 0))
+                if v:
+                    failure_counts[k] += v
+
             metrics = {
                 "run_id": run_id,
                 "status": status,
+                "finish_reason": self.runtime_state.get("finish_reason", ""),
                 "elapsed_sec": round(elapsed_sec, 1),
                 "downloaded": downloaded,
+                "target": target,
+                "achievement_pct": achievement_pct,
                 "skipped": skipped,
                 "avg_per_download_sec": round(avg_per_download, 1),
                 "skip_reason_counts": skip_reason_counts,
+                "skip_groups": skip_groups,
                 "failure_counts": dict(failure_counts),
                 "chrome_download_missed": len(missed_files),
             }
             self._write_event_log("run_metrics_summary", metrics)
 
             self._log("highlight", "━━━ 本轮采集指标 ━━━")
-            self._log("highlight", f"总耗时={int(elapsed_sec)}s；下载={downloaded} (avg {avg_per_download:.1f}s/份)；跳过={skipped}")
-            if skip_reason_counts:
-                top = "；".join(f"{k}={v}" for k, v in sorted(skip_reason_counts.items(), key=lambda kv: -kv[1])[:5])
+            finish_reason = self.runtime_state.get("finish_reason", "")
+            if finish_reason:
+                self._log("highlight", f"结束原因：{finish_reason}")
+            if target:
+                self._log("highlight", f"总耗时={int(elapsed_sec)}s；下载={downloaded}/{target}（达成率 {achievement_pct}%；avg {avg_per_download:.1f}s/份）；跳过={skipped}")
+            else:
+                self._log("highlight", f"总耗时={int(elapsed_sec)}s；下载={downloaded} (avg {avg_per_download:.1f}s/份)；跳过={skipped}")
+            if skip_groups:
+                top = "；".join(f"{k}={v}" for k, v in sorted(skip_groups.items(), key=lambda kv: -kv[1]))
                 self._log("highlight", f"跳过分布：{top}")
             if failure_counts:
                 top = "；".join(f"{k}={v}" for k, v in failure_counts.most_common(5))
                 self._log("highlight", f"失败分布：{top}")
             else:
                 self._log("highlight", "失败分布：无")
+
+            # 仅在未达目标时给出针对性提示
+            if status == "partial" and skipped:
+                dedup_share = skip_groups.get("去重命中", 0) / max(skipped, 1)
+                waiting_share = skip_groups.get("待候选人上传", 0) / max(skipped, 1)
+                if dedup_share >= 0.5:
+                    self._log("warning", "提示：超半数跳过来自去重命中；当前列表的可用候选人已不足以覆盖目标，建议刷新聊天列表或扩大筛选范围")
+                elif waiting_share >= 0.5:
+                    self._log("warning", "提示：超半数跳过来自'已索要等上传'；建议等待若干小时后再来采集")
         except Exception as exc:
             self._log("warning", f"生成本轮采集指标失败：{exc}")
 
@@ -335,6 +436,7 @@ class BossWSBridge:
         config["boss_candidate_signatures"] = sorted(boss_candidate_signatures)
         config["boss_pre_dedup_ready"] = True
         self._create_crawl_task(config)
+        self._log_task_initialization(config, collect_mode, collect_minutes)
         command = {"type": "start_collect", "config": config, "run_id": self.runtime_state.get("run_id", "")}
         self.ws_server.send_command(command)
         self._write_event_log("command_sent", command)
@@ -837,12 +939,29 @@ class BossWSBridge:
                 self.runtime_state["running"] = False
                 self.runtime_state["paused"] = False
                 total = self.runtime_state.get("downloaded_count", 0)
-                final_status = "success" if not data.get("stopped") else "cancelled"
+                target = int(self.runtime_state.get("task_planned_count") or 0)
+                stopped = bool(data.get("stopped"))
+                target_met = bool(target) and total >= target
+                if stopped:
+                    final_status = "cancelled"
+                    reason_text = "用户手动停止"
+                elif target_met or not target:
+                    final_status = "success"
+                    reason_text = "已达成目标"
+                else:
+                    final_status = "partial"
+                    reason_text = "候选人列表已逛完，未达目标"
+                self.runtime_state["finish_reason"] = reason_text
+                self.runtime_state["finish_status"] = final_status
                 self._finish_crawl_task(final_status)
                 if data.get("learning_finished"):
                     self._log("highlight", "学习任务已完成，采集任务自动结束")
                 else:
-                    self._log("info", f"采集完成，共下载 {total} 份简历；本次新增去重 {self.runtime_state.get('dedup_record_count', 0)} 位")
+                    if target:
+                        pct = round(total / target * 100, 1)
+                        self._log("info", f"采集结束：{reason_text}（{total}/{target}，达成率 {pct}%）；本次新增去重 {self.runtime_state.get('dedup_record_count', 0)} 位")
+                    else:
+                        self._log("info", f"采集结束：{reason_text}；共下载 {total} 份简历；本次新增去重 {self.runtime_state.get('dedup_record_count', 0)} 位")
                 self.get_run_summary()
                 self._on_task_finished(final_status)
             case "error":

@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  const CONTENT_SCRIPT_VERSION = "1.67.0";
+  const CONTENT_SCRIPT_VERSION = "1.68.0";
   if (window.__bossResumeCollectorVersion === CONTENT_SCRIPT_VERSION) {
     return;
   }
@@ -1461,7 +1461,7 @@
     }
     for (const root of getPreviewRoots()) pushRoot(root);
     const matches = [];
-    const selector = "[class*='attachment-resume-btns'] svg, [class*='attachment-resume-btns'] use, [class*='resume-footer'] svg, [class*='resume-footer'] use, [class*='resume-detail'] [class*='boss-svg'], [class*='resume-detail'] [class*='svg-icon']";
+    const selector = "[class*='attachment-resume-btns'] svg, [class*='attachment-resume-btns'] use, [class*='resume-footer'] svg, [class*='resume-footer'] use, [class*='resume-detail'] [class*='boss-svg'], [class*='resume-detail'] [class*='svg-icon'], span.card-btn, [class*='card-btn']";
     for (const root of roots) {
       const nodes = root.matches?.(selector) ? [root, ...root.querySelectorAll(selector)] : Array.from(root.querySelectorAll?.(selector) || []);
       for (const el of nodes) {
@@ -1475,9 +1475,13 @@
         if (rect.width < 10 || rect.height < 10 || rect.top < 0 || rect.left < 0) continue;
         const descriptor = `${getElementDescriptor(el)} ${getElementDescriptor(clickable)} ${getElementDescriptor(clickable.parentElement)}`;
         const combined = descriptor.toLowerCase();
-        if (!isXlinkDownload && !isBossSvgDownloadDescriptor(descriptor)) continue;
+        // HTML 弹窗形态：span.card-btn 且文案命中"附件简历"或"下载"。要求位于弹窗/对话框容器内，规避聊天列表中同名 class 的误中。
+        const inPopupContainer = !!clickable.closest?.("[class*='preview'], [class*='dialog'], [class*='modal'], [class*='drawer'], [class*='popup'], [class*='layer'], [role='dialog']");
+        const isHtmlPopupDownload = /card-btn/i.test(descriptor) && /附件简历|下载/.test(descriptor) && inPopupContainer;
+        if (!isXlinkDownload && !isHtmlPopupDownload && !isBossSvgDownloadDescriptor(descriptor)) continue;
         if (/关闭|close|取消|返回|back|delete|trash|更多|more|打印|print|zoom|放大|缩小|rotate|旋转|×|✕|esc/i.test(combined)) continue;
         let score = 40;
+        if (isHtmlPopupDownload) score += 30;
         if (clickable.closest?.("[class*='attachment-resume-btns']")) score += 22;
         if (clickable.closest?.("[class*='resume-footer']")) score += 14;
         if (clickable.closest?.("[class*='icon-content']")) score += 8;
@@ -1584,6 +1588,7 @@
         let score = 0;
         if (isLikelyDownloadIcon(el, descriptor)) score += 12;
         if (isBossSvgDownloadDescriptor(descriptor)) score += 18;
+        if (/card-btn/i.test(descriptor) && /附件简历|下载/.test(descriptor)) score += 24;
         if (/下载附件|下载简历/.test(descriptor)) score += 12;
         if (/下载|download|down/i.test(descriptor)) score += 8;
         if (clickable.closest?.("[class*='attachment-resume-btns']")) score += 16;

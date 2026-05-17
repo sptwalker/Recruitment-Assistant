@@ -2588,6 +2588,7 @@ class ZhilianAdapter(BasePlatformAdapter):
         wait_seconds: int = 900,
         per_candidate_wait_seconds: int = 60,
         min_download_interval_seconds: int = 5,
+        request_resume_if_missing: bool = False,
         on_resume_saved: Callable[[dict], None] | None = None,
         should_skip_candidate_signature: Callable[[str], bool] | None = None,
         should_skip_candidate_profile: Callable[[dict, str], bool] | None = None,
@@ -3215,20 +3216,31 @@ class ZhilianAdapter(BasePlatformAdapter):
                 request_clicked = False
                 attachment_ready = request_button_state == "view"
                 if request_button_state == "enabled":
-                    request_clicked = self._click_request_attachment_resume(page)
-                    if request_clicked:
-                        ready_wait_seconds = min(per_candidate_wait_seconds, 3)
-                        ready_started = time.monotonic()
-                        attachment_ready = self._wait_for_requested_attachment_ready(page, ready_wait_seconds, can_continue)
+                    if not request_resume_if_missing:
+                        logger.info("索要简历开关关闭，未索要的候选人按禁用状态跳过。")
                         diag_event(
                             "attachment",
-                            "request_wait",
-                            "ready" if attachment_ready else "timeout",
-                            cost_ms=(time.monotonic() - ready_started) * 1000,
-                            wait_ms=(time.monotonic() - ready_started) * 1000,
+                            "request_skip_disabled",
+                            "skip",
                             candidate=profile_label,
-                            wait_limit_ms=ready_wait_seconds * 1000,
+                            wait_limit_ms=0,
                         )
+                        request_button_state = "disabled"
+                    else:
+                        request_clicked = self._click_request_attachment_resume(page)
+                        if request_clicked:
+                            ready_wait_seconds = min(per_candidate_wait_seconds, 3)
+                            ready_started = time.monotonic()
+                            attachment_ready = self._wait_for_requested_attachment_ready(page, ready_wait_seconds, can_continue)
+                            diag_event(
+                                "attachment",
+                                "request_wait",
+                                "ready" if attachment_ready else "timeout",
+                                cost_ms=(time.monotonic() - ready_started) * 1000,
+                                wait_ms=(time.monotonic() - ready_started) * 1000,
+                                candidate=profile_label,
+                                wait_limit_ms=ready_wait_seconds * 1000,
+                            )
                 elif request_button_state == "view":
                     logger.info("右下角按钮为查看附件简历，跳过索要按钮，直接进入查看附件流程。")
                 elif request_button_state == "already_requested":

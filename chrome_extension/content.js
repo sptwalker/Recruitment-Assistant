@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  const CONTENT_SCRIPT_VERSION = "1.72.0";
+  const CONTENT_SCRIPT_VERSION = "1.73.0";
 
   // 平台注册表：每个平台的 hostname、WS 端口、文本标记、localStorage key 一站式声明。
   // 这是从单平台升级到多平台的核心入口——新加平台只需在此对象增加一条配置。
@@ -3002,10 +3002,6 @@
       case "resume_collect":
         state = "collecting";
         if (pauseResolve) { pauseResolve(); pauseResolve = null; }
-        break;
-      case "clear_qiancheng_learning":
-        clearQianchengLearningKeys();
-        emit({ type: "qiancheng_learning_cleared", data: { run_id: msg.run_id || activeRunId, content_script_version: CONTENT_SCRIPT_VERSION } });
         break;
       case "reset_content_script":
         window.__bossResumeCollectorVersion = "";

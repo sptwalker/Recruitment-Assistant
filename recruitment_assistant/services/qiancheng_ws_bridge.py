@@ -25,9 +25,9 @@ from recruitment_assistant.utils.hash_utils import text_hash
 from recruitment_assistant.utils.snapshot_utils import safe_filename
 
 
-QIANCHENG_BRIDGE_VERSION = "1.1.0"
-QIANCHENG_EXTENSION_EXPECTED_VERSION = "1.72.0"
-QIANCHENG_CONTENT_SCRIPT_EXPECTED_VERSION = "1.72.0"
+QIANCHENG_BRIDGE_VERSION = "1.2.0"
+QIANCHENG_EXTENSION_EXPECTED_VERSION = "1.73.0"
+QIANCHENG_CONTENT_SCRIPT_EXPECTED_VERSION = "1.73.0"
 
 
 class QianchengWSBridge:
@@ -513,13 +513,6 @@ class QianchengWSBridge:
         self._write_event_log("command_sent", command)
         self._log("info", "已请求扩展重新检测 ehire 页面")
 
-    def clear_qiancheng_learning(self) -> None:
-        """让 ehire 页 content.js 清空已学到的 4 个 selector localStorage key，下次采集重新进入学习模式。"""
-        command = {"type": "clear_qiancheng_learning", "run_id": self.runtime_state.get("run_id", "")}
-        self.ws_server.send_command(command)
-        self._write_event_log("command_sent", command)
-        self._log("info", "已请求扩展清除 51前程无忧 selector 学习记录")
-
     def _send_persist_ack(
         self,
         candidate_sig: str,
@@ -662,9 +655,7 @@ class QianchengWSBridge:
                 if data.get("all_keys_captured"):
                     self._log("highlight", "🎉 7 步学习完成。请在 Chrome F12 → Application → Local Storage → ehire.51job.com 复制 8 个 qiancheng_* key 的 JSON 值发给开发者。")
                 else:
-                    self._log("warning", "学习结束但部分 key 未捕获，建议点 09 页「清除学习记录」按钮后重做。")
-            case "qiancheng_learning_cleared":
-                self._log("info", "已清除扩展端 51前程无忧 selector 学习记录。下次开始采集会重新进入学习模式。")
+                    self._log("warning", "学习结束但部分 key 未捕获，建议在 ehire 页 F12 Console 手动删除 qiancheng_* localStorage key 后重做。")
             case "extension_disconnected":
                 self.runtime_state["extension_connected"] = False
                 self.runtime_state["page_ready"] = False

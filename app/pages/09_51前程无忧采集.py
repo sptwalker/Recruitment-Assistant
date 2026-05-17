@@ -314,9 +314,9 @@ with st.container(border=True):
     status_cols[3].metric("Run ID", runtime.get("run_id") or "-")
     status_cols[4].metric("最近事件", runtime.get("last_event_at") or "-")
 
-    action_cols = st.columns([1.25, 1.25, 1.1, 1.25, 1.4, 2.75], gap="medium")
-    action_cols[0].link_button("打开 51前程无忧（ehire）登录页", "https://ehire.51job.com/")
-    if action_cols[1].button("重新检测 ehire 页面", disabled=not ws_connected):
+    action_cols = st.columns([1.4, 1.6, 1.1, 1.25, 4.65], gap="medium")
+    action_cols[0].link_button("打开51Job网站", "https://ehire.51job.com/")
+    if action_cols[1].button("重新检测51Job页面", disabled=not ws_connected):
         bridge.probe_page()
         st.rerun()
     if action_cols[2].button("重置日志信息", disabled=runtime.get("running", False)):
@@ -328,13 +328,6 @@ with st.container(border=True):
             st.session_state["qiancheng_dedup_clear_message"] = f"已清除 51前程无忧 去重记录 {deleted_count} 条"
         except Exception as exc:
             st.session_state["qiancheng_dedup_clear_message"] = f"清除 51前程无忧 去重记录失败：{exc}"
-        st.rerun()
-    if action_cols[4].button("清除学习记录", disabled=runtime.get("running", False) or not ws_connected, help="清除扩展端 4 个 qiancheng_* selector，下次采集会重新进入 4 步学习引导"):
-        try:
-            bridge.clear_qiancheng_learning()
-            st.session_state["qiancheng_dedup_clear_message"] = "已请求扩展清除 selector 学习记录，下次采集将重新引导学习"
-        except Exception as exc:
-            st.session_state["qiancheng_dedup_clear_message"] = f"清除学习记录失败：{exc}"
         st.rerun()
     clear_message = st.session_state.get("qiancheng_dedup_clear_message")
     if clear_message:

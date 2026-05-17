@@ -2,6 +2,44 @@
 
 ## 2026-05-18
 
+### V2.07 UI 文案精简 + 修复扩展版本号显示 bug
+
+#### 已完成内容
+
+**09 页 UI 调整：**
+
+- 按钮文案精简：
+  - `打开 51前程无忧（ehire）登录页` → **`打开51Job网站`**
+  - `重新检测 ehire 页面` → **`重新检测51Job页面`**
+- 移除"清除学习记录"按钮及其交互链路（学习模式作为冷启动一次性流程，正常采集流不需要清除入口；如需重学，用户可在 F12 Console 手动删除 `qiancheng_*` localStorage key）
+- action_cols 6 列 → 5 列，宽度比例 `[1.4, 1.6, 1.1, 1.25, 4.65]`（迭代两次：第一次按短文案缩到 1.0 后偏短，调整为 1.4/1.6）
+
+**移除清除学习记录链路（3 处代码删除）：**
+
+- `qiancheng_ws_bridge.py`：删除 `clear_qiancheng_learning()` 方法
+- `qiancheng_ws_bridge.py`：删除 `case "qiancheng_learning_cleared"` 处理
+- `content.js`：删除 `case "clear_qiancheng_learning"` 命令处理
+- `clearQianchengLearningKeys()` 函数保留（作为 F12 Console 调用工具）
+
+**修复扩展版本号显示 bug：**
+
+- 根因：`background.js:24` 硬编码 `EXTENSION_VERSION = "1.68.0"`，多次 manifest bump 时从未跟着升级
+- 修复：改为运行时动态读取 `chrome.runtime.getManifest().version`
+- 影响：所有历史上"扩展版本不匹配 warning"的根源问题；今后 manifest 升版即自动同步上报版本，不再需要双向手动同步
+
+**版本同步（含 background.js 已动态化，不再列在同步项）：**
+
+- `manifest.json` 1.72.0 → **1.73.0**
+- `content.js` `CONTENT_SCRIPT_VERSION` 1.72.0 → **1.73.0**
+- `background.js` `EXTENSION_VERSION` 硬编码 → **动态读 manifest**（永远跟随 manifest 同步）
+- `qiancheng_ws_bridge.py` 1.1.0 → **1.2.0**；期望扩展/脚本 1.72.0 → **1.73.0**
+- `boss_ws_bridge.py` 1.79.0 → **1.80.0**；期望扩展/脚本 1.72.0 → **1.73.0**
+- `app/components/layout.py` V2.06 → **V2.07**
+
+#### 后续观察点
+
+- 重启 streamlit + 完整重载扩展后，09 页第一栏 banner 应显示扩展版本 **1.73.0**（不再卡在 1.68.0）；任何后续版本 bump 都会被 background.js 自动同步上报
+
 ### V2.06 51前程无忧采集器开荒收尾：去除索要简历控件 + 归档目录 51job + 死代码清理
 
 #### 已完成内容

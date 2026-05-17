@@ -21,7 +21,9 @@ const PLATFORM_REGISTRY = {
   },
 };
 
-const EXTENSION_VERSION = "1.68.0";
+const EXTENSION_VERSION = (typeof chrome !== "undefined" && chrome.runtime && typeof chrome.runtime.getManifest === "function")
+  ? (chrome.runtime.getManifest().version || "0.0.0")
+  : "0.0.0";
 const HEARTBEAT_INTERVAL_MS = 15000;
 
 // 每个平台一份连接状态。状态隔离：BOSS 在采集时不影响 51job 闲置标签。

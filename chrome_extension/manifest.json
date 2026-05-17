@@ -1,16 +1,23 @@
 {
   "manifest_version": 3,
-  "name": "Boss直聘采集助手",
-  "description": "配合招聘助手系统，在Boss直聘页面内自动采集附件简历。",
-  "version": "1.67.0",
+  "name": "招聘平台采集助手",
+  "description": "配合招聘助手系统，在 BOSS 直聘 / 51 前程无忧（ehire）页面内自动采集附件简历。",
+  "version": "1.72.0",
   "permissions": ["activeTab", "downloads", "storage", "tabs", "scripting"],
-  "host_permissions": ["https://www.zhipin.com/*"],
+  "host_permissions": [
+    "https://www.zhipin.com/*",
+    "https://ehire.51job.com/*"
+  ],
   "background": {
     "service_worker": "background.js"
   },
   "content_scripts": [
     {
-      "matches": ["https://www.zhipin.com/web/chat*", "https://www.zhipin.com/web/geek/chat*"],
+      "matches": [
+        "https://www.zhipin.com/web/chat*",
+        "https://www.zhipin.com/web/geek/chat*",
+        "https://ehire.51job.com/*"
+      ],
       "js": ["content.js"],
       "run_at": "document_idle"
     }

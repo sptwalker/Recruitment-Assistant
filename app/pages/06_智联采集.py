@@ -138,7 +138,7 @@ def build_zhilian_candidate_summary(runtime_state: dict) -> str:
     downloaded_count = sum(1 for c in candidates if c.get("简历文件名") and c.get("简历文件名") != "待识别")
     if not downloaded_count:
         downloaded_count = len(candidates)
-    return f"已记录{len(candidates)}位候选人，跳过{skipped_count}位候选人（其中去重{dedup_skipped}人），向{resume_request_count}位候选人索要了简历，成功下载{downloaded_count}份简历"
+    return f"已记录{len(candidates)}位候选人，跳过{skipped_count}位（去重{dedup_skipped}人），向{resume_request_count}人索要了简历，成功下载{downloaded_count}份简历"
 
 
 def get_platform_collect_meta(target_site: str | None) -> dict:
@@ -173,8 +173,8 @@ def default_task_config() -> dict:
 
 
 def get_runtime_state() -> dict:
-    if "collect_runtime_state" not in st.session_state:
-        st.session_state.collect_runtime_state = {
+    if "collect_runtime_state_zhilian" not in st.session_state:
+        st.session_state.collect_runtime_state_zhilian = {
             "running": False,
             "paused": False,
             "stopped": False,
@@ -190,26 +190,26 @@ def get_runtime_state() -> dict:
             "stale_warned": False,
             "ui_refresh_requested": False,
         }
-    return st.session_state.collect_runtime_state
+    return st.session_state.collect_runtime_state_zhilian
 
 
 def init_state() -> None:
     runtime = get_runtime_state()
-    if "collect_task_logs" not in st.session_state:
-        st.session_state.collect_task_logs = list(runtime.get("logs", []))
-    if "collect_candidates" not in st.session_state:
-        st.session_state.collect_candidates = list(runtime.get("candidates", []))
-    if "collect_paused" not in st.session_state:
-        st.session_state.collect_paused = runtime["paused"]
-    if "collect_stopped" not in st.session_state:
-        st.session_state.collect_stopped = runtime["stopped"]
-    if "collect_running" not in st.session_state:
-        st.session_state.collect_running = runtime["running"]
+    if "collect_task_logs_zhilian" not in st.session_state:
+        st.session_state.collect_task_logs_zhilian = list(runtime.get("logs", []))
+    if "collect_candidates_zhilian" not in st.session_state:
+        st.session_state.collect_candidates_zhilian = list(runtime.get("candidates", []))
+    if "collect_paused_zhilian" not in st.session_state:
+        st.session_state.collect_paused_zhilian = runtime["paused"]
+    if "collect_stopped_zhilian" not in st.session_state:
+        st.session_state.collect_stopped_zhilian = runtime["stopped"]
+    if "collect_running_zhilian" not in st.session_state:
+        st.session_state.collect_running_zhilian = runtime["running"]
 
 
 def sync_runtime_to_session() -> dict:
     runtime = get_runtime_state()
-    pending_task = st.session_state.get("pending_collect_task")
+    pending_task = st.session_state.get("pending_collect_task_zhilian")
     if pending_task and not runtime.get("running") and runtime.get("task_config", {}).get("任务状态") in {None, "等待启动"}:
         runtime["task_config"] = pending_task
 
@@ -236,12 +236,12 @@ def sync_runtime_to_session() -> dict:
     previous_status = runtime.get("last_synced_task_status")
     runtime["needs_status_refresh"] = bool(runtime.pop("status_dirty", False)) or previous_status != current_status
     runtime["last_synced_task_status"] = current_status
-    st.session_state.collect_task_logs = list(runtime.get("logs", []))
-    st.session_state.collect_candidates = list(runtime.get("candidates", []))
-    st.session_state.collect_paused = runtime["paused"]
-    st.session_state.collect_stopped = runtime["stopped"]
-    st.session_state.collect_running = runtime["running"]
-    st.session_state.pending_collect_task = task_config
+    st.session_state.collect_task_logs_zhilian = list(runtime.get("logs", []))
+    st.session_state.collect_candidates_zhilian = list(runtime.get("candidates", []))
+    st.session_state.collect_paused_zhilian = runtime["paused"]
+    st.session_state.collect_stopped_zhilian = runtime["stopped"]
+    st.session_state.collect_running_zhilian = runtime["running"]
+    st.session_state.pending_collect_task_zhilian = task_config
     if "scanned_count" not in runtime:
         runtime["scanned_count"] = 0
     if "skipped_count" not in runtime:
@@ -259,7 +259,7 @@ def append_collect_log(message: str) -> None:
     runtime["logs"] = runtime["logs"][-5000:]
     runtime["last_log_at"] = time.monotonic()
     runtime["last_log_count"] = len(runtime["logs"])
-    st.session_state.collect_task_logs = list(runtime.get("logs", []))
+    st.session_state.collect_task_logs_zhilian = list(runtime.get("logs", []))
 
 
 def _format_log_value(value) -> str:
@@ -473,14 +473,14 @@ def build_collect_log_body(logs: list[str]) -> str:
 
 
 def render_log_html(container=None) -> None:
-    body = build_collect_log_body(st.session_state.get("collect_task_logs", []))
+    body = build_collect_log_body(st.session_state.get("collect_task_logs_zhilian", []))
     target = container or st
     target.markdown(f'<div id="collect-log-box" class="collect-log-box" data-collect-log-box="1">{body}</div>', unsafe_allow_html=True)
 
 
 def render_live_log_panel(refresh_seconds: float = 1.5) -> None:
     live_runtime = get_runtime_state()
-    logs = live_runtime.get("logs") or st.session_state.get("collect_task_logs", [])
+    logs = live_runtime.get("logs") or st.session_state.get("collect_task_logs_zhilian", [])
     body = build_collect_log_body(list(logs))
     components.html(
         f"""
@@ -520,7 +520,7 @@ else:
 
 def render_candidate_table(container=None) -> None:
     target = container or st
-    candidates = runtime.get("candidates", st.session_state.get("collect_candidates", []))
+    candidates = runtime.get("candidates", st.session_state.get("collect_candidates_zhilian", []))
     if candidates:
         target.dataframe(candidates, use_container_width=True, hide_index=True)
     else:
@@ -992,7 +992,7 @@ def render_task_editor(task_config: dict, login_states: dict[str, bool], disable
         "间隔秒": "5-15" if speed_mode.startswith("快速") else "10-45",
     }
     if not disabled:
-        st.session_state.pending_collect_task = updated_task
+        st.session_state.pending_collect_task_zhilian = updated_task
         runtime = get_runtime_state()
         if not runtime.get("running"):
             runtime["task_config"] = updated_task
@@ -1547,10 +1547,10 @@ def start_collect_task(task_config: dict, runtime: dict) -> None:
     runtime["last_log_count"] = 0
     runtime["stale_warned"] = False
     runtime["task_config"] = task_to_run
-    st.session_state.collect_task_logs = list(runtime.get("logs", []))
-    st.session_state.collect_candidates = list(runtime.get("candidates", []))
-    st.session_state.collect_running = True
-    st.session_state.pending_collect_task = task_to_run
+    st.session_state.collect_task_logs_zhilian = list(runtime.get("logs", []))
+    st.session_state.collect_candidates_zhilian = list(runtime.get("candidates", []))
+    st.session_state.collect_running_zhilian = True
+    st.session_state.pending_collect_task_zhilian = task_to_run
     thread = threading.Thread(target=run_collect_task, args=(task_to_run, runtime), daemon=True)
     runtime["thread"] = thread
     thread.start()
@@ -1558,7 +1558,7 @@ def start_collect_task(task_config: dict, runtime: dict) -> None:
 
 init_state()
 runtime = sync_runtime_to_session()
-pending_task = st.session_state.get("pending_collect_task") or default_task_config()
+pending_task = st.session_state.get("pending_collect_task_zhilian") or default_task_config()
 pending_task["目标网站"] = "智联招聘"
 account_name = pending_task.get("账号标识") or "default"
 login_states = get_platform_login_states(account_name)
@@ -1569,11 +1569,11 @@ if runtime.pop("ui_refresh_requested", False):
     sync_runtime_to_session()
     st.rerun()
 
-is_running = st.session_state.get("collect_running", False) or pending_task.get("任务状态") == "运行中"
-collect_action_feedback = st.session_state.pop("collect_action_feedback", "")
-if collect_action_feedback:
-    st.success(collect_action_feedback)
-if st.session_state.pop("auto_start_collect_task", False) and not runtime.get("running"):
+is_running = st.session_state.get("collect_running_zhilian", False) or pending_task.get("任务状态") == "运行中"
+collect_action_feedback_zhilian = st.session_state.pop("collect_action_feedback_zhilian", "")
+if collect_action_feedback_zhilian:
+    st.success(collect_action_feedback_zhilian)
+if st.session_state.pop("auto_start_collect_task_zhilian", False) and not runtime.get("running"):
     start_collect_task(pending_task, runtime)
     st.rerun()
 
@@ -1698,7 +1698,7 @@ with st.container(border=True):
             session.commit()
         feedback_message = f"清空去重索引成功：删除 {before_count} 条索引记录。"
         append_collect_log(f"已清空智联招聘下载前个人信息去重库：删除 {before_count} 条索引记录。")
-        st.session_state.collect_action_feedback = feedback_message
+        st.session_state.collect_action_feedback_zhilian = feedback_message
         st.rerun()
 
     result_cols = st.columns([1.15, 1])

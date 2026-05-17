@@ -1,6 +1,175 @@
 # 开发日志
 
+## 2026-05-18
+
+### V2.06 51前程无忧采集器开荒收尾：去除索要简历控件 + 归档目录 51job + 死代码清理
+
+#### 已完成内容
+
+**清理死代码：**
+
+- 删除 `chrome_extension/content.js` 行 2131-2231 旧 4 步学习模块（`runQianchengLearningSession` 4 步版 + `waitForUserClick` + 2 参版 `deriveStableSelector` + `detectPreviewFormKind`）—— Phase 4 已被 7 步版完全覆盖
+- 删除 `qiancheng_ws_bridge.py` 行 988-1004 旧学习事件 case（`qiancheng_learning_step_started` / `qiancheng_learning_failed` 等 5 个 case）——content.js 已不再 emit
+- 同时修复 `needsQianchengLearning()` ：从只检查 `learned_candidate_card` 一个 key 改为调用 `isQianchengLearningComplete()` 检查全部 8 个 key
+
+**索要简历控件：**
+
+- 09 页删除"索要简历" checkbox（51job ehire 不需要此交互）
+- top_cols 列布局 5 列 → 4 列
+- start_collect 不再下发 `request_resume_if_missing`
+
+**归档目录：**
+
+- 简历归档目录 `data/attachments/qiancheng/` → `data/attachments/51job/`（3 处：09 页、bridge 行 278、bridge 行 1189）
+- 数据库 `platform_code` 仍保持 `qiancheng`，与历史数据兼容
+- Chrome 下载临时目录 `Downloads/51前程无忧/` 保持不变（与 background.js download_dir_name 对齐）
+
+**测试结果：**
+
+- 10/10 100% 达成率，avg 10.1s/份（与首次 3/3 的 11.2s/份基本持平，**无规模膨胀**）
+- 去重命中验证通过（黄心钰被正确跳过）
+- 候选人信息提取健壮性验证（含英文名/特殊名/中文名混排 26 人全识别）
+- Chrome 下载目录对账无遗漏
+
+**版本同步：**
+
+- `manifest.json` 1.71.0 → **1.72.0**
+- `content.js` 1.71.0 → **1.72.0**
+- `qiancheng_ws_bridge.py` 1.0.0 → **1.1.0**；期望扩展/脚本 1.71.0 → **1.72.0**
+- `boss_ws_bridge.py` 1.78.0 → **1.79.0**；期望扩展/脚本 1.71.0 → **1.72.0**
+- `app/components/layout.py` V2.05 → **V2.06**
+
+### V2.05 51前程无忧采集器端到端跑通
+
+#### 已完成内容
+
+**Phase 5：固化 selector + 自动采集主循环（Chrome 扩展模式）**
+
+- 在 `content.js` 加入 `QIANCHENG_SELECTORS` 常量（13 项 selector）和 6 个 qiancheng 专用 helper：
+  - `extractQianchengContactInfo()`：从 `.info-main` 提取姓名/年龄/学历，文本"女 | 27岁 | 3年 | 本科 | 柳州"用 `|` 切分 + 关键字白名单识别
+  - `getQianchengCandidateItems()`：从 `#conversation-list .content-list` 抓取候选人卡片
+  - `findQianchengAttachmentButton()`：在 `.chat-user-operate` 范围内按文本"附件简历"匹配
+  - `waitForQianchengPreviewReady()`：轮询 `.annex-resume .container-options-item.item-download` visible（51 ehire 是就地切换内容，不发新 DOM 节点）
+  - `findQianchengDownloadButton()`：优先 `#sensor_Bchatinfo_xiazai`（埋点 id），回退 class
+  - `findQianchengClosePreviewButton()`：`.annex-resume .container-close`
+- 新增 `qianchengCollectLoop()` 完整主循环（约 200 行）：导航 → 列表抓取 → 候选人遍历 → 去重检查 → 附件检测 → 下载触发 → 关闭弹窗 → 间隔
+- `collectLoop()` 入口加平台分发：qiancheng 走 qiancheng 主循环，BOSS 维持原路径
+- `ensureQianchengOnChattingPage()`：自动用学到的 `#sensor_talentcommunicate` + `#sensor_Bchat_communication` 跳转到沟通中页面
+- 去重 key 命名空间 `qiancheng|profile|name|age|education`，避免与 BOSS 撞库
+- 复用 BOSS 已实战的下载链路：`waitForDownloadResult` / `finalizeDownloadWithPersistAck` / `clickElementReliably` / `normalizeBossCandidateSignature`
+
+**关键 selector**（3 个 sensor 埋点 id 极稳）：
+- 左侧"人才沟通"菜单：`#sensor_talentcommunicate`
+- 顶部"沟通中"标签：`#sensor_Bchat_communication`
+- 预览页"下载"按钮：`#sensor_Bchatinfo_xiazai`
+
+**测试结果：**
+
+- 首次跑通 3/3，avg 11.2s/份
+- 候选人信息提取 100% 正确（黄心钰/27岁/本科、王剑/30岁/本科、聂雨欣/24岁/本科）
+- Chrome 下载链路全程跑通：下载创建 → 持久化确认 → 归档目录正确命名
+
+**版本同步：**
+
+- `content.js` 1.70.0 → **1.71.0**
+- `manifest.json` 1.70.0 → **1.71.0**
+- `qiancheng_ws_bridge.py` 0.3.0 → **1.0.0**（首版正式可用）；期望 1.70.0 → **1.71.0**
+- `boss_ws_bridge.py` 1.77.0 → **1.78.0**；期望 1.71.0
+- `layout.py` V2.04 → **V2.05**
+
+### V2.04 扩展端 DOM 学习模式（7 步引导）
+
+#### 已完成内容
+
+**Phase 4：扩展内嵌学习模式**
+
+针对 51 ehire 全新平台，content.js 无法预知 DOM 结构——通过浮动 banner 引导用户首次采集时手动点击 7 个 DOM 锚点，抓取 selector + DOM 链 + 客户端坐标存入 localStorage，供 Phase 5 自动采集复用。
+
+**7 步学习流程：**
+
+| Step | 学习内容 | localStorage key |
+|---|---|---|
+| 1 | 左侧"人才沟通"菜单 | `qiancheng_nav_menu_chat_selector` |
+| 2 | 顶部"沟通中"标签 | `qiancheng_tab_chatting_selector` |
+| 3 | 候选人卡片 | `qiancheng_candidate_card_selector` |
+| 4 | 个人信息区（点姓名） | `qiancheng_profile_info_container_selector` |
+| 5 | "附件简历"按钮 | `qiancheng_attachment_btn_selector` |
+| 6 | 预览形态（自动检测 iframe/dialog/window.open） | `qiancheng_preview_form_kind` |
+| 7 | 预览页"下载"按钮（复用 BOSS `learned_click` key） | `qiancheng_resume_download_learned_click` |
+| 7+ | 关闭弹窗按钮 | `qiancheng_close_preview_selector` |
+
+**关键设计：**
+
+- 浮动 banner 固定右上角，蓝边框 + 进度条 + ✕关闭按钮
+- 每步监听 click（useCapture=true），抓 element + 6 级祖先链 + 客户端坐标
+- selector 推导优先级：`data-*` 属性 → 稳定 class（避开 webpack hash）→ role + tag → tag
+- Phase 5 在抓取的 chain_detail 里找 `sensor_*` 埋点 id，比推导出的 selector 更稳
+
+**bridge 端事件处理：**
+
+- 7 个 case 处理学习生命周期：`qiancheng_learning_required` / `_started` / `_step_completed` / `_step_failed` / `_finished` / `_cleared`
+- 09 页加"清除学习记录"按钮：bridge 发命令到扩展清空 8 个 localStorage key
+
+**版本同步：**
+
+- `manifest.json` 1.68.0 → **1.69.0** → 1.70.0（途中调整）
+- `content.js` 1.68.0 → **1.69.0** → 1.70.0
+- `qiancheng_ws_bridge.py` 0.1.0 → **0.2.0** → 0.3.0
+- `boss_ws_bridge.py` 1.75.0 → **1.76.0** → 1.77.0（保持双 bridge 期望版本一致）
+- `layout.py` V2.00 → V2.04
+
+#### V2.04 期间识别并写入项目记忆的规则
+
+- "改代码必 bump 模块版本号" 记忆：任何 content.js / manifest / bridge / layout 改动都要同步升对应版本号常量，否则 Chrome 不重载扩展、bridge 输出版本不匹配警告
+
 ## 2026-05-17
+
+### V2.03（已被 V2.04~V2.06 替代）新增 51 前程无忧采集页 + 智联页状态命名空间隔离
+
+#### 已完成内容
+
+**新增 qiancheng 平台骨架适配器：**
+
+- 新文件 `recruitment_assistant/platforms/qiancheng/__init__.py`（空）+ `adapter.py`
+- 实现接口：`login()`、`login_manually()`、`is_logged_in()`、`_open_authenticated_session()`、`_is_login_or_security_page()` 等——结构镜像 ZhilianAdapter，URL 替换为 `https://ehire.51job.com/`
+- 登录失效标记词改为 51 站点特征：`login.51job.com`、`passport.51job.com`、`/login`、`扫码登录`、`账号登录`、`请输入用户名`、`请输入密码`、`短信验证`、`图形验证`、`verify`
+- 已登录标记：`ehire.51job.com`、`/ehire/`、`ehire/home`、`51job`、`前程无忧`
+- `fetch_resume_list` / `fetch_resume_detail` 为 base 契约桩实现（返回空列表/字典）
+- `auto_click_chat_attachment_resumes` 为骨架版本：步骤 1（打开沟通页）真实执行，步骤 2-6（找候选人列表 / 点击候选人 / 找附件简历按钮 / 识别预览弹窗 / 点击保存按钮）通过 `on_diagnostic` 发出 `status="todo"` 事件占位，最终返回空列表
+
+**新增页面 `app/pages/09_51前程无忧采集.py`：**
+
+- 基于 `06_智联采集.py` 全文复制
+- 批量替换：`zhilian` → `qiancheng`、`Zhilian` → `Qiancheng`、`智联招聘` → `51前程无忧`、`智联采集` → `51前程无忧采集`、`rd5.zhaopin.com/` → `ehire.51job.com/`、`passport.zhaopin.com/` → `ehire.51job.com/`、`打开智联登录页` → `打开 51前程无忧登录页`
+- `page_title` / `page_header` / 侧边栏 active 标识同步改为 51前程无忧采集
+- 顶部加 `st.warning` 横幅说明骨架状态，避免用户以为是 bug
+
+**菜单与登录页注册：**
+
+- `app/components/layout.py` `MENU_ITEMS` 增加 `("51前程无忧采集", "◈", "/51前程无忧采集")`
+- 顶部导航栏 `vibe-actions` 同步加 1 项
+- `app/pages/05_平台登录.py` 增加 `QianchengAdapter` 导入与 `platform_options["51前程无忧"]` 配置项
+
+**智联页 session_state 命名空间隔离：**
+
+- 全部 9 个顶层 session_state 键加 `_zhilian` 后缀：`collect_runtime_state_zhilian`、`collect_task_logs_zhilian`、`collect_candidates_zhilian`、`collect_paused_zhilian`、`collect_stopped_zhilian`、`collect_running_zhilian`、`pending_collect_task_zhilian`、`collect_action_feedback_zhilian`、`auto_start_collect_task_zhilian`
+- 不动 runtime dict 内部字段（`logs`、`candidates`、`scanned_count` 等）
+- 51 前程无忧页同样字段为 `_qiancheng` 后缀，两个采集页 session_state 不会互相干扰
+
+#### 后续需要的实际页面信息（等待用户提供）
+
+要从骨架升级为可工作版本，需要 51 ehire 招聘者端**以下 5 个 DOM 锚点的截图/HTML 片段**：
+
+1. 沟通/聊天页候选人列表的卡片元素 DOM 结构
+2. 点击候选人卡片后右侧详情区切换的标志（URL 变化 / 关键元素出现）
+3. "附件简历"按钮的 selector 与状态判断（启用 / 暂无附件 / 已索要）
+4. 简历预览弹窗结构（iframe / 新窗口 / DOM 浮层）
+5. 预览页"保存/下载"按钮的 selector
+
+#### 风险点
+
+- 51 ehire 反爬策略可能与智联不同，`login_manually` 等待跳转的 while 循环未必能正确识别"登录完成"——已留 `重新校验登录态` 按钮作为人工兜底
+- 若两个采集页 session_state 命名空间隔离漏改某个键，可能导致按钮状态错乱——批量 replace_all 覆盖完整，语法已过；首次启动验证时重点关注智联页面的按钮交互是否正常
 
 ### V2.02 智联招聘采集页重构
 

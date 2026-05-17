@@ -1,4 +1,9 @@
-"""Bridge between WebSocket events and Boss business logic."""
+"""Bridge between WebSocket events and Qiancheng (51job ehire) business logic.
+
+基于 boss_ws_bridge.py 复制 + 命名空间替换而来。BOSS 专属事件 case 保留
+（运行时不会被触发，因为扩展端不会在 qiancheng 平台 emit BOSS 专属事件）。
+等 Phase 4 学习模式起来后再补 qiancheng 专属事件 case。
+"""
 
 import json
 import shutil
@@ -13,20 +18,20 @@ from loguru import logger
 
 from app.components.layout import APP_VERSION
 from recruitment_assistant.services.crawl_task_service import BossCandidateRecordService, CrawlTaskService
-from recruitment_assistant.services.ws_server import BossWSServer
+from recruitment_assistant.services.ws_server import QianchengWSServer
 from recruitment_assistant.storage.db import create_session
 from recruitment_assistant.storage.models import CrawlTask
 from recruitment_assistant.utils.hash_utils import text_hash
 from recruitment_assistant.utils.snapshot_utils import safe_filename
 
 
-BOSS_BRIDGE_VERSION = "1.79.0"
-BOSS_EXTENSION_EXPECTED_VERSION = "1.72.0"
-BOSS_CONTENT_SCRIPT_EXPECTED_VERSION = "1.72.0"
+QIANCHENG_BRIDGE_VERSION = "1.1.0"
+QIANCHENG_EXTENSION_EXPECTED_VERSION = "1.72.0"
+QIANCHENG_CONTENT_SCRIPT_EXPECTED_VERSION = "1.72.0"
 
 
-class BossWSBridge:
-    def __init__(self, ws_server: BossWSServer):
+class QianchengWSBridge:
+    def __init__(self, ws_server: QianchengWSServer):
         self.ws_server = ws_server
         self.ws_server.on_event = self._handle_event
         self._event_seq = 0
@@ -71,7 +76,7 @@ class BossWSBridge:
     def reset_run(self) -> None:
         now = datetime.now()
         run_id = now.strftime("%Y%m%d_%H%M%S")
-        log_dir = Path("logs") / "boss_extension" / now.strftime("%Y%m%d")
+        log_dir = Path("logs") / "qiancheng_extension" / now.strftime("%Y%m%d")
         log_dir.mkdir(parents=True, exist_ok=True)
         log_file = log_dir / f"run_{run_id}.jsonl"
 
@@ -100,39 +105,39 @@ class BossWSBridge:
             "task_planned_count": 0,
             "task_status": "pending",
         })
-        self._seen_candidate_records.update(self._load_boss_candidate_keys())
+        self._seen_candidate_records.update(self._load_candidate_keys())
         self._write_event_log("run_started", {"run_id": run_id})
         self._log("info", f"新测试轮次已创建: {run_id}")
         self._log(
             "info",
             "版本信息: "
             f"页面={APP_VERSION}；"
-            f"BOSS后端桥接={BOSS_BRIDGE_VERSION}；"
-            f"期望扩展={BOSS_EXTENSION_EXPECTED_VERSION}；"
-            f"期望内容脚本={BOSS_CONTENT_SCRIPT_EXPECTED_VERSION}；"
+            f"51前程无忧后端桥接={QIANCHENG_BRIDGE_VERSION}；"
+            f"期望扩展={QIANCHENG_EXTENSION_EXPECTED_VERSION}；"
+            f"期望内容脚本={QIANCHENG_CONTENT_SCRIPT_EXPECTED_VERSION}；"
             f"当前已连接扩展={self.runtime_state.get('extension_version') or '未连接'}",
         )
         self._write_event_log("module_versions", {
             "app_version": APP_VERSION,
-            "boss_bridge_version": BOSS_BRIDGE_VERSION,
-            "expected_extension_version": BOSS_EXTENSION_EXPECTED_VERSION,
-            "expected_content_script_version": BOSS_CONTENT_SCRIPT_EXPECTED_VERSION,
+            "qiancheng_bridge_version": QIANCHENG_BRIDGE_VERSION,
+            "expected_extension_version": QIANCHENG_EXTENSION_EXPECTED_VERSION,
+            "expected_content_script_version": QIANCHENG_CONTENT_SCRIPT_EXPECTED_VERSION,
             "connected_extension_version": self.runtime_state.get("extension_version") or "",
         })
         if self.ws_server.is_extension_connected:
             command = {"type": "reset_content_script", "run_id": self.runtime_state.get("run_id", "")}
             self.ws_server.send_command(command)
             self._write_event_log("command_sent", command)
-            self._log("info", "已请求扩展重新加载 Boss 页面脚本")
+            self._log("info", "已请求扩展重新加载 ehire 页面脚本")
             self.probe_page()
 
     def clear_boss_dedup_records(self) -> int:
         with create_session() as session:
-            deleted_count = BossCandidateRecordService(session).clear_records("boss")
+            deleted_count = BossCandidateRecordService(session).clear_records("qiancheng")
         self._seen_candidate_records.clear()
         self.runtime_state["dedup_record_count"] = 0
-        self._log("info", f"已清除 BOSS 去重数据库: {deleted_count} 条")
-        self._write_event_log("boss_dedup_records_cleared", {"deleted_count": deleted_count})
+        self._log("info", f"已清除 51前程无忧 去重数据库: {deleted_count} 条")
+        self._write_event_log("qiancheng_dedup_records_cleared", {"deleted_count": deleted_count})
         return deleted_count
 
     def _create_crawl_task(self, config: dict) -> None:
@@ -143,8 +148,8 @@ class BossWSBridge:
         try:
             with create_session() as session:
                 task = CrawlTaskService(session).create_task(
-                    platform_code="boss",
-                    task_name=f"BOSS采集-{datetime.now().strftime('%Y%m%d%H%M%S')}",
+                    platform_code="qiancheng",
+                    task_name=f"51前程无忧采集-{datetime.now().strftime('%Y%m%d%H%M%S')}",
                     task_type="chat_attachment_resume",
                     query_params=task_config,
                     planned_count=planned_count,
@@ -155,12 +160,12 @@ class BossWSBridge:
             self.runtime_state["task_started_at"] = started_at
             self.runtime_state["task_planned_count"] = planned_count or 0
             self.runtime_state["task_status"] = "running"
-            self._write_event_log("boss_crawl_task_created", {"task_id": task_id, "planned_count": planned_count})
-            self._log("info", f"BOSS 历史批次任务已创建: #{task_id}")
+            self._write_event_log("qiancheng_crawl_task_created", {"task_id": task_id, "planned_count": planned_count})
+            self._log("info", f"历史批次任务已创建: #{task_id}")
         except Exception as exc:
             self.runtime_state["task_id"] = None
             self.runtime_state["task_status"] = "create_failed"
-            self._log("warning", f"BOSS 历史批次任务创建失败: {exc}")
+            self._log("warning", f"历史批次任务创建失败: {exc}")
 
     def _log_task_initialization(self, config: dict, collect_mode: str, collect_minutes: int) -> None:
         """采集开始时输出任务初始化信息块，便于事后追溯任务上下文。"""
@@ -191,7 +196,7 @@ class BossWSBridge:
             self._log("highlight", f"任务目标：{target_text}（test_mode={test_mode_label}）")
             self._log("highlight", f"配置：request_resume_if_missing={request_resume}；扫描间隔={interval_text}")
             self._log("highlight", f"去重基线：{key_count} 条 key / {signature_count} 条签名")
-            self._log("highlight", f"版本：页面 {APP_VERSION} / 桥接 {BOSS_BRIDGE_VERSION} / 扩展 {BOSS_EXTENSION_EXPECTED_VERSION} / 脚本 {BOSS_CONTENT_SCRIPT_EXPECTED_VERSION}")
+            self._log("highlight", f"版本：页面 {APP_VERSION} / 桥接 {QIANCHENG_BRIDGE_VERSION} / 扩展 {QIANCHENG_EXTENSION_EXPECTED_VERSION} / 脚本 {QIANCHENG_CONTENT_SCRIPT_EXPECTED_VERSION}")
             self._log("highlight", f"当前会话：扩展已连接 {ext_version}")
             self._log("highlight", "━━━━━━━━━━━━━━━━━━━━")
 
@@ -223,7 +228,7 @@ class BossWSBridge:
             with create_session() as session:
                 task = session.get(CrawlTask, task_id)
                 if not task:
-                    self._log("warning", f"BOSS 历史批次任务不存在，无法完成: #{task_id}")
+                    self._log("warning", f"历史批次任务不存在，无法完成: #{task_id}")
                     return
                 CrawlTaskService(session).finish_task(
                     task,
@@ -233,16 +238,16 @@ class BossWSBridge:
                     error_message=error_message,
                 )
             self.runtime_state["task_status"] = status
-            self._write_event_log("boss_crawl_task_finished", {
+            self._write_event_log("qiancheng_crawl_task_finished", {
                 "task_id": task_id,
                 "status": status,
                 "success_count": success_count,
                 "failed_count": failed_count,
                 "error_message": error_message,
             })
-            self._log("info", f"BOSS 历史批次任务已更新: #{task_id}，状态={status}，获取={success_count}，跳过={failed_count}")
+            self._log("info", f"历史批次任务已更新: #{task_id}，状态={status}，获取={success_count}，跳过={failed_count}")
         except Exception as exc:
-            self._log("warning", f"BOSS 历史批次任务更新失败: #{task_id}；原因={exc}")
+            self._log("warning", f"历史批次任务更新失败: #{task_id}；原因={exc}")
 
     def _on_task_finished(self, status: str) -> None:
         """采集任务收尾钩子：关闭弹窗、对账 Chrome 下载目录、输出本轮指标。"""
@@ -268,9 +273,9 @@ class BossWSBridge:
                     run_started_ts = datetime.fromisoformat(run_started_at).timestamp()
                 except ValueError:
                     run_started_ts = 0.0
-            chrome_dir = Path.home() / "Downloads" / "Boss直聘"
+            chrome_dir = Path.home() / "Downloads" / "51前程无忧"
             settings = get_settings()
-            today_archive = (settings.attachment_dir / "boss" / datetime.now().strftime("%Y%m%d")).resolve()
+            today_archive = (settings.attachment_dir / "51job" / datetime.now().strftime("%Y%m%d")).resolve()
             archived_stems = {p.stem for p in today_archive.glob("*.pdf")} if today_archive.exists() else set()
             if chrome_dir.exists():
                 for pdf in chrome_dir.glob("*.pdf"):
@@ -292,7 +297,7 @@ class BossWSBridge:
                         except OSError:
                             missed_files.append((pdf.resolve(), 0))
             if missed_files:
-                self._log("warning", f"⚠ Chrome 下载目录有 {len(missed_files)} 个未归档的 BOSS PDF：")
+                self._log("warning", f"⚠ Chrome 下载目录有 {len(missed_files)} 个未归档的 51前程无忧 PDF：")
                 shown = missed_files[:10]
                 for idx, (path, size) in enumerate(shown, 1):
                     kb = size / 1024 if size else 0
@@ -417,8 +422,8 @@ class BossWSBridge:
         self.runtime_state["task_started_at"] = ""
         self.runtime_state["task_planned_count"] = 0
         self.runtime_state["task_status"] = "pending"
-        boss_candidate_keys = self._load_boss_candidate_keys()
-        boss_candidate_signatures = self._load_boss_candidate_signatures()
+        boss_candidate_keys = self._load_candidate_keys()
+        boss_candidate_signatures = self._load_candidate_signatures()
         self._seen_candidate_records.update(boss_candidate_keys)
         config = dict(config or {})
 
@@ -440,7 +445,7 @@ class BossWSBridge:
         command = {"type": "start_collect", "config": config, "run_id": self.runtime_state.get("run_id", "")}
         self.ws_server.send_command(command)
         self._write_event_log("command_sent", command)
-        self._log("info", f"BOSS 下载前去重数据已下发: key={len(config['boss_candidate_keys'])} 条；签名={len(config['boss_candidate_signatures'])} 条")
+        self._log("info", f"下载前去重数据已下发: key={len(config['boss_candidate_keys'])} 条；签名={len(config['boss_candidate_signatures'])} 条")
         if collect_mode == "按时间采集":
             self._log("info", f"采集指令已下发，采集时间={collect_minutes}分钟")
             self._start_collect_timer(collect_minutes)
@@ -506,7 +511,14 @@ class BossWSBridge:
         command = {"type": "probe_page", "run_id": self.runtime_state.get("run_id", "")}
         self.ws_server.send_command(command)
         self._write_event_log("command_sent", command)
-        self._log("info", "已请求扩展重新检测 Boss 页面")
+        self._log("info", "已请求扩展重新检测 ehire 页面")
+
+    def clear_qiancheng_learning(self) -> None:
+        """让 ehire 页 content.js 清空已学到的 4 个 selector localStorage key，下次采集重新进入学习模式。"""
+        command = {"type": "clear_qiancheng_learning", "run_id": self.runtime_state.get("run_id", "")}
+        self.ws_server.send_command(command)
+        self._write_event_log("command_sent", command)
+        self._log("info", "已请求扩展清除 51前程无忧 selector 学习记录")
 
     def _send_persist_ack(
         self,
@@ -585,9 +597,9 @@ class BossWSBridge:
                 version = data.get("content_script_version", "?")
                 key_count = data.get("key_count", 0)
                 signature_count = data.get("signature_count", 0)
-                self._log("info", f"BOSS 内容脚本已启动采集 v{version}；去重 key={key_count} 条；签名={signature_count} 条")
-                if version and version != BOSS_CONTENT_SCRIPT_EXPECTED_VERSION:
-                    self._log("warning", f"BOSS 内容脚本版本不匹配: 当前={version}；期望={BOSS_CONTENT_SCRIPT_EXPECTED_VERSION}，请刷新 BOSS 页面")
+                self._log("info", f"内容脚本已启动采集 v{version}；去重 key={key_count} 条；签名={signature_count} 条")
+                if version and version != QIANCHENG_CONTENT_SCRIPT_EXPECTED_VERSION:
+                    self._log("warning", f"内容脚本版本不匹配: 当前={version}；期望={QIANCHENG_CONTENT_SCRIPT_EXPECTED_VERSION}，请刷新 ehire 页面")
             case "boss_pre_dedup_checked":
                 sig = data.get("candidate_signature", "未知")
                 key_count = data.get("key_count", 0)
@@ -597,21 +609,62 @@ class BossWSBridge:
                 elapsed = data.get("elapsed_ms")
                 elapsed_text = f"；耗时={elapsed}ms" if elapsed is not None else ""
                 hit = key_hit or signature_hit
-                self._log("info", f"BOSS 下载前去重检查: {sig}；结果={'命中' if hit else '未命中'}{elapsed_text}")
+                self._log("info", f"下载前去重检查: {sig}；结果={'命中' if hit else '未命中'}{elapsed_text}")
             case "boss_resume_button_lookup_started":
                 pass
             case "extension_connected":
                 version = data.get("version", "")
                 self.runtime_state["extension_connected"] = True
                 self.runtime_state["extension_version"] = version
-                self._log("info", f"扩展已连接 v{version or '?'}；期望版本={BOSS_EXTENSION_EXPECTED_VERSION}")
-                if version and version != BOSS_EXTENSION_EXPECTED_VERSION:
-                    self._log("warning", f"扩展版本不匹配: 当前={version}；期望={BOSS_EXTENSION_EXPECTED_VERSION}，请在 chrome://extensions/ 重新加载扩展")
+                self._log("info", f"扩展已连接 v{version or '?'}；期望版本={QIANCHENG_EXTENSION_EXPECTED_VERSION}")
+                if version and version != QIANCHENG_EXTENSION_EXPECTED_VERSION:
+                    self._log("warning", f"扩展版本不匹配: 当前={version}；期望={QIANCHENG_EXTENSION_EXPECTED_VERSION}，请在 chrome://extensions/ 重新加载扩展")
             case "heartbeat":
                 self.runtime_state["extension_connected"] = True
                 self.runtime_state["last_heartbeat_at"] = datetime.now().isoformat(timespec="seconds")
                 if data.get("version"):
                     self.runtime_state["extension_version"] = data.get("version", "")
+            case "qiancheng_learning_required":
+                self._log("highlight", "━━━ 51前程无忧首次学习 ━━━")
+                self._log("highlight", "本平台采集器尚未学习过 ehire 后台 DOM。请在浏览器 ehire 页面右上角的浮动 banner 中按提示完成以下 7 步：")
+                self._log("highlight", "  Step 1/7：点击左侧菜单的「人才沟通」")
+                self._log("highlight", "  Step 2/7：点击顶部菜单的「沟通中」")
+                self._log("highlight", "  Step 3/7：点击候选人列表中任意一个候选人")
+                self._log("highlight", "  Step 4/7：点击个人信息区的「候选人姓名」")
+                self._log("highlight", "  Step 5/7：点击右上角的「附件简历」按钮")
+                self._log("highlight", "  Step 6/7：预览出现后点击「下载/保存」按钮")
+                self._log("highlight", "  Step 7/7：点击预览弹窗的「关闭」按钮")
+                self._log("info", "学习结果会保存在浏览器 localStorage，完成后请把 8 个 key 的 JSON 值发给开发者写入代码。")
+            case "qiancheng_learning_started":
+                self._log("info", f"学习会话已启动；扩展版本={data.get('content_script_version', '?')}；总步数={data.get('total_steps', '?')}")
+            case "qiancheng_learning_step_skipped":
+                self._log("info", f"跳过已学习的步骤：{data.get('step', '?')}（原因={data.get('reason', '?')}）")
+            case "qiancheng_learning_step_completed":
+                step = data.get("step", "?")
+                step_labels = {
+                    "nav_menu_chat": "Step 1/7 左侧人才沟通菜单",
+                    "tab_chatting": "Step 2/7 顶部沟通中标签",
+                    "candidate_card": "Step 3/7 候选人卡片",
+                    "profile_info": "Step 4/7 个人信息区",
+                    "attachment_btn": "Step 5/7 附件简历按钮",
+                    "preview_form": "Step 6a/7 预览形态",
+                    "download_btn": "Step 6b/7 下载按钮",
+                    "close_preview": "Step 7/7 关闭弹窗按钮",
+                }
+                label = step_labels.get(step, step)
+                if step == "preview_form":
+                    self._log("highlight", f"✓ {label}：识别为 {data.get('kind', 'unknown')}")
+                else:
+                    self._log("highlight", f"✓ {label}：selector={data.get('selector', '?')[:80]}；descriptor={(data.get('descriptor', '') or '')[:60]}")
+            case "qiancheng_learning_step_failed":
+                self._log("error", f"学习步骤失败：step={data.get('step', '?')}；原因={data.get('reason', '?')}")
+            case "qiancheng_learning_finished":
+                if data.get("all_keys_captured"):
+                    self._log("highlight", "🎉 7 步学习完成。请在 Chrome F12 → Application → Local Storage → ehire.51job.com 复制 8 个 qiancheng_* key 的 JSON 值发给开发者。")
+                else:
+                    self._log("warning", "学习结束但部分 key 未捕获，建议点 09 页「清除学习记录」按钮后重做。")
+            case "qiancheng_learning_cleared":
+                self._log("info", "已清除扩展端 51前程无忧 selector 学习记录。下次开始采集会重新进入学习模式。")
             case "extension_disconnected":
                 self.runtime_state["extension_connected"] = False
                 self.runtime_state["page_ready"] = False
@@ -631,9 +684,9 @@ class BossWSBridge:
             case "boss_tabs_scanned":
                 pass
             case "content_script_inject_failed":
-                self._log("error", f"注入 Boss 页面脚本失败: {data.get('url', '')}")
+                self._log("error", f"注入 ehire 页面脚本失败: {data.get('url', '')}")
             case "content_script_message_failed":
-                self._log("error", f"Boss 页面脚本通信失败: {data.get('error', '')} {data.get('url', '')}")
+                self._log("error", f"ehire 页面脚本通信失败: {data.get('error', '')} {data.get('url', '')}")
             case "candidate_clicked":
                 sig = f"{data.get('name', '?')}/{data.get('age', '?')}/{data.get('education', '?')}"
                 elapsed = data.get("elapsed_ms")
@@ -1020,17 +1073,17 @@ class BossWSBridge:
         name = self._normalize_resume_filename_part(raw_name or signature_parts[0], "待识别")
         age = self._normalize_resume_filename_part(raw_age or signature_parts[1], "待识别")
         education = self._normalize_resume_filename_part(raw_education or signature_parts[2], "待识别")
-        key = text_hash("|".join(["boss", "profile_name_age_education", name, age, education]))
+        key = text_hash("|".join(["qiancheng", "profile_name_age_education", name, age, education]))
         if key:
             return key
-        return text_hash(f"boss|candidate_signature|{candidate_sig or ''}") or ""
+        return text_hash(f"qiancheng|candidate_signature|{candidate_sig or ''}") or ""
 
-    def _load_boss_candidate_keys(self) -> set[str]:
+    def _load_candidate_keys(self) -> set[str]:
         try:
             with create_session() as session:
-                return BossCandidateRecordService(session).list_candidate_keys("boss")
+                return BossCandidateRecordService(session).list_candidate_keys("qiancheng")
         except Exception as exc:
-            self._log("warning", f"读取 BOSS 去重记录失败: {exc}")
+            self._log("warning", f"读取 去重记录失败: {exc}")
             return set()
 
     def _normalize_boss_candidate_signature(self, signature: str) -> str:
@@ -1042,14 +1095,14 @@ class BossWSBridge:
         education = self._normalize_resume_filename_part(parts[2], "待识别")
         return f"{name}/{age}/{education}"
 
-    def _load_boss_candidate_signatures(self) -> set[str]:
+    def _load_candidate_signatures(self) -> set[str]:
         try:
             with create_session() as session:
-                signatures = BossCandidateRecordService(session).list_candidate_signatures("boss")
+                signatures = BossCandidateRecordService(session).list_candidate_signatures("qiancheng")
             normalized_signatures = {self._normalize_boss_candidate_signature(signature) for signature in signatures if signature}
             return {signature for signature in normalized_signatures if signature and signature != "待识别/待识别/待识别"}
         except Exception as exc:
-            self._log("warning", f"读取 BOSS 去重签名失败: {exc}")
+            self._log("warning", f"读取 去重签名失败: {exc}")
             return set()
 
     def _upsert_boss_candidate_record(
@@ -1075,8 +1128,8 @@ class BossWSBridge:
         with create_session() as session:
             service = BossCandidateRecordService(session)
             return service.upsert_candidate_record(
-                platform_code="boss",
-                target_site="BOSS直聘",
+                platform_code="qiancheng",
+                target_site="51前程无忧",
                 candidate_key=candidate_key,
                 candidate_signature=candidate_sig,
                 name=name if name != "待识别" else None,
@@ -1100,7 +1153,7 @@ class BossWSBridge:
         download_request_id = str(data.get("download_request_id", "") or "")
 
         if candidate_key and candidate_key in self._seen_candidate_records:
-            self._log("info", f"BOSS 去重命中，已存在记录: {candidate_sig}")
+            self._log("info", f"去重命中，已存在记录: {candidate_sig}")
             self._write_event_log("resume_saved_duplicate_skipped", {
                 "signature": candidate_sig,
                 "candidate_key": candidate_key,
@@ -1116,7 +1169,7 @@ class BossWSBridge:
             if source.exists():
                 now = datetime.now()
                 project_root = Path(__file__).resolve().parents[2]
-                target_dir = project_root / "data" / "attachments" / "boss" / now.strftime("%Y%m%d")
+                target_dir = project_root / "data" / "attachments" / "51job" / now.strftime("%Y%m%d")
                 target_dir.mkdir(parents=True, exist_ok=True)
 
                 content = source.read_bytes()
@@ -1151,7 +1204,7 @@ class BossWSBridge:
                 age = self._normalize_resume_filename_part(candidate_info.get("age"), "未知年龄")
                 education = self._normalize_resume_filename_part(candidate_info.get("education"), "未知学历")
                 seq = self.runtime_state["downloaded_count"] + 1
-                filename_stem = f"{name}-{age}-{education}-BOSS直聘-{now.strftime('%Y%m%d')}-{now.strftime('%H%M%S')}-{seq:03d}"
+                filename_stem = f"{name}-{age}-{education}-51前程无忧-{now.strftime('%Y%m%d')}-{now.strftime('%H%M%S')}-{seq:03d}"
                 filename = f"{filename_stem}{suffix}"
 
                 target = target_dir / filename
@@ -1176,7 +1229,7 @@ class BossWSBridge:
                 self._seen_candidate_records.add(candidate_key)
                 if is_new_record:
                     self.runtime_state["dedup_record_count"] += 1
-                    logger.debug("BOSS 去重记录已写入: {}", candidate_sig)
+                    logger.debug("去重记录已写入: {}", candidate_sig)
                     self._write_event_log("resume_saved_dedup_record_created", {
                         "signature": candidate_sig,
                         "candidate_key": candidate_key,
@@ -1187,7 +1240,7 @@ class BossWSBridge:
                         "at": now.isoformat(),
                     })
                 else:
-                    self._log("info", f"BOSS 去重记录已存在，未新增: {candidate_sig}")
+                    self._log("info", f"去重记录已存在，未新增: {candidate_sig}")
                     self._write_event_log("resume_saved_duplicate_record", {
                         "signature": candidate_sig,
                         "candidate_key": candidate_key,
@@ -1245,7 +1298,7 @@ class BossWSBridge:
         mapping = {
             "no_resume_attachment": "无可下载附件简历",
             "need_request_resume": "需要索要简历，已按设置跳过",
-            "boss_dedup_hit": "BOSS 去重命中，已有简历记录",
+            "boss_dedup_hit": "去重命中，已有简历记录",
             "duplicate_in_run": "本轮已处理过相同候选人签名",
             "resume_requested_by_user": "已根据用户设置索要简历",
             "resume_request_unconfirmed": "已点击索要简历但未检测到请求发送成功",
@@ -1282,7 +1335,7 @@ class BossWSBridge:
         elif reason == "no_resume_attachment":
             pass
         if reason == "boss_dedup_hit":
-            self._log("info", f"BOSS 下载前去重命中，跳过附件识别: {candidate_sig}")
+            self._log("info", f"下载前去重命中，跳过附件识别: {candidate_sig}")
         self._write_event_log("candidate_skipped_seen", {
             "signature": candidate_sig,
             "reason": reason,
@@ -1354,4 +1407,4 @@ class BossWSBridge:
             with Path(log_file).open("a", encoding="utf-8") as f:
                 f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
         except Exception as exc:
-            logger.warning("写入 Boss Extension 测试日志失败: {}", exc)
+            logger.warning("写入 Qiancheng Extension 测试日志失败: {}", exc)

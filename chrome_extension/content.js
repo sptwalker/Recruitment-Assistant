@@ -1,7 +1,61 @@
 (function () {
   "use strict";
 
-  const CONTENT_SCRIPT_VERSION = "1.68.0";
+  const CONTENT_SCRIPT_VERSION = "1.72.0";
+
+  // 平台注册表：每个平台的 hostname、WS 端口、文本标记、localStorage key 一站式声明。
+  // 这是从单平台升级到多平台的核心入口——新加平台只需在此对象增加一条配置。
+  const PLATFORM_REGISTRY = {
+    boss: {
+      code: "boss",
+      hostnames: ["www.zhipin.com"],
+      ws_url: "ws://127.0.0.1:8765",
+      auth_markers: ["沟通中", "新招呼", "联系人", "附件简历", "牛人", "聊天", "常用语", "发送", "交换微信", "打招呼"],
+      page_markers: ["沟通", "聊天", "联系人", "牛人", "BOSS", "直聘", "发送", "常用语", "附件简历"],
+      resume_view_text: ["查看附件简历", "查看简历附件", "下载附件简历", "下载简历附件"],
+      resume_requested_text: ["已向对方要附件简历", "已索要附件简历", "等待对方上传", "简历请求已发送"],
+      storage_keys: {
+        learning_stage: "boss_resume_learning_stage",
+        learned_click: "boss_resume_download_learned_click",
+      },
+    },
+    qiancheng: {
+      code: "qiancheng",
+      hostnames: ["ehire.51job.com"],
+      ws_url: "ws://127.0.0.1:8766",
+      // 以下字段为占位值，阶段 3 学习模式跑通后再校准
+      auth_markers: ["人才沟通", "应聘者", "招呼", "简历"],
+      page_markers: ["前程无忧", "51job", "ehire", "招聘", "人才"],
+      resume_view_text: [],
+      resume_requested_text: [],
+      storage_keys: {
+        learning_stage: "qiancheng_resume_learning_stage",
+        learned_click: "qiancheng_resume_download_learned_click",
+        learned_candidate_card: "qiancheng_candidate_card_selector",
+        learned_attachment_btn: "qiancheng_attachment_btn_selector",
+        learned_preview_form: "qiancheng_preview_form_kind",
+        learned_nav_menu_chat: "qiancheng_nav_menu_chat_selector",
+        learned_tab_chatting: "qiancheng_tab_chatting_selector",
+        learned_profile_info: "qiancheng_profile_info_container_selector",
+        learned_close_preview: "qiancheng_close_preview_selector",
+      },
+    },
+  };
+
+  function detectPlatform() {
+    const host = location.hostname;
+    for (const cfg of Object.values(PLATFORM_REGISTRY)) {
+      if (cfg.hostnames.includes(host)) return cfg;
+    }
+    return null;
+  }
+
+  const PLATFORM = detectPlatform();
+  if (!PLATFORM) {
+    // manifest 宽匹配可能让 content.js 注入到非目标 hostname，静默退出
+    return;
+  }
+
   if (window.__bossResumeCollectorVersion === CONTENT_SCRIPT_VERSION) {
     return;
   }
@@ -46,10 +100,10 @@
     ".base-info",
   ];
 
-  const AUTH_MARKERS = ["沟通中", "新招呼", "联系人", "附件简历", "牛人", "聊天", "常用语", "发送", "交换微信", "打招呼"];
-  const PAGE_MARKERS = ["沟通", "聊天", "联系人", "牛人", "BOSS", "直聘", "发送", "常用语", "附件简历"];
-  const RESUME_VIEW_TEXT = ["查看附件简历", "查看简历附件", "下载附件简历", "下载简历附件"];
-  const RESUME_REQUESTED_TEXT = ["已向对方要附件简历", "已索要附件简历", "等待对方上传", "简历请求已发送"];
+  const AUTH_MARKERS = PLATFORM.auth_markers;
+  const PAGE_MARKERS = PLATFORM.page_markers;
+  const RESUME_VIEW_TEXT = PLATFORM.resume_view_text;
+  const RESUME_REQUESTED_TEXT = PLATFORM.resume_requested_text;
 
 
   let state = "idle";
@@ -64,8 +118,8 @@
   const pendingPersistAcks = new Map();
   const candidateResourceIdMap = new Map();
   const STORAGE_KEYS = {
-    learningStage: "boss_resume_learning_stage",
-    learnedClick: "boss_resume_download_learned_click",
+    learningStage: PLATFORM.storage_keys.learning_stage,
+    learnedClick: PLATFORM.storage_keys.learned_click,
   };
   const resumePreviewLearnState = {
     learningStage: localStorage.getItem(STORAGE_KEYS.learningStage) || "detect_preview",
@@ -118,7 +172,7 @@
 
   function isBossPageDetected() {
     const text = `${document.title || ""} ${document.body?.innerText || ""}`;
-    return location.hostname === "www.zhipin.com" && PAGE_MARKERS.some((m) => text.includes(m));
+    return PLATFORM.hostnames.includes(location.hostname) && PAGE_MARKERS.some((m) => text.includes(m));
   }
 
   function isVisible(el) {
@@ -2070,11 +2124,627 @@
     await new Promise((resolve) => { pauseResolve = resolve; });
   }
 
+  function needsQianchengLearning() {
+    return PLATFORM.code === "qiancheng" && !isQianchengLearningComplete();
+  }
+
+  // ============================================================
+  // Qiancheng (51job ehire) 学习模式
+  // ============================================================
+  // 首次采集时通过浮动 banner 引导用户依次点击 4 个 DOM 锚点，
+  // 抓取 selector 存入 localStorage，供后续自动采集使用。
+  // ============================================================
+
+  const QIANCHENG_LEARNING_BANNER_ID = "__qc_learning_banner__";
+
+  function isQianchengLearningComplete() {
+    if (!PLATFORM || PLATFORM.code !== "qiancheng") return true;
+    const keys = PLATFORM.storage_keys || {};
+    const required = [
+      keys.learned_nav_menu_chat,
+      keys.learned_tab_chatting,
+      keys.learned_candidate_card,
+      keys.learned_profile_info,
+      keys.learned_attachment_btn,
+      keys.learned_preview_form,
+      keys.learned_click,
+      keys.learned_close_preview,
+    ];
+    for (const key of required) {
+      if (!key) continue;
+      const val = localStorage.getItem(key);
+      if (!val) return false;
+    }
+    return true;
+  }
+
+  function clearQianchengLearningKeys() {
+    if (!PLATFORM || PLATFORM.code !== "qiancheng") return;
+    const keys = PLATFORM.storage_keys || {};
+    [
+      keys.learned_nav_menu_chat,
+      keys.learned_tab_chatting,
+      keys.learned_candidate_card,
+      keys.learned_profile_info,
+      keys.learned_attachment_btn,
+      keys.learned_preview_form,
+      keys.learned_click,
+      keys.learned_close_preview,
+      keys.learning_stage,
+    ].forEach((k) => {
+      if (k) {
+        try { localStorage.removeItem(k); } catch {}
+      }
+    });
+  }
+
+  function getElementSelectorCandidates(el) {
+    // 返回当前元素 + 5 级祖先的描述链
+    const chain = [];
+    let cur = el;
+    for (let i = 0; i < 6 && cur && cur.tagName; i++) {
+      const attrs = {};
+      for (const a of (cur.attributes || [])) attrs[a.name] = String(a.value).slice(0, 200);
+      chain.push({
+        tag: cur.tagName,
+        id: cur.id || "",
+        cls: String(cur.className || "").slice(0, 240),
+        text: (cur.innerText || "").trim().slice(0, 120),
+        attrs: attrs,
+        rect: (() => { try { const r = cur.getBoundingClientRect(); return { x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height) }; } catch { return null; } })(),
+      });
+      cur = cur.parentElement;
+    }
+    return chain;
+  }
+
+  function deriveStableSelector(el) {
+    // 按优先级生成最稳定的 selector，Phase 5 固化时会再校准
+    if (!el || !el.tagName) return "";
+    // 1) data-* 属性
+    for (const a of (el.attributes || [])) {
+      const name = a.name || "";
+      if (name.startsWith("data-") && a.value && /^[a-zA-Z0-9_-]+$/.test(a.value)) {
+        return `${el.tagName.toLowerCase()}[${name}="${a.value}"]`;
+      }
+    }
+    // 2) 自身稳定 class（不含数字 hash 段）
+    const classes = String(el.className || "").split(/\s+/).filter((c) => c && !/^\d/.test(c) && !/[a-z]\d[a-zA-Z]/.test(c));
+    if (classes.length) {
+      return `${el.tagName.toLowerCase()}.${classes[0]}`;
+    }
+    // 3) role + 部分文本
+    const role = el.getAttribute && el.getAttribute("role");
+    if (role) {
+      return `${el.tagName.toLowerCase()}[role="${role}"]`;
+    }
+    return el.tagName.toLowerCase();
+  }
+
+  function ensureQianchengLearningBanner() {
+    let banner = document.getElementById(QIANCHENG_LEARNING_BANNER_ID);
+    if (banner) return banner;
+    banner = document.createElement("div");
+    banner.id = QIANCHENG_LEARNING_BANNER_ID;
+    banner.style.cssText = [
+      "position:fixed", "top:16px", "right:16px", "z-index:2147483647",
+      "background:#fff", "border:2px solid #4A90E2", "border-radius:12px",
+      "padding:14px 16px", "min-width:320px", "max-width:380px",
+      "box-shadow:0 12px 32px rgba(31,41,55,.18)",
+      "font-family:-apple-system, 'Microsoft YaHei', sans-serif",
+      "font-size:13px", "line-height:1.5", "color:#1F2937",
+    ].join(";");
+    banner.innerHTML = `
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
+        <strong style="font-size:14px;color:#4A90E2;">🎓 51前程无忧采集器首次学习</strong>
+        <span id="${QIANCHENG_LEARNING_BANNER_ID}_close" style="cursor:pointer;color:#94A3B8;font-size:18px;line-height:1;padding:0 4px;">✕</span>
+      </div>
+      <div id="${QIANCHENG_LEARNING_BANNER_ID}_step" style="margin:6px 0;font-weight:700;color:#172033;">Step 1/7</div>
+      <div id="${QIANCHENG_LEARNING_BANNER_ID}_msg" style="margin:4px 0 8px;color:#475569;">准备中...</div>
+      <div id="${QIANCHENG_LEARNING_BANNER_ID}_progress" style="display:flex;gap:5px;">
+        <span class="qc-dot" style="width:12px;height:12px;border-radius:50%;background:#E5EAF2;display:inline-block;"></span>
+        <span class="qc-dot" style="width:12px;height:12px;border-radius:50%;background:#E5EAF2;display:inline-block;"></span>
+        <span class="qc-dot" style="width:12px;height:12px;border-radius:50%;background:#E5EAF2;display:inline-block;"></span>
+        <span class="qc-dot" style="width:12px;height:12px;border-radius:50%;background:#E5EAF2;display:inline-block;"></span>
+        <span class="qc-dot" style="width:12px;height:12px;border-radius:50%;background:#E5EAF2;display:inline-block;"></span>
+        <span class="qc-dot" style="width:12px;height:12px;border-radius:50%;background:#E5EAF2;display:inline-block;"></span>
+        <span class="qc-dot" style="width:12px;height:12px;border-radius:50%;background:#E5EAF2;display:inline-block;"></span>
+      </div>
+    `;
+    document.body.appendChild(banner);
+    const closeBtn = document.getElementById(`${QIANCHENG_LEARNING_BANNER_ID}_close`);
+    if (closeBtn) {
+      closeBtn.addEventListener("click", () => {
+        banner.style.display = "none";
+      });
+    }
+    return banner;
+  }
+
+  function updateQianchengLearningBanner(stepIdx, stepTotal, message) {
+    const banner = ensureQianchengLearningBanner();
+    banner.style.display = "block";
+    const stepEl = document.getElementById(`${QIANCHENG_LEARNING_BANNER_ID}_step`);
+    const msgEl = document.getElementById(`${QIANCHENG_LEARNING_BANNER_ID}_msg`);
+    if (stepEl) stepEl.textContent = `Step ${stepIdx}/${stepTotal}`;
+    if (msgEl) msgEl.textContent = message;
+    const dots = banner.querySelectorAll(".qc-dot");
+    dots.forEach((d, i) => {
+      d.style.background = i < stepIdx - 1 ? "#16A34A" : (i === stepIdx - 1 ? "#4A90E2" : "#E5EAF2");
+    });
+  }
+
+  function dismissQianchengLearningBanner(finalMessage = "🎉 学习完成") {
+    const banner = ensureQianchengLearningBanner();
+    const stepEl = document.getElementById(`${QIANCHENG_LEARNING_BANNER_ID}_step`);
+    const msgEl = document.getElementById(`${QIANCHENG_LEARNING_BANNER_ID}_msg`);
+    if (stepEl) stepEl.textContent = "完成";
+    if (msgEl) msgEl.textContent = finalMessage;
+    const dots = banner.querySelectorAll(".qc-dot");
+    dots.forEach((d) => { d.style.background = "#16A34A"; });
+    setTimeout(() => { try { banner.style.display = "none"; } catch {} }, 5000);
+  }
+
+  function captureNextQianchengClick(timeoutMs = 120000) {
+    return new Promise((resolve) => {
+      let done = false;
+      const handler = (ev) => {
+        if (done) return;
+        const target = ev.target;
+        if (!target) return;
+        // 排除 banner 自身的点击
+        if (target.closest && target.closest(`#${QIANCHENG_LEARNING_BANNER_ID}`)) return;
+        done = true;
+        document.removeEventListener("click", handler, true);
+        clearTimeout(timer);
+        resolve({
+          ok: true,
+          target_element: target,
+          client_xy: [ev.clientX, ev.clientY],
+          chain: getElementSelectorCandidates(target),
+          selector: deriveStableSelector(target),
+        });
+      };
+      const timer = setTimeout(() => {
+        if (done) return;
+        done = true;
+        document.removeEventListener("click", handler, true);
+        resolve({ ok: false, reason: "timeout" });
+      }, timeoutMs);
+      document.addEventListener("click", handler, true);
+    });
+  }
+
+  async function detectQianchengPreviewKind(observeMs = 2000) {
+    // 监听 iframe / dialog 出现 / window.open 调用
+    const startTime = Date.now();
+    const newIframes = [];
+    const newDialogs = [];
+    let windowOpenCalled = false;
+
+    const origOpen = window.open;
+    window.open = function () {
+      windowOpenCalled = true;
+      try {
+        return origOpen.apply(this, arguments);
+      } catch (e) { return null; }
+    };
+
+    const observer = new MutationObserver((muts) => {
+      for (const m of muts) {
+        for (const n of m.addedNodes) {
+          if (n.nodeType !== 1) continue;
+          if ((n.tagName || "") === "IFRAME") {
+            newIframes.push({ src: n.getAttribute("src") || "", tag: n.tagName });
+          }
+          const cls = String(n.className || "");
+          if (/dialog|modal|preview|popup|popover|drawer/i.test(cls) || n.getAttribute?.("role") === "dialog") {
+            newDialogs.push({ tag: n.tagName, cls: cls.slice(0, 200) });
+          }
+        }
+      }
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    await sleep(observeMs);
+
+    observer.disconnect();
+    window.open = origOpen;
+
+    let kind = "unknown";
+    if (windowOpenCalled) kind = "new_window";
+    else if (newIframes.length) kind = "pdf_iframe";
+    else if (newDialogs.length) kind = "html_popup";
+
+    return {
+      kind,
+      evidence: {
+        new_iframes: newIframes.slice(0, 3),
+        new_dialogs: newDialogs.slice(0, 3),
+        window_open_called: windowOpenCalled,
+      },
+      observed_ms: Date.now() - startTime,
+    };
+  }
+
+  async function runQianchengLearningSession(runId) {
+    if (!PLATFORM || PLATFORM.code !== "qiancheng") return;
+    const keys = PLATFORM.storage_keys;
+    const TOTAL_STEPS = 7;
+    emit({ type: "qiancheng_learning_started", data: { run_id: runId, content_script_version: CONTENT_SCRIPT_VERSION, total_steps: TOTAL_STEPS } });
+
+    async function captureStep(stepIdx, stepId, prompt, storageKey) {
+      updateQianchengLearningBanner(stepIdx, TOTAL_STEPS, prompt);
+      if (localStorage.getItem(storageKey)) {
+        emit({ type: "qiancheng_learning_step_skipped", data: { step: stepId, reason: "already_learned" } });
+        return true;
+      }
+      const result = await captureNextQianchengClick();
+      if (!result.ok) {
+        emit({ type: "qiancheng_learning_step_failed", data: { step: stepId, reason: result.reason } });
+        updateQianchengLearningBanner(stepIdx, TOTAL_STEPS, "等待点击超时，请刷新页面重试");
+        return false;
+      }
+      const record = {
+        selector: result.selector,
+        text_hint: result.chain[0]?.text || "",
+        tag: result.chain[0]?.tag || "",
+        class: result.chain[0]?.cls || "",
+        parent_chain: result.chain.slice(1, 4).map((p) => `${p.tag}.${(p.cls || "").split(/\s+/)[0]}`),
+        chain_detail: result.chain,
+        client_xy: result.client_xy,
+        captured_at: new Date().toISOString(),
+      };
+      try { localStorage.setItem(storageKey, JSON.stringify(record)); } catch {}
+      emit({ type: "qiancheng_learning_step_completed", data: { step: stepId, selector: record.selector, descriptor: record.text_hint } });
+      return true;
+    }
+
+    // Step 1/7: 左侧"人才沟通"菜单
+    if (!await captureStep(1, "nav_menu_chat", "请点击左侧菜单的「人才沟通」", keys.learned_nav_menu_chat)) return;
+    await sleep(500);
+
+    // Step 2/7: 顶部"沟通中"标签
+    if (!await captureStep(2, "tab_chatting", "请点击顶部菜单的「沟通中」标签", keys.learned_tab_chatting)) return;
+    await sleep(500);
+
+    // Step 3/7: 候选人卡片
+    if (!await captureStep(3, "candidate_card", "请点击左侧候选人列表中任意一个候选人", keys.learned_candidate_card)) return;
+    await sleep(500);
+
+    // Step 4/7: 个人信息区（让用户点姓名，selector 推导时往上找信息容器）
+    if (!await captureStep(4, "profile_info", "请点击右上方个人信息区的「候选人姓名」（用于提取姓名/年龄/学历做去重）", keys.learned_profile_info)) return;
+    await sleep(500);
+
+    // Step 5/7: "附件简历"按钮 + Step 6/7 自动检测预览形态
+    updateQianchengLearningBanner(5, TOTAL_STEPS, "请点击右上角的「附件简历」按钮");
+    if (!localStorage.getItem(keys.learned_attachment_btn)) {
+      const result = await captureNextQianchengClick();
+      if (!result.ok) {
+        emit({ type: "qiancheng_learning_step_failed", data: { step: "attachment_btn", reason: result.reason } });
+        updateQianchengLearningBanner(5, TOTAL_STEPS, "等待点击超时，请刷新页面重试");
+        return;
+      }
+      const record = {
+        selector: result.selector,
+        text_hint: result.chain[0]?.text || "",
+        tag: result.chain[0]?.tag || "",
+        class: result.chain[0]?.cls || "",
+        parent_chain: result.chain.slice(1, 4).map((p) => `${p.tag}.${(p.cls || "").split(/\s+/)[0]}`),
+        chain_detail: result.chain,
+        client_xy: result.client_xy,
+        captured_at: new Date().toISOString(),
+      };
+      try { localStorage.setItem(keys.learned_attachment_btn, JSON.stringify(record)); } catch {}
+      emit({ type: "qiancheng_learning_step_completed", data: { step: "attachment_btn", selector: record.selector, descriptor: record.text_hint } });
+    }
+
+    // Step 6/7: 自动检测预览形态（无需用户点击）
+    updateQianchengLearningBanner(6, TOTAL_STEPS, "等待预览出现，自动识别形态中...");
+    if (!localStorage.getItem(keys.learned_preview_form)) {
+      const detection = await detectQianchengPreviewKind(2500);
+      const record = { ...detection, captured_at: new Date().toISOString() };
+      try { localStorage.setItem(keys.learned_preview_form, JSON.stringify(record)); } catch {}
+      emit({ type: "qiancheng_learning_step_completed", data: { step: "preview_form", kind: detection.kind, evidence: detection.evidence } });
+      if (detection.kind === "unknown") {
+        updateQianchengLearningBanner(6, TOTAL_STEPS, "⚠ 未识别到预览形态（点击「清除学习记录」后重做可重试）");
+        await sleep(3000);
+      }
+    }
+
+    // Step 6/7 续：预览页"下载"按钮
+    updateQianchengLearningBanner(6, TOTAL_STEPS, "预览已出现，请在预览页里点击「下载/保存」按钮");
+    if (!localStorage.getItem(keys.learned_click)) {
+      const result = await captureNextQianchengClick();
+      if (!result.ok) {
+        emit({ type: "qiancheng_learning_step_failed", data: { step: "download_btn", reason: result.reason } });
+        updateQianchengLearningBanner(6, TOTAL_STEPS, "等待点击超时，请刷新页面重试");
+        return;
+      }
+      const record = {
+        selector: result.selector,
+        text_hint: result.chain[0]?.text || "",
+        tag: result.chain[0]?.tag || "",
+        class: result.chain[0]?.cls || "",
+        parent_chain: result.chain.slice(1, 4).map((p) => `${p.tag}.${(p.cls || "").split(/\s+/)[0]}`),
+        chain_detail: result.chain,
+        client_xy: result.client_xy,
+        captured_at: new Date().toISOString(),
+      };
+      try { localStorage.setItem(keys.learned_click, JSON.stringify(record)); } catch {}
+      emit({ type: "qiancheng_learning_step_completed", data: { step: "download_btn", selector: record.selector, descriptor: record.text_hint } });
+    }
+
+    // Step 7/7: 关闭弹窗按钮
+    if (!await captureStep(7, "close_preview", "下载已触发。请点击预览弹窗的「关闭/×」按钮", keys.learned_close_preview)) return;
+
+    dismissQianchengLearningBanner("🎉 7 步学习完成，请把 8 个 localStorage 值发给开发者写入代码");
+    emit({ type: "qiancheng_learning_finished", data: { run_id: runId, all_keys_captured: isQianchengLearningComplete() } });
+  }
+
+  // ============================================================
+  // Qiancheng (51job ehire) 采集主循环 + 专用 selectors
+  // ============================================================
+
+  const QIANCHENG_SELECTORS = {
+    nav_menu_chat: "#sensor_talentcommunicate",
+    tab_chatting: "#sensor_Bchat_communication",
+    candidate_list_container: "#conversation-list .content-list",
+    candidate_card: ".list-item",
+    candidate_card_click_target: ".item-content",
+    profile_info_container: ".info-main",
+    profile_name: ".info-main .im_userName .username-text",
+    profile_link_info: ".info-main .person-info .link-info",
+    attachment_btn_scope: ".chat-user-operate",
+    attachment_btn_text: "附件简历",
+    preview_container: ".annex-resume",
+    preview_ready_marker: ".annex-resume .container-options-item.item-download",
+    download_btn_sensor: "#sensor_Bchatinfo_xiazai",
+    download_btn_class: ".container-options-item.item-download",
+    close_preview: ".annex-resume .container-close",
+  };
+
+  const QIANCHENG_EDUCATION_KEYWORDS = ["博士", "硕士", "本科", "大专", "专科", "高中", "中专", "中职", "初中"];
+
+  function extractQianchengContactInfo() {
+    const info = { name: "待识别", age: "待识别", education: "待识别", raw_text: "" };
+    const root = document.querySelector(QIANCHENG_SELECTORS.profile_info_container);
+    if (!root) return info;
+    const nameEl = root.querySelector(QIANCHENG_SELECTORS.profile_name) || root.querySelector(".username-text");
+    if (nameEl) info.name = (nameEl.innerText || nameEl.textContent || "").trim() || "待识别";
+    const linkEl = root.querySelector(QIANCHENG_SELECTORS.profile_link_info) || root.querySelector(".link-info");
+    let segments = [];
+    if (linkEl) {
+      const title = linkEl.getAttribute("title") || "";
+      const text = title || linkEl.innerText || linkEl.textContent || "";
+      info.raw_text = text;
+      segments = text.split(/[|｜/、,，]/).map((s) => s.trim()).filter(Boolean);
+    }
+    for (const seg of segments) {
+      if (/\d+\s*岁/.test(seg) && info.age === "待识别") {
+        info.age = seg.replace(/\s+/g, "");
+        continue;
+      }
+      for (const kw of QIANCHENG_EDUCATION_KEYWORDS) {
+        if (seg.includes(kw) && info.education === "待识别") {
+          info.education = kw;
+          break;
+        }
+      }
+    }
+    return info;
+  }
+
+  function getQianchengCandidateItems() {
+    const container = document.querySelector(QIANCHENG_SELECTORS.candidate_list_container);
+    if (!container) return [];
+    return Array.from(container.querySelectorAll(QIANCHENG_SELECTORS.candidate_card));
+  }
+
+  function findQianchengAttachmentButton() {
+    const scope = document.querySelector(QIANCHENG_SELECTORS.attachment_btn_scope);
+    if (!scope) return null;
+    const candidates = Array.from(scope.querySelectorAll("span, div, button, a"));
+    for (const el of candidates) {
+      const txt = (el.innerText || el.textContent || "").trim();
+      if (txt === QIANCHENG_SELECTORS.attachment_btn_text) {
+        return el;
+      }
+    }
+    const fallback = scope.querySelector(".file-type-text");
+    if (fallback && (fallback.innerText || "").trim().includes("附件")) return fallback;
+    return null;
+  }
+
+  async function waitForQianchengPreviewReady(timeoutMs = 5000) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const marker = document.querySelector(QIANCHENG_SELECTORS.preview_ready_marker);
+      if (marker) {
+        const rect = marker.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0) return marker;
+      }
+      await sleep(200);
+    }
+    return null;
+  }
+
+  function findQianchengDownloadButton() {
+    const sensor = document.querySelector(QIANCHENG_SELECTORS.download_btn_sensor);
+    if (sensor) return sensor;
+    return document.querySelector(QIANCHENG_SELECTORS.download_btn_class);
+  }
+
+  function findQianchengClosePreviewButton() {
+    return document.querySelector(QIANCHENG_SELECTORS.close_preview);
+  }
+
+  async function ensureQianchengOnChattingPage() {
+    if (document.querySelector(QIANCHENG_SELECTORS.candidate_list_container)) return true;
+    const navMenu = document.querySelector(QIANCHENG_SELECTORS.nav_menu_chat);
+    if (navMenu) {
+      clickElementReliably(navMenu);
+      await sleep(1500);
+    }
+    const tab = document.querySelector(QIANCHENG_SELECTORS.tab_chatting);
+    if (tab) {
+      clickElementReliably(tab);
+      await sleep(800);
+    }
+    return Boolean(document.querySelector(QIANCHENG_SELECTORS.candidate_list_container));
+  }
+
+  function buildQianchengCandidateKey(info) {
+    const name = (info.name || "").trim();
+    const age = (info.age || "").trim();
+    const education = (info.education || "").trim();
+    if (!name || name === "待识别") return "";
+    return `qiancheng|profile|${name}|${age}|${education}`;
+  }
+
+  async function qianchengCollectLoop() {
+    emit({ type: "page_ready", data: { url: location.href, platform: "qiancheng" } });
+    const ready = await ensureQianchengOnChattingPage();
+    if (!ready) {
+      emit({ type: "error", data: { message: "未能进入沟通中页面，请手动点击「人才沟通」并切到「沟通中」标签后再开始采集", stage: "navigation" } });
+      state = "idle";
+      return;
+    }
+
+    const items = getQianchengCandidateItems();
+    if (items.length === 0) {
+      emit({ type: "error", data: { message: "未找到候选人列表（沟通中标签为空）", stage: "scan" } });
+      state = "idle";
+      return;
+    }
+    emit({ type: "collect_progress", data: { scanned_count: 0, current_index: 0, total_in_list: items.length } });
+
+    const seenSignatures = new Set();
+    const dedupSignatures = new Set(Array.isArray(config.boss_candidate_signatures) ? config.boss_candidate_signatures : []);
+    const dedupKeys = new Set(Array.isArray(config.boss_candidate_keys) ? config.boss_candidate_keys : []);
+
+    for (let i = 0; i < items.length && results.completed < config.max_resumes; i++) {
+      if (state === "stopped") break;
+      await waitForPause();
+      if (state === "stopped") break;
+
+      results.currentIndex = i;
+      const card = items[i];
+      const clickTarget = card.querySelector(QIANCHENG_SELECTORS.candidate_card_click_target) || card;
+      try {
+        card.scrollIntoView({ block: "center" });
+        await sleep(120);
+        clickElementReliably(clickTarget);
+        await sleep(600);
+      } catch (error) {
+        emit({ type: "candidate_skipped", data: { candidate_signature: `index_${i}`, reason: "click_failed", error: String(error) } });
+        results.skipped++;
+        emit({ type: "collect_progress", data: { scanned_count: i + 1, current_index: i, downloaded: results.completed, skipped: results.skipped } });
+        continue;
+      }
+
+      const info = extractQianchengContactInfo();
+      const signature = `${info.name}/${info.age}/${info.education}`;
+      const candidateId = `${activeRunId || "run"}_${i}_${signature}`;
+
+      emit({ type: "candidate_clicked", data: { ...info, candidate_id: candidateId, candidate_signature: signature, index: i } });
+
+      if (signature === "待识别/待识别/待识别") {
+        emit({ type: "candidate_skipped", data: { candidate_id: candidateId, candidate_signature: signature, reason: "candidate_info_unrecognized", raw_text: info.raw_text } });
+        results.skipped++;
+        continue;
+      }
+
+      if (seenSignatures.has(signature)) {
+        emit({ type: "candidate_skipped", data: { candidate_id: candidateId, candidate_signature: signature, reason: "duplicate_in_run" } });
+        results.skipped++;
+        continue;
+      }
+      seenSignatures.add(signature);
+
+      const normalized = normalizeBossCandidateSignature(signature);
+      const candidateKey = buildQianchengCandidateKey(info);
+      const sigHit = dedupSignatures.has(signature) || dedupSignatures.has(normalized);
+      const keyHit = candidateKey && dedupKeys.has(candidateKey);
+      emit({ type: "boss_pre_dedup_checked", data: { candidate_id: candidateId, candidate_signature: signature, normalized_signature: normalized, candidate_key: candidateKey, key_hit: keyHit, signature_hit: sigHit } });
+      if (sigHit || keyHit) {
+        emit({ type: "candidate_skipped", data: { candidate_id: candidateId, candidate_signature: signature, reason: "boss_dedup_hit", candidate_key: candidateKey } });
+        results.skipped++;
+        continue;
+      }
+
+      const attachmentBtn = findQianchengAttachmentButton();
+      if (!attachmentBtn) {
+        emit({ type: "candidate_skipped", data: { candidate_id: candidateId, candidate_signature: signature, reason: "no_resume_attachment" } });
+        results.skipped++;
+        continue;
+      }
+
+      emit({ type: "resume_attachment_click_dispatched", data: { candidate_id: candidateId, candidate_signature: signature, button_state: "bright", button_text: "附件简历" } });
+      clickElementReliably(attachmentBtn);
+      await sleep(400);
+
+      const previewMarker = await waitForQianchengPreviewReady(5000);
+      if (!previewMarker) {
+        emit({ type: "candidate_skipped", data: { candidate_id: candidateId, candidate_signature: signature, reason: "resume_preview_not_found" } });
+        results.skipped++;
+        continue;
+      }
+      emit({ type: "resume_preview_detected", data: { candidate_id: candidateId, candidate_signature: signature, preview_source: "qiancheng_annex_resume" } });
+
+      const downloadBtn = findQianchengDownloadButton();
+      if (!downloadBtn) {
+        emit({ type: "candidate_skipped", data: { candidate_id: candidateId, candidate_signature: signature, reason: "download_button_not_found" } });
+        results.skipped++;
+        const closeBtn = findQianchengClosePreviewButton();
+        if (closeBtn) { clickElementReliably(closeBtn); await sleep(400); }
+        continue;
+      }
+
+      const downloadRequestId = makeDownloadRequestId(candidateId, signature);
+      emit({ type: "download_intent", data: { candidate_id: candidateId, candidate_signature: signature, candidate_info: info, expected_filename: `${signature}.pdf`, download_request_id: downloadRequestId } });
+      const resultPromise = waitForDownloadResult(downloadRequestId, 20000);
+      clickElementReliably(downloadBtn);
+      const downloadResult = await resultPromise;
+      if (downloadResult.ok) {
+        await finalizeDownloadWithPersistAck(candidateId, signature, downloadRequestId, "qiancheng_sensor_download");
+        dedupSignatures.add(signature);
+        if (candidateKey) dedupKeys.add(candidateKey);
+      } else {
+        emit({ type: "candidate_skipped", data: { candidate_id: candidateId, candidate_signature: signature, reason: downloadResult.reason || "download_failed" } });
+        results.skipped++;
+      }
+
+      const closeBtn = findQianchengClosePreviewButton();
+      if (closeBtn) {
+        clickElementReliably(closeBtn);
+        await sleep(500);
+      }
+
+      emit({ type: "collect_progress", data: { scanned_count: i + 1, current_index: i, downloaded: results.completed, skipped: results.skipped } });
+      await sleep(Math.max(800, config.interval_ms || 1500));
+    }
+
+    state = "idle";
+    if (!collectFinishedEmitted) {
+      emit({ type: "collect_finished", data: { total_completed: results.completed, total_skipped: results.skipped } });
+      collectFinishedEmitted = true;
+    }
+  }
+
   async function collectLoop() {
     if (!isActiveInstance()) return;
     if (activeCollectLoopRunId === activeRunId) return;
     activeCollectLoopRunId = activeRunId;
     try {
+      if (needsQianchengLearning()) {
+        await runQianchengLearningSession();
+        return;
+      }
+      if (PLATFORM && PLATFORM.code === "qiancheng") {
+        await qianchengCollectLoop();
+        return;
+      }
       if (!isAuthenticated()) {
       emit({ type: "error", data: { message: "未检测到登录态", stage: "pre_check" } });
       state = "idle";
@@ -2270,6 +2940,18 @@
         window.__bossResumeCollectorActiveInstance = INSTANCE_ID;
         activeRunId = msg.run_id || `${Date.now()}`;
         if (state === "collecting" && activeCollectLoopRunId === activeRunId) break;
+        // qiancheng 平台首次采集前先走 4 步学习引导
+        if (PLATFORM && PLATFORM.code === "qiancheng" && !isQianchengLearningComplete()) {
+          state = "collecting";
+          emit({ type: "qiancheng_learning_required", data: { run_id: activeRunId, content_script_version: CONTENT_SCRIPT_VERSION } });
+          runQianchengLearningSession(activeRunId).catch((err) => {
+            emit({ type: "qiancheng_learning_step_failed", data: { step: "session_error", reason: String(err) } });
+          }).finally(() => {
+            state = "idle";
+            emit({ type: "collect_finished", data: { reason: "learning_session_ended", total: 0 } });
+          });
+          break;
+        }
         state = "collecting";
         config = {
           ...config,
@@ -2320,6 +3002,10 @@
       case "resume_collect":
         state = "collecting";
         if (pauseResolve) { pauseResolve(); pauseResolve = null; }
+        break;
+      case "clear_qiancheng_learning":
+        clearQianchengLearningKeys();
+        emit({ type: "qiancheng_learning_cleared", data: { run_id: msg.run_id || activeRunId, content_script_version: CONTENT_SCRIPT_VERSION } });
         break;
       case "reset_content_script":
         window.__bossResumeCollectorVersion = "";

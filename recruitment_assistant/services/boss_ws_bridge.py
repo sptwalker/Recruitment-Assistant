@@ -20,9 +20,9 @@ from recruitment_assistant.utils.hash_utils import text_hash
 from recruitment_assistant.utils.snapshot_utils import safe_filename
 
 
-BOSS_BRIDGE_VERSION = "1.80.0"
-BOSS_EXTENSION_EXPECTED_VERSION = "1.73.0"
-BOSS_CONTENT_SCRIPT_EXPECTED_VERSION = "1.73.0"
+BOSS_BRIDGE_VERSION = "1.89.0"
+BOSS_EXTENSION_EXPECTED_VERSION = "1.82.0"
+BOSS_CONTENT_SCRIPT_EXPECTED_VERSION = "1.82.0"
 
 
 class BossWSBridge:
@@ -763,10 +763,8 @@ class BossWSBridge:
                 self._log("highlight", f"命中 PDF iframe 简历预览页: {sig}")
             case "resume_download_strategy_start":
                 sig = data.get("candidate_signature", "未知")
-                logger.debug(
-                    "开始尝试捕获简历下载链接: sig={} PDF iframe={}",
-                    sig, data.get("pdf_iframe", False),
-                )
+                preview_source = data.get("preview_source", "")
+                self._log("info", f"开始尝试下载: {sig}；预览类型={preview_source}")
             case "direct_iframe_download_resolved":
                 pass
             case "direct_iframe_download_start":
@@ -781,6 +779,22 @@ class BossWSBridge:
             case "direct_iframe_download_skipped":
                 sig = data.get("candidate_signature", "未知")
                 self._log("info", f"跳过 iframe 直接下载: {sig}；原因={data.get('reason', '')}")
+            case "dom_text_download_url_scan_started":
+                sig = data.get("candidate_signature", "未知")
+                self._log("info", f"扫描 dom_text 弹窗下载链接: {sig}")
+            case "dom_text_download_url_found":
+                sig = data.get("candidate_signature", "未知")
+                source = data.get("source", "")
+                self._log("highlight", f"dom_text 弹窗发现下载链接: {sig}；来源={source}")
+            case "dom_text_download_url_not_found":
+                sig = data.get("candidate_signature", "未知")
+                self._log("info", f"dom_text 弹窗未发现下载链接: {sig}；锚标签={data.get('anchor_count', 0)}；Vue 元素={data.get('vue_element_count', 0)}")
+            case "dom_text_direct_download_failed":
+                sig = data.get("candidate_signature", "未知")
+                self._log("error", f"dom_text 直接下载失败: {sig}；原因={data.get('reason', '')}")
+            case "all_download_strategies_exhausted":
+                sig = data.get("candidate_signature", "未知")
+                self._log("error", f"所有下载策略均未成功: {sig}；预览类型={data.get('preview_source', '')}")
             case "direct_iframe_download_created":
                 pass
             case "direct_iframe_download_link_captured":
@@ -801,14 +815,14 @@ class BossWSBridge:
                 self._log("error", f"Chrome 后台直接下载启动失败: {sig}；原因={data.get('reason', '')}")
             case "boss_svg_download_icon_scan_started":
                 sig = data.get("candidate_signature", "未知")
-                logger.debug("开始扫描 boss-svg 下载组件: sig={}", sig)
+                self._log("info", f"扫描 boss-svg 下载组件: {sig}")
             case "boss_svg_download_icon_found":
                 sig = data.get("candidate_signature", "未知")
                 path = str(data.get("component_path", ""))[:160]
                 self._log("highlight", f"命中 boss-svg 下载组件: {sig}；路径={path}")
             case "boss_svg_download_icon_not_found":
                 sig = data.get("candidate_signature", "未知")
-                logger.debug("未命中 boss-svg 下载组件，尝试其他策略: sig={}", sig)
+                self._log("info", f"boss-svg 下载组件未命中，尝试其他策略: {sig}")
             case "boss_svg_download_icon_clicked":
                 sig = data.get("candidate_signature", "未知")
                 self._log("highlight", f"已点击 boss-svg 下载组件，等待 Chrome 下载事件: {sig}")
@@ -817,10 +831,9 @@ class BossWSBridge:
                 candidates = data.get("candidates") or []
                 if candidates:
                     top = candidates[0] or {}
-                    logger.debug(
-                        "下载按钮候选诊断: sig={} 数量={} 首选score={} 路径={}",
-                        sig, len(candidates), top.get("score", ""), str(top.get("path", ""))[:140],
-                    )
+                    self._log("info", f"下载按钮候选: {sig}；数量={len(candidates)}；首选score={top.get('score', '')}；描述={str(top.get('text', ''))[:100]}")
+                else:
+                    self._log("info", f"下载按钮候选: {sig}；数量=0")
             case "download_click_post_diagnostics":
                 sig = data.get("candidate_signature", "未知")
                 diagnostics = data.get("diagnostics") or {}

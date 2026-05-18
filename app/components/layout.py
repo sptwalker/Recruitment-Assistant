@@ -5,7 +5,7 @@ BG = "#F5F7FA"
 WHITE = "#FFFFFF"
 SUCCESS_BG = "#E6F4EA"
 ACCENT = "#FF9F43"
-APP_VERSION = "V2.07"
+APP_VERSION = "V2.16"
 
 MENU_ITEMS = [
     ("首页", "⌂", "/"),

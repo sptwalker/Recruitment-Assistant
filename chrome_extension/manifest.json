@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "招聘平台采集助手",
   "description": "配合招聘助手系统，在 BOSS 直聘 / 51 前程无忧（ehire）页面内自动采集附件简历。",
-  "version": "1.73.0",
+  "version": "1.82.0",
   "permissions": ["activeTab", "downloads", "storage", "tabs", "scripting"],
   "host_permissions": [
     "https://www.zhipin.com/*",

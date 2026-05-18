@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  const CONTENT_SCRIPT_VERSION = "1.73.0";
+  const CONTENT_SCRIPT_VERSION = "1.82.0";
 
   // 平台注册表：每个平台的 hostname、WS 端口、文本标记、localStorage key 一站式声明。
   // 这是从单平台升级到多平台的核心入口——新加平台只需在此对象增加一条配置。
@@ -338,8 +338,9 @@
     const blacklist = new Set([
       "沟通", "在线", "附件", "附件简历", "简历附件", "交换微信", "常用语", "招聘者", "职位管理", "推荐牛人", "搜索",
       "刚刚", "刚刚活跃", "今日", "今日活跃", "昨日", "昨日活跃", "活跃", "下载", "查看", "简历", "下载简历", "查看简历", "下简历",
+      "游戏", "标注", "运营", "开发", "测试", "设计", "运维", "策划", "编程", "销售", "教育", "培训", "直播", "电商", "外贸",
     ]);
-    return !baseValue || blacklist.has(value) || blacklist.has(baseValue) || /简历|下载|附件|查看|沟通|职位|推荐|搜索|客服|工具/.test(baseValue);
+    return !baseValue || blacklist.has(value) || blacklist.has(baseValue) || /简历|下载|附件|查看|沟通|职位|推荐|搜索|客服|工具|数据标注|数据分析|数据运营|游戏策划|游戏测试|游戏运营|产品经理|产品助理|前端开发|后端开发|全栈开发|运维工程|测试工程|算法工程|人工智能|机器学习|深度学习|自然语言|计算机视|软件开发|软件工程|系统运维|网络工程|项目经理|项目管理|电商运营|新媒体|内容运营|短视频|直播运营|平面设计|UI设计|视觉设计|交互设计|客户经理|商务拓展|市场营销|人力资源|行政助理|财务会计/.test(baseValue);
   }
 
   function parseContactText(text) {
@@ -386,9 +387,20 @@
   async function sha256Hex(value = "") {
     const normalized = String(value || "").trim().toLowerCase();
     if (!normalized) return "";
-    const bytes = new TextEncoder().encode(normalized);
-    const digest = await crypto.subtle.digest("SHA-256", bytes);
-    return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, "0")).join("");
+    try {
+      const bytes = new TextEncoder().encode(normalized);
+      const digest = await Promise.race([
+        crypto.subtle.digest("SHA-256", bytes),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("sha256_timeout")), 3000))
+      ]);
+      return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, "0")).join("");
+    } catch (e) {
+      let hash = 0;
+      for (let i = 0; i < normalized.length; i++) {
+        hash = ((hash << 5) - hash + normalized.charCodeAt(i)) | 0;
+      }
+      return Math.abs(hash).toString(16).padStart(8, "0");
+    }
   }
 
   function normalizeBossCandidateSignature(signature = "") {
@@ -419,6 +431,10 @@
     for (const value of names) {
       if (!isInvalidCandidateNameToken(value)) return value;
     }
+    const englishName = source.match(/^([A-Za-z][A-Za-z\s.\-]{1,24}[A-Za-z.])/);
+    if (englishName) return englishName[1].trim();
+    const singleChar = source.match(/^([一-龥])\s*\d/);
+    if (singleChar && !isInvalidCandidateNameToken(singleChar[1])) return singleChar[1];
     return "";
   }
 
@@ -449,6 +465,142 @@
     return rect.left >= pageWidth * 0.42 && rect.left <= pageWidth * 0.78 && rect.top >= 80 && rect.top <= 170;
   }
 
+  function isJobTitleContext(el) {
+    const jobLabelRe = /沟通职位|期望职位|求职意向|应聘职位/;
+    let node = el.parentElement;
+    for (let i = 0; i < 3 && node && node !== document.body; i++) {
+      if (node.className && /job|position|expect|intent/i.test(String(node.className))) return true;
+      const directText = Array.from(node.childNodes).filter((n) => n.nodeType === 3).map((n) => n.textContent).join("");
+      if (jobLabelRe.test(directText)) return true;
+      for (const sib of node.children) {
+        if (sib === el || sib.contains(el)) continue;
+        const sibText = sib.textContent || "";
+        if (sibText.length < 20 && jobLabelRe.test(sibText)) return true;
+      }
+      node = node.parentElement;
+    }
+    return false;
+  }
+
+  function findAgeAnchorInRightPanel() {
+    const AGE_RE = /\d{2}\s*\u5c81/;
+    const pageWidth = window.innerWidth || document.documentElement.clientWidth || 0;
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        if (!node.textContent || !AGE_RE.test(node.textContent)) return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_ACCEPT;
+      }
+    });
+    while (walker.nextNode()) {
+      const el = walker.currentNode.parentElement;
+      if (!el || !isVisible(el)) continue;
+      const rect = el.getBoundingClientRect();
+      if (rect.left < pageWidth * 0.28 || rect.top < 60 || rect.top > 200) continue;
+      if (rect.height < 8 || rect.height > 50) continue;
+      const text = (el.innerText || el.textContent || "").trim();
+      if (text.length > 60) continue;
+      return { el, rect, text };
+    }
+    return null;
+  }
+
+  function getInfoBarContainer(ageEl) {
+    let node = ageEl;
+    for (let i = 0; i < 6; i++) {
+      const parent = node.parentElement;
+      if (!parent || parent === document.body) break;
+      const pRect = parent.getBoundingClientRect();
+      if (pRect.height > 100 || pRect.width > 900) break;
+      const pText = parent.innerText || "";
+      if (/[|\uff5c]/.test(pText) && pRect.width > 150) return parent;
+      node = parent;
+    }
+    return node;
+  }
+
+  function findLargestFontElement(container, centerY) {
+    const candidates = [];
+    const els = container.querySelectorAll("*");
+    for (const el of els) {
+      if (!isVisible(el)) continue;
+      const rect = el.getBoundingClientRect();
+      if (Math.abs((rect.top + rect.height / 2) - centerY) > 20) continue;
+      if (rect.width < 10 || rect.width > 200 || rect.height < 10 || rect.height > 50) continue;
+      const text = (el.innerText || "").trim();
+      if (!text || text.length > 30 || /[|\uff5c]/.test(text)) continue;
+      if (el.children.length > 2) continue;
+      candidates.push({ el, rect, text });
+    }
+    let maxFs = 0, best = null;
+    for (const c of candidates) {
+      const fs = parseFloat(getComputedStyle(c.el).fontSize);
+      if (fs > maxFs) { maxFs = fs; best = { ...c, fontSize: fs }; }
+    }
+    return best;
+  }
+
+  function hasGenderIndicator(nameEl) {
+    const GENDER_TEXT = /[\u2642\u2640]|^[\u7537\u5973]$/;
+    const GENDER_CLASS = /sex|gender|male|female|icon-man|icon-woman/i;
+    const parent = nameEl.parentElement;
+    if (!parent) return false;
+    const nameRect = nameEl.getBoundingClientRect();
+    for (const sib of parent.children) {
+      if (sib === nameEl) continue;
+      const sibRect = sib.getBoundingClientRect();
+      if (sibRect.left < nameRect.right - 5 || sibRect.left > nameRect.right + 80) continue;
+      const sibText = (sib.innerText || sib.textContent || "").trim();
+      if (GENDER_TEXT.test(sibText) || GENDER_CLASS.test(sib.className || "")) return true;
+      const icon = sib.querySelector("[class*='sex'], [class*='gender'], [class*='male'], [class*='female']");
+      if (icon) return true;
+    }
+    const next = nameEl.nextElementSibling;
+    if (next) {
+      const nt = (next.innerText || next.textContent || "").trim();
+      if (GENDER_TEXT.test(nt) || GENDER_CLASS.test(next.className || "")) return true;
+    }
+    return false;
+  }
+
+  function extractEducationFromPipes(container) {
+    const EDU_RE = /\u535a\u58eb|\u7855\u58eb|\u7814\u7a76\u751f|\u672c\u79d1|\u5927\u4e13|\u4e13\u79d1|\u9ad8\u4e2d|\u4e2d\u4e13/;
+    const fullText = (container.innerText || "").replace(/\s+/g, " ").trim();
+    const segments = fullText.split(/[|\uff5c]/);
+    for (const seg of segments) {
+      const m = seg.match(EDU_RE);
+      if (m) return normalizeEducation(m[0]);
+    }
+    return "";
+  }
+
+  function findProfileByFontSize() {
+    const ageAnchor = findAgeAnchorInRightPanel();
+    if (!ageAnchor) return null;
+    const ageMatch = ageAnchor.text.match(/(\d{2})\s*\u5c81/);
+    if (!ageMatch) return null;
+    const container = getInfoBarContainer(ageAnchor.el);
+    const ageCenterY = ageAnchor.rect.top + ageAnchor.rect.height / 2;
+    const largest = findLargestFontElement(container, ageCenterY);
+    if (!largest) return null;
+    const rawName = largest.text.replace(/[\u2642\u2640\s]/g, "").trim();
+    const cleanName = stripActivityText(rawName);
+    const nameFromLargest = parseTopProfileName(cleanName) || cleanName.replace(/\u5728\u7ebf|\u6d3b\u8dc3|\u5206\u949f\u524d.*$/g, "").trim();
+    if (!nameFromLargest || isInvalidCandidateNameToken(nameFromLargest)) return null;
+    if (largest.el === ageAnchor.el) return null;
+    const genderOk = hasGenderIndicator(largest.el);
+    const education = extractEducationFromPipes(container);
+    const age = `${ageMatch[1]}\u5c81`;
+    const rawText = `${nameFromLargest} ${ageAnchor.text} ${education}`.replace(/\s+/g, " ").trim();
+    return {
+      el: ageAnchor.el,
+      info: { name: nameFromLargest, age, education: education || "\u5f85\u8bc6\u522b", raw_text: rawText.slice(0, 160) },
+      score: genderOk ? 120 : 105,
+      top: ageAnchor.rect.top,
+      area: ageAnchor.rect.width * ageAnchor.rect.height,
+      len: rawText.length,
+    };
+  }
+
   function getTopProfileTokens() {
     return Array.from(document.querySelectorAll("body *"))
       .filter((el) => {
@@ -459,13 +611,17 @@
         const text = textOf(el);
         if (!text || text.length > 180) return false;
         if (/职位管理|推荐牛人|牛人管理|工具箱|招聘规范|我的客服|在线简历|附件简历|沟通职位|期望|工作经历|职位:|沟通职位/.test(text)) return false;
-        return /\d{2}\s*岁|博士|硕士|研究生|本科|大专|专科|高中|中专|[\u4e00-\u9fa5]{2,4}/.test(text);
+        if (isJobTitleContext(el)) return false;
+        return /\d{2}\s*岁|博士|硕士|研究生|本科|大专|专科|高中|中专|[\u4e00-\u9fa5]{2,4}|[A-Za-z]{2,}/.test(text);
       })
       .map((el) => ({ el, rect: el.getBoundingClientRect(), text: textOf(el) }))
       .sort((a, b) => a.rect.left - b.rect.left || a.rect.top - b.rect.top);
   }
 
   function findTopProfileInfoRoot() {
+    const fontSizeResult = findProfileByFontSize();
+    if (fontSizeResult) return fontSizeResult;
+
     const tokens = getTopProfileTokens();
     const nameTokens = tokens
       .filter((x) => isTopProfileNameBandRect(x.rect))
@@ -538,12 +694,39 @@
 
   async function waitForContactInfo(clickedItem = null, timeoutMs = 2200) {
     const deadline = Date.now() + timeoutMs;
+    await waitForRightPanelReady(Math.min(timeoutMs * 0.4, 1500));
     let info = extractContactInfo(clickedItem);
     while (`${info.name}/${info.age}/${info.education}` === "待识别/待识别/待识别" && Date.now() < deadline) {
       await sleep(120);
       info = extractContactInfo(clickedItem);
     }
     return info;
+  }
+
+  function isRightPanelLoading() {
+    const pageWidth = window.innerWidth || document.documentElement.clientWidth || 0;
+    const rightArea = Array.from(document.querySelectorAll("[class*='loading'], [class*='skeleton'], [class*='spinner'], .chat-loading, .geek-loading"))
+      .filter((el) => {
+        if (!isVisible(el)) return false;
+        const rect = el.getBoundingClientRect();
+        return rect.left >= pageWidth * 0.28 && rect.top >= 50 && rect.top <= 300;
+      });
+    if (rightArea.length > 0) return true;
+    const topBand = Array.from(document.querySelectorAll("body *"))
+      .filter((el) => {
+        if (!isVisible(el)) return false;
+        const rect = el.getBoundingClientRect();
+        return rect.left >= pageWidth * 0.28 && rect.left <= pageWidth * 0.78 && rect.top >= 80 && rect.top <= 170 && rect.width > 50 && rect.height > 10;
+      });
+    if (topBand.length === 0) return true;
+    return false;
+  }
+
+  async function waitForRightPanelReady(maxWaitMs = 1500) {
+    const deadline = Date.now() + maxWaitMs;
+    while (isRightPanelLoading() && Date.now() < deadline) {
+      await sleep(100);
+    }
   }
 
   function hasResumeRequestSent(scope = document) {
@@ -1523,19 +1706,21 @@
         const clickable = getDownloadClickableNode(el);
         if (!clickable || !isVisible(clickable) || isDisabled(clickable)) continue;
         const elHref = el.getAttribute?.("href") || el.getAttribute?.("xlink:href") || "";
-        const isXlinkDownload = /download/i.test(elHref) && !!el.closest?.("[class*='attachment-resume-btns']");
+        const isXlinkDownload = /download/i.test(elHref) && (!!el.closest?.("[class*='attachment-resume-btns']") || (preview?.root && preview.root.contains(el)));
         if (!isXlinkDownload && !isStrictResumeActionArea(clickable, preview) && !isStrictResumeActionArea(el, preview)) continue;
         const rect = clickable.getBoundingClientRect();
         if (rect.width < 10 || rect.height < 10 || rect.top < 0 || rect.left < 0) continue;
         const descriptor = `${getElementDescriptor(el)} ${getElementDescriptor(clickable)} ${getElementDescriptor(clickable.parentElement)}`;
         const combined = descriptor.toLowerCase();
-        // HTML 弹窗形态：span.card-btn 且文案命中"附件简历"或"下载"。要求位于弹窗/对话框容器内，规避聊天列表中同名 class 的误中。
         const inPopupContainer = !!clickable.closest?.("[class*='preview'], [class*='dialog'], [class*='modal'], [class*='drawer'], [class*='popup'], [class*='layer'], [role='dialog']");
-        const isHtmlPopupDownload = /card-btn/i.test(descriptor) && /附件简历|下载/.test(descriptor) && inPopupContainer;
-        if (!isXlinkDownload && !isHtmlPopupDownload && !isBossSvgDownloadDescriptor(descriptor)) continue;
+        const inPreviewRoot = preview?.root && preview.root.contains(clickable);
+        const isHtmlPopupDownload = /card-btn/i.test(descriptor) && /附件简历|下载/.test(descriptor) && (inPopupContainer || inPreviewRoot);
+        const isPreviewRootDownload = inPreviewRoot && /下载|download|附件简历/.test(combined) && !/关闭|close|取消|返回/i.test(combined);
+        if (!isXlinkDownload && !isHtmlPopupDownload && !isPreviewRootDownload && !isBossSvgDownloadDescriptor(descriptor)) continue;
         if (/关闭|close|取消|返回|back|delete|trash|更多|more|打印|print|zoom|放大|缩小|rotate|旋转|×|✕|esc/i.test(combined)) continue;
         let score = 40;
         if (isHtmlPopupDownload) score += 30;
+        if (isPreviewRootDownload) score += 20;
         if (clickable.closest?.("[class*='attachment-resume-btns']")) score += 22;
         if (clickable.closest?.("[class*='resume-footer']")) score += 14;
         if (clickable.closest?.("[class*='icon-content']")) score += 8;
@@ -1567,20 +1752,42 @@
     return matches[0]?.el || null;
   }
 
+  function _extractVueHref(vm) {
+    if (!vm) return "";
+    for (const src of [vm, vm.$parent, vm.$parent?.$parent]) {
+      if (!src) continue;
+      const h = src.href || src.$props?.href || src.$data?.href || src.$attrs?.href || "";
+      if (h && /^https?:\/\//i.test(h)) return h;
+    }
+    return "";
+  }
+
   function tryVueDirectDownload(target) {
     try {
-      const iconDiv = target?.closest?.("[class*='icon-content']") || target?.parentElement?.closest?.("[class*='icon-content']");
-      const vm = iconDiv?.__vue__;
-      const href = vm?.$parent?.href || vm?.$parent?.$props?.href || "";
-      if (!href || !/^https?:\/\//i.test(href)) return null;
-      const a = document.createElement("a");
-      a.href = href;
-      a.download = "";
-      a.style.display = "none";
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      return href;
+      const candidates = [
+        target?.closest?.("[class*='icon-content']"),
+        target?.parentElement?.closest?.("[class*='icon-content']"),
+        target,
+        target?.parentElement,
+        target?.parentElement?.parentElement,
+      ];
+      for (let i = 0; i < 5; i++) {
+        const node = i < candidates.length ? candidates[i] : target;
+        if (!node) continue;
+        const vm = node.__vue__;
+        const href = _extractVueHref(vm);
+        if (href) {
+          const a = document.createElement("a");
+          a.href = href;
+          a.download = "";
+          a.style.display = "none";
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          return href;
+        }
+      }
+      return null;
     } catch (e) { return null; }
   }
 
@@ -1936,6 +2143,9 @@
       return accepted;
     }
     emit({ type: "boss_svg_download_link_capture_failed", data: { candidate_id: candidateId, candidate_signature: signature, reason: downloadResult.reason || "download_failed", ...(downloadResult.data || {}) } });
+    if (resumePreviewLearnState.learnedClick) {
+      return false;
+    }
     if (await learnManualDownloadClickAfterFailure(candidateId, signature, info, downloadResult.reason || "boss_svg_download_failed")) {
       return true;
     }
@@ -2004,17 +2214,15 @@
     const downloadRequestId = makeDownloadRequestId(candidateId, signature);
     emit({ type: "download_intent", data: { candidate_id: candidateId, candidate_signature: signature, candidate_info: info, expected_filename: `${signature}.pdf`, download_request_id: downloadRequestId } });
     const resultPromise = waitForDownloadResult(downloadRequestId);
-    clickElementReliably(target);
+    const vueUrl = tryVueDirectDownload(target);
+    if (!vueUrl) clickElementReliably(target);
     const downloadResult = await resultPromise;
     if (downloadResult.ok) {
       const accepted = await finalizeDownloadWithPersistAck(candidateId, signature, downloadRequestId, "learned_click");
       return accepted;
     }
-    if (await learnManualDownloadClickAfterFailure(candidateId, signature, info, downloadResult.reason || "learned_download_failed")) {
-      return true;
-    }
-    await skipCandidate(candidateId, signature, downloadResult.reason || "download_failed", downloadResult.data || {});
-    return true;
+    emit({ type: "learned_download_click_download_failed", data: { candidate_id: candidateId, candidate_signature: signature, reason: downloadResult.reason || "download_not_triggered" } });
+    return false;
   }
 
   function finishLearningTask(candidateId = "", signature = "", data = {}) {
@@ -2068,6 +2276,47 @@
     return preview;
   }
 
+  async function tryDomTextDownloadUrlScan(candidateId, signature, info, preview) {
+    if (!preview?.root || preview.info?.preview_source !== "dom_text") return false;
+    emit({ type: "dom_text_download_url_scan_started", data: { candidate_id: candidateId, candidate_signature: signature } });
+    const root = preview.root;
+    const urlPattern = /preview4boss|\/download\/|attachment.*\.pdf|\.pdf(?:$|[?#])/i;
+    const anchors = Array.from(root.querySelectorAll("a[href]"));
+    for (const a of anchors) {
+      const href = a.href || a.getAttribute("href") || "";
+      if (href && urlPattern.test(href) && /^https?:\/\//i.test(href)) {
+        emit({ type: "dom_text_download_url_found", data: { candidate_id: candidateId, candidate_signature: signature, url: href, source: "anchor" } });
+        const downloadRequestId = makeDownloadRequestId(candidateId, signature);
+        emit({ type: "download_intent", data: { candidate_id: candidateId, candidate_signature: signature, candidate_info: info, expected_filename: `${signature}.pdf`, download_request_id: downloadRequestId } });
+        const resultPromise = waitForDownloadResult(downloadRequestId, 20000);
+        const started = await downloadDirectUrl({ candidate_id: candidateId, candidate_signature: signature, candidate_info: info, expected_filename: `${signature}.pdf`, url: href, download_request_id: downloadRequestId });
+        if (!started.ok) { emit({ type: "dom_text_direct_download_failed", data: { candidate_id: candidateId, candidate_signature: signature, reason: started.reason || "start_failed" } }); return false; }
+        const downloadResult = await resultPromise;
+        if (downloadResult.ok) { await finalizeDownloadWithPersistAck(candidateId, signature, downloadRequestId, "dom_text_anchor_url"); return true; }
+        return false;
+      }
+    }
+    const allEls = root.querySelectorAll("*");
+    for (const el of allEls) {
+      const vm = el.__vue__;
+      if (!vm) continue;
+      const href = _extractVueHref(vm);
+      if (href && urlPattern.test(href)) {
+        emit({ type: "dom_text_download_url_found", data: { candidate_id: candidateId, candidate_signature: signature, url: href, source: "vue_instance" } });
+        const downloadRequestId = makeDownloadRequestId(candidateId, signature);
+        emit({ type: "download_intent", data: { candidate_id: candidateId, candidate_signature: signature, candidate_info: info, expected_filename: `${signature}.pdf`, download_request_id: downloadRequestId } });
+        const resultPromise = waitForDownloadResult(downloadRequestId, 20000);
+        const started = await downloadDirectUrl({ candidate_id: candidateId, candidate_signature: signature, candidate_info: info, expected_filename: `${signature}.pdf`, url: href, download_request_id: downloadRequestId });
+        if (!started.ok) { emit({ type: "dom_text_direct_download_failed", data: { candidate_id: candidateId, candidate_signature: signature, reason: started.reason || "start_failed" } }); return false; }
+        const downloadResult = await resultPromise;
+        if (downloadResult.ok) { await finalizeDownloadWithPersistAck(candidateId, signature, downloadRequestId, "dom_text_vue_url"); return true; }
+        return false;
+      }
+    }
+    emit({ type: "dom_text_download_url_not_found", data: { candidate_id: candidateId, candidate_signature: signature, anchor_count: anchors.length, vue_element_count: Array.from(allEls).filter((e) => e.__vue__).length } });
+    return false;
+  }
+
   async function tryDownloadResume(candidateId, signature, info, preview = null, previewAlreadyWaited = false) {
     if (shouldAbortAsyncStep()) return;
     if (!preview && !previewAlreadyWaited) {
@@ -2088,7 +2337,7 @@
       return;
     }
 
-    if (await clickBossSvgDownloadIcon(candidateId, signature, info, preview)) {
+    if (await tryDomTextDownloadUrlScan(candidateId, signature, info, preview)) {
       return;
     }
 
@@ -2096,8 +2345,13 @@
       return;
     }
 
+    if (await clickBossSvgDownloadIcon(candidateId, signature, info, preview)) {
+      return;
+    }
+
     const downloadButton = await waitForDownloadButton(candidateId, signature, 5000);
     if (!downloadButton) {
+      emit({ type: "all_download_strategies_exhausted", data: { candidate_id: candidateId, candidate_signature: signature, preview_source: preview?.info?.preview_source || "" } });
       await skipCandidate(candidateId, signature, "download_button_not_found");
       return;
     }
@@ -2106,7 +2360,8 @@
     const downloadRequestId = makeDownloadRequestId(candidateId, signature);
     emit({ type: "download_intent", data: { candidate_id: candidateId, candidate_signature: signature, candidate_info: info, expected_filename: `${signature}.pdf`, download_request_id: downloadRequestId } });
     const resultPromise = waitForDownloadResult(downloadRequestId, 20000);
-    clickElementReliably(downloadButton);
+    const vueUrl = tryVueDirectDownload(downloadButton);
+    if (!vueUrl) clickElementReliably(downloadButton);
     await sleep(1000);
     emit({ type: "download_click_post_diagnostics", data: { candidate_id: candidateId, candidate_signature: signature, click_strategy: "auto_download_button", diagnostics: getDownloadClickDiagnostics(downloadButton, "auto_1s_after_click") } });
     const downloadResult = await resultPromise;
@@ -2754,7 +3009,7 @@
     emit({ type: "page_ready", data: { url: location.href } });
 
     await resetCandidateListScroll();
-    const items = getCandidateItems();
+    let items = getCandidateItems();
     if (items.length === 0) {
       emit({ type: "error", data: { message: "未找到候选人列表", stage: "scan" } });
       state = "idle";
@@ -2762,6 +3017,10 @@
     }
 
     const seenSignatures = new Set();
+    const processedElements = new WeakSet();
+    let scrollRetries = 0;
+    const MAX_SCROLL_RETRIES = 5;
+    let consecutiveUnrecognized = 0;
 
     for (let i = results.currentIndex; i < items.length && results.completed < config.max_resumes; i++) {
       if (state === "stopped") break;
@@ -2770,13 +3029,15 @@
 
       results.currentIndex = i;
       const item = items[i];
+      if (processedElements.has(item)) continue;
+      processedElements.add(item);
 
       const candidateStepStartedAt = Date.now();
       try {
         item.scrollIntoView({ block: "center" });
         await sleep(80);
         item.click();
-        await sleep(450);
+        await sleep(450 + consecutiveUnrecognized * 300);
       } catch (error) {
         emit({ type: "candidate_skipped", data: { candidate_signature: `index_${i}`, reason: "click_failed", error: String(error), elapsed_ms: Date.now() - candidateStepStartedAt } });
         results.skipped++;
@@ -2785,9 +3046,18 @@
       }
 
       const infoStartedAt = Date.now();
-      const info = await waitForContactInfo(item, 2200);
-      const infoElapsedMs = Date.now() - infoStartedAt;
-      const signature = `${info.name}/${info.age}/${info.education}`;
+      let info = await waitForContactInfo(item, 3000);
+      let infoElapsedMs = Date.now() - infoStartedAt;
+      let signature = `${info.name}/${info.age}/${info.education}`;
+
+      if (signature === "待识别/待识别/待识别") {
+        item.click();
+        await sleep(600);
+        info = await waitForContactInfo(item, 3000);
+        infoElapsedMs = Date.now() - infoStartedAt;
+        signature = `${info.name}/${info.age}/${info.education}`;
+      }
+
       const candidateId = `${activeRunId || "run"}_${i}_${signature}`;
 
       emit({ type: "candidate_clicked", data: { ...info, candidate_id: candidateId, candidate_signature: signature, index: i, elapsed_ms: infoElapsedMs } });
@@ -2795,10 +3065,12 @@
       if (signature === "待识别/待识别/待识别") {
         emit({ type: "candidate_skipped", data: { candidate_id: candidateId, candidate_signature: signature, reason: "candidate_info_unrecognized", raw_text: info.raw_text || "" } });
         results.skipped++;
+        consecutiveUnrecognized++;
         emitProgress();
-        state = "idle";
-        break;
+        continue;
       }
+
+      consecutiveUnrecognized = 0;
 
       if (seenSignatures.has(signature)) {
         await skipCandidate(candidateId, signature, "duplicate_in_run", { fast_skip: true });
@@ -2892,6 +3164,123 @@
       }
 
       await tryDownloadResume(candidateId, signature, info, preview, true);
+      await closeExistingResumePreview(candidateId, signature);
+    }
+
+    while (results.completed < config.max_resumes && state !== "stopped" && scrollRetries < MAX_SCROLL_RETRIES) {
+      const container = findBestListContainer();
+      if (!container) break;
+      const prevScrollTop = container.scrollTop;
+      const scrollStep = container.clientHeight * 0.8;
+      container.scrollTop = prevScrollTop + scrollStep;
+      container.dispatchEvent(new Event("scroll", { bubbles: true }));
+      await sleep(1500);
+      const newItems = getCandidateItems();
+      const freshItems = newItems.filter((el) => !processedElements.has(el));
+      if (freshItems.length === 0) {
+        if (Math.abs(container.scrollTop - prevScrollTop) < 10) break;
+        scrollRetries++;
+        continue;
+      }
+      scrollRetries = 0;
+      items = freshItems;
+      for (let i = 0; i < items.length && results.completed < config.max_resumes; i++) {
+        if (state === "stopped") break;
+        await waitForPause();
+        if (state === "stopped") break;
+
+        results.currentIndex++;
+        const item = items[i];
+        if (processedElements.has(item)) continue;
+        processedElements.add(item);
+
+        const candidateStepStartedAt = Date.now();
+        try {
+          item.scrollIntoView({ block: "center" });
+          await sleep(80);
+          item.click();
+          await sleep(450);
+        } catch (error) {
+          emit({ type: "candidate_skipped", data: { candidate_signature: `scroll_${results.currentIndex}`, reason: "click_failed", error: String(error), elapsed_ms: Date.now() - candidateStepStartedAt } });
+          results.skipped++;
+          emitProgress();
+          continue;
+        }
+
+        const infoStartedAt = Date.now();
+        let info = await waitForContactInfo(item, 3000);
+        let infoElapsedMs = Date.now() - infoStartedAt;
+        let signature = `${info.name}/${info.age}/${info.education}`;
+
+        if (signature === "待识别/待识别/待识别") {
+          item.click();
+          await sleep(600);
+          info = await waitForContactInfo(item, 3000);
+          infoElapsedMs = Date.now() - infoStartedAt;
+          signature = `${info.name}/${info.age}/${info.education}`;
+        }
+
+        const candidateId = `${activeRunId || "run"}_${results.currentIndex}_${signature}`;
+
+        emit({ type: "candidate_clicked", data: { ...info, candidate_id: candidateId, candidate_signature: signature, index: results.currentIndex, elapsed_ms: infoElapsedMs } });
+
+        if (signature === "待识别/待识别/待识别") {
+          emit({ type: "candidate_skipped", data: { candidate_id: candidateId, candidate_signature: signature, reason: "candidate_info_unrecognized", raw_text: info.raw_text || "" } });
+          results.skipped++;
+          emitProgress();
+          continue;
+        }
+
+        if (seenSignatures.has(signature)) {
+          await skipCandidate(candidateId, signature, "duplicate_in_run", { fast_skip: true });
+          continue;
+        }
+        seenSignatures.add(signature);
+
+        const dedupStartedAt = Date.now();
+        const candidateKey = await buildBossCandidateKey(signature, info);
+        const candidateSignatures = new Set(Array.isArray(config.boss_candidate_signatures) ? config.boss_candidate_signatures : []);
+        const normalizedSignature = normalizeBossCandidateSignature(signature);
+        const keyHit = Boolean(candidateKey && Array.isArray(config.boss_candidate_keys) && config.boss_candidate_keys.includes(candidateKey));
+        const signatureHit = candidateSignatures.has(signature) || candidateSignatures.has(normalizedSignature);
+        emit({ type: "boss_pre_dedup_checked", data: { candidate_id: candidateId, candidate_signature: signature, candidate_key: candidateKey, key_hit: keyHit, signature_hit: signatureHit, elapsed_ms: Date.now() - dedupStartedAt } });
+        if (keyHit || signatureHit) {
+          emit({ type: "candidate_skipped", data: { candidate_id: candidateId, candidate_signature: signature, reason: "boss_dedup_hit" } });
+          results.skipped++;
+          emitProgress();
+          continue;
+        }
+
+        const btnStartedAt = Date.now();
+        const btn = findResumeButton();
+        const btnElapsedMs = Date.now() - btnStartedAt;
+        emit({ type: "resume_button_found", data: { candidate_id: candidateId, candidate_signature: signature, button_state: btn?.state, button_state_label: btn?.state_label, button_text: btn?.text, elapsed_ms: btnElapsedMs } });
+
+        if (!btn || btn.state === "dim") {
+          await skipCandidate(candidateId, signature, btn ? "no_downloadable_attachment" : "button_not_found");
+          continue;
+        }
+
+        if (!guardResumeAttachmentClick(candidateId, signature)) {
+          await skipCandidate(candidateId, signature, "resume_attachment_click_guarded", { fast_skip: true });
+          continue;
+        }
+        const stalePreview = await closeExistingResumePreview(candidateId, signature);
+        const beforePreviewFingerprint = stalePreview.before_fingerprint || getResumePreviewFingerprint();
+        const beforeUrl = location.href;
+        const clickOk = clickElementReliably(btn.el);
+        emit({ type: "resume_attachment_click_dispatched", data: { candidate_id: candidateId, candidate_signature: signature, click_ok: clickOk, button_state: btn.state } });
+        await sleep(350);
+        const preview = await startResumePreviewRecognition(candidateId, signature, info, btn, beforeUrl, stalePreview.closed, beforePreviewFingerprint);
+        if (shouldAbortAsyncStep()) break;
+        if (!preview) {
+          await skipCandidate(candidateId, signature, "resume_preview_not_found");
+          continue;
+        }
+
+        await tryDownloadResume(candidateId, signature, info, preview, true);
+        await closeExistingResumePreview(candidateId, signature);
+      }
     }
 
     state = "idle";

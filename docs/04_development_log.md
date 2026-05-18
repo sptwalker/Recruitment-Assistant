@@ -2,6 +2,61 @@
 
 ## 2026-05-18
 
+### V2.08–V2.16 BOSS 采集稳定性修复 + 候选人识别重构
+
+#### 问题总览
+
+经过多轮测试（#41–#50），暴露并修复了 scroll-rescan 循环中的多个静默崩溃 bug、候选人姓名误识别问题、以及下载策略短路问题。
+
+#### 已修复 Bug 列表
+
+**1. `findResumeAttachmentButton()` 未定义（V2.12）**
+- 根因：scroll-rescan 循环引用了不存在的函数，导致 ReferenceError 静默崩溃
+- 修复：`findResumeAttachmentButton()` → `findResumeButton()`（与主循环一致）
+
+**2. scroll-rescan 重复候选人跳过无日志（V2.14）**
+- 根因：`seenSignatures.has(signature)` 命中时只做 `results.skipped++` 但未调用 `skipCandidate()`
+- 修复：改为调用 `await skipCandidate(candidateId, signature, "duplicate_in_run", { fast_skip: true })`
+
+**3. 英文/非常规名称导致三字段全部"待识别"（V2.14）**
+- 根因：`getTopProfileTokens` 过滤器只允许中文字符；`parseTopProfileName` 无英文名匹配
+- 修复：token 过滤器增加 `[A-Za-z]{2,}`；名称解析增加英文名正则和单字中文名兜底
+
+**4. 职位名称"数据标注""游戏"被误识别为候选人姓名（V2.14）**
+- 根因：BOSS"沟通职位"区域的岗位名称（2-4 中文字符）通过了 token 过滤和名称解析
+- 修复（双保险）：
+  - 新增 `isJobTitleContext(el)` 检查元素父级/兄弟是否含"沟通职位|期望职位|求职意向"标签
+  - 扩充 `isInvalidCandidateNameToken` 黑名单：15 个 2 字职业词 + 40+ 多字职位模式
+
+**5. 候选人识别策略重构：基于字体大小的主检测（V2.15）**
+- 新增 `findProfileByFontSize()` 作为主策略优先执行，利用 BOSS 页面视觉层次：
+  - TreeWalker 高效定位 "XX岁" 文本锚点
+  - 向上遍历找到含 `|` 分隔符的信息栏容器
+  - `getComputedStyle().fontSize` 找同行最大字号元素 = 姓名
+  - 性别符号（♂/♀）软验证
+  - 管道符分割提取学历
+- 原有 token 扫描保留为 fallback
+- 纯只读 DOM 检测，不触发面板刷新
+
+**6. `clickLearnedDownload` 失败后短路阻断后续策略（V2.16）**
+- 根因：学习记录（SVG）在 dom_text 预览中找到匹配元素但点击无效，随后直接进入手动学习模式，后续策略永不执行
+- 修复：下载未触发时返回 `false`，让 `clickBossSvgDownloadIcon`、`waitForDownloadButton` 继续尝试；手动学习仅作最后防线
+
+#### 版本同步
+
+- `manifest.json` 1.73.0 → **1.82.0**
+- `content.js` `CONTENT_SCRIPT_VERSION` 1.73.0 → **1.82.0**
+- `boss_ws_bridge.py` 1.80.0 → **1.89.0**；期望扩展/脚本 → **1.82.0**
+- `qiancheng_ws_bridge.py` 1.3.0（不变）；期望扩展/脚本 → **1.82.0**
+- `app/components/layout.py` V2.07 → **V2.16**
+
+#### 测试结果
+
+- 测试 #50（V2.15）：5/5 100% 达成率，avg 15.8s/份
+- 候选人姓名识别：字体大小策略成功识别所有中文名（朱月明、王芳、陈伟妹、黄进、程小波、张书豪）
+- 下载策略：PDF iframe 直接下载 3 份 + 手动学习 2 份（dom_text 类型）
+- V2.16 修复后 dom_text 类型应可通过后续策略自动下载，减少手动介入
+
 ### V2.07 UI 文案精简 + 修复扩展版本号显示 bug
 
 #### 已完成内容

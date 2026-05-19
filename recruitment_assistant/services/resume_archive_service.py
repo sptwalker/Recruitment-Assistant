@@ -55,12 +55,7 @@ class ResumeArchiveService:
             phone=data.phone,
             email=data.email,
             wechat=data.wechat,
-            qq=data.qq,
-            native_place=data.native_place,
             current_city=data.current_city,
-            political_status=data.political_status,
-            ethnicity=data.ethnicity,
-            height=data.height,
             education_level=data.education_level,
             self_intro=data.self_intro,
         )

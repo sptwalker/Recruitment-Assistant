@@ -35,12 +35,7 @@ class Candidate(ResumeBase):
     phone: Mapped[str | None] = mapped_column(String(20), unique=True)
     email: Mapped[str | None] = mapped_column(String(100))
     wechat: Mapped[str | None] = mapped_column(String(50))
-    qq: Mapped[str | None] = mapped_column(String(20))
-    native_place: Mapped[str | None] = mapped_column(String(50))
     current_city: Mapped[str | None] = mapped_column(String(50))
-    political_status: Mapped[str | None] = mapped_column(String(20))
-    ethnicity: Mapped[str | None] = mapped_column(String(20))
-    height: Mapped[str | None] = mapped_column(String(20))
     education_level: Mapped[str | None] = mapped_column(String(20))
     self_intro: Mapped[str | None] = mapped_column(Text)
     create_time: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
@@ -68,8 +63,6 @@ class Education(ResumeBase):
     start_date: Mapped[date | None] = mapped_column(Date)
     end_date: Mapped[date | None] = mapped_column(Date)
     is_full_time: Mapped[int] = mapped_column(Integer, default=1)
-    main_courses: Mapped[str | None] = mapped_column(Text)
-    honors: Mapped[str | None] = mapped_column(Text)
 
     candidate: Mapped["Candidate"] = relationship(back_populates="educations")
 
@@ -80,17 +73,11 @@ class WorkExperience(ResumeBase):
     work_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     candidate_id: Mapped[int] = mapped_column(ForeignKey("candidates.candidate_id", ondelete="CASCADE"), nullable=False, index=True)
     company_name: Mapped[str] = mapped_column(String(200), nullable=False)
-    company_type: Mapped[str | None] = mapped_column(String(50))
     industry: Mapped[str | None] = mapped_column(String(100), index=True)
-    department: Mapped[str | None] = mapped_column(String(100))
     position: Mapped[str | None] = mapped_column(String(100), index=True)
-    job_level: Mapped[str | None] = mapped_column(String(50))
     start_date: Mapped[date | None] = mapped_column(Date)
     end_date: Mapped[date | None] = mapped_column(Date)
-    work_duration: Mapped[int | None] = mapped_column(Integer)
     job_content: Mapped[str | None] = mapped_column(Text)
-    performance: Mapped[str | None] = mapped_column(Text)
-    manage_scope: Mapped[str | None] = mapped_column(Text)
     is_main_job: Mapped[int] = mapped_column(Integer, default=1)
 
     candidate: Mapped["Candidate"] = relationship(back_populates="work_experiences")
@@ -107,7 +94,6 @@ class ProjectExperience(ResumeBase):
     project_desc: Mapped[str | None] = mapped_column(Text)
     project_duty: Mapped[str | None] = mapped_column(Text)
     project_result: Mapped[str | None] = mapped_column(Text)
-    project_industry: Mapped[str | None] = mapped_column(String(100))
 
     candidate: Mapped["Candidate"] = relationship(back_populates="project_experiences")
 
@@ -120,8 +106,6 @@ class SkillCertificate(ResumeBase):
     skill_type: Mapped[str | None] = mapped_column(String(20))
     skill_name: Mapped[str | None] = mapped_column(String(100), index=True)
     proficiency: Mapped[str | None] = mapped_column(String(20))
-    certificate_org: Mapped[str | None] = mapped_column(String(100))
-    get_date: Mapped[date | None] = mapped_column(Date)
     is_core: Mapped[int] = mapped_column(Integer, default=0)
 
     candidate: Mapped["Candidate"] = relationship(back_populates="skills")
@@ -135,10 +119,7 @@ class JobIntention(ResumeBase):
     target_position: Mapped[str | None] = mapped_column(String(100), index=True)
     target_city: Mapped[str | None] = mapped_column(String(50))
     expected_salary: Mapped[str | None] = mapped_column(String(50))
-    work_nature: Mapped[str | None] = mapped_column(String(20))
-    arrival_time: Mapped[str | None] = mapped_column(String(30))
     job_status: Mapped[str | None] = mapped_column(String(30))
-    industry_prefer: Mapped[str | None] = mapped_column(String(100))
 
     candidate: Mapped["Candidate"] = relationship(back_populates="job_intention")
 
@@ -149,7 +130,6 @@ class Honor(ResumeBase):
     honor_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     candidate_id: Mapped[int] = mapped_column(ForeignKey("candidates.candidate_id", ondelete="CASCADE"), nullable=False, index=True)
     honor_name: Mapped[str] = mapped_column(String(200), nullable=False)
-    issue_by: Mapped[str | None] = mapped_column(String(100))
     honor_date: Mapped[date | None] = mapped_column(Date)
     honor_level: Mapped[str | None] = mapped_column(String(20))
 

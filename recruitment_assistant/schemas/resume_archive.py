@@ -62,24 +62,16 @@ class EducationCreate(BaseModel):
     start_date: PartialDate = None
     end_date: PartialDate = None
     is_full_time: int = 1
-    main_courses: str | None = None
-    honors: str | None = None
 
 
 class WorkExperienceCreate(BaseModel):
     # company_name 放宽为 Optional：AI 偶尔从文本片段里识别不到公司名
     company_name: str | None = None
-    company_type: str | None = None
     industry: str | None = None
-    department: str | None = None
     position: str | None = None
-    job_level: str | None = None
     start_date: PartialDate = None
     end_date: PartialDate = None
-    work_duration: int | None = None
     job_content: str | None = None
-    performance: str | None = None
-    manage_scope: str | None = None
     is_main_job: int = 1
 
 
@@ -91,15 +83,12 @@ class ProjectExperienceCreate(BaseModel):
     project_desc: str | None = None
     project_duty: str | None = None
     project_result: str | None = None
-    project_industry: str | None = None
 
 
 class SkillCertificateCreate(BaseModel):
     skill_type: str | None = None
     skill_name: str | None = None
     proficiency: str | None = None
-    certificate_org: str | None = None
-    get_date: PartialDate = None
     is_core: int = 0
 
 
@@ -107,16 +96,12 @@ class JobIntentionCreate(BaseModel):
     target_position: str | None = None
     target_city: str | None = None
     expected_salary: str | None = None
-    work_nature: str | None = None
-    arrival_time: str | None = None
     job_status: str | None = None
-    industry_prefer: str | None = None
 
 
 class HonorCreate(BaseModel):
     # honor_name 放宽为 Optional：AI 偶尔只识别到荣誉级别没识别到名字
     honor_name: str | None = None
-    issue_by: str | None = None
     honor_date: PartialDate = None
     honor_level: str | None = None
 
@@ -150,12 +135,7 @@ class CandidateCreate(BaseModel):
     phone: str | None = None
     email: str | None = None
     wechat: str | None = None
-    qq: str | None = None
-    native_place: str | None = None
     current_city: str | None = None
-    political_status: str | None = None
-    ethnicity: str | None = None
-    height: str | None = None
     education_level: str | None = None
     self_intro: str | None = None
     educations: list[EducationCreate] = []

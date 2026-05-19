@@ -46,7 +46,8 @@ def test_prompt_explicitly_forbids_dropped_fields():
 
 def test_prompt_has_age_calculation_rule():
     """age 是审计中重大缺失字段（48% 空），prompt 必须显式要求按生日推算。"""
-    assert "2026" in SYSTEM_PROMPT or "当前年" in SYSTEM_PROMPT, \
+    # 使用动态年份避免每年改测试；只要 prompt 包含 "减去出生年" 这条规则就通过
+    assert "减去出生年" in SYSTEM_PROMPT, \
         "缺少年龄推算规则，会让 AI 在简历只给生日时漏填 age"
 
 

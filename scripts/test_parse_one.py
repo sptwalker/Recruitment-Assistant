@@ -8,6 +8,8 @@ import json
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from recruitment_assistant.config.settings import get_settings
 from recruitment_assistant.parsers.pdf_resume_parser import (
     extract_text_from_docx,

@@ -145,8 +145,15 @@ JSON 顶层就是一个候选人对象，**不要**再嵌套 `candidates` 之类
 ## project_experiences[] 项目经历
 - project_name (str)：项目名。
 - project_role (str)：在项目中的角色（如"项目经理"、"后端开发"）。
+- project_date (str)：项目时间段，原文照抄简历写法即可（如"2021.03 - 2022.06"、"2023年至今"）。
 - project_desc (str)：项目描述。
+- project_duty (str)：本人在该项目的具体职责（与 project_desc 区别：desc 写项目本身，duty 写"我做了什么"）。
 - project_result (str)：项目成果/产出。
+
+## honors[] 荣誉
+- honor_name (str)：荣誉名（如"国家奖学金"、"优秀员工"）。
+- honor_date (str|null)：获得日期，YYYY-MM-DD，缺月份补 -01；只有年份用 YYYY-01-01。
+- honor_level (str)：等级，"国家级" / "省级" / "市级" / "校级" / "公司级"。
 
 ## skills[] 技能/证书 ★合并规则
 **重要：相同 skill_type 的技能要合并到一条记录里**，多个 skill_name 用顿号"、"连接。例如：
@@ -163,10 +170,6 @@ JSON 顶层就是一个候选人对象，**不要**再嵌套 `candidates` 之类
 - target_city (str)：期望工作城市。
 - expected_salary (str)：期望薪资（如"15-20K"）。
 - job_status (str)：求职状态（"在职-看机会" / "离职-随时到岗" / "应届"）。
-
-## honors[] 荣誉
-- honor_name (str)：荣誉名（如"国家奖学金"、"优秀员工"）。
-- honor_level (str)：等级，"国家级" / "省级" / "市级" / "校级" / "公司级"。
 
 # 通用规则
 

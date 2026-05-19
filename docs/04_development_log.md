@@ -50,21 +50,49 @@ V2.07 后第一次大规模简历入库 75 份，审计发现：
 
 - `tests/services/test_resume_ai_service_prompt.py` 5 个测试，回归 prompt 字段覆盖。
 - `tests/services/test_platform_normalize.py` 5 个测试，验证别名映射。
+- `tests/services/test_unwrap_envelope.py` 7 个测试，验证 AI 嵌套输出兜底解包。
 - `scripts/test_parse_one.py` 抽样工具 + `scripts/audit_resume_db.py` 字段填充率审计。
 
-#### 数据治理结果
+#### 实测收益（候选人 75 → 74，删张三 sample 后）
 
-| 指标 | 改造前 | 改造后 |
-|---|---|---|
-| 平台命名 | BOSS/BOSS直聘 混用 | 统一 BOSS直聘 |
-| skills 总条数 | 659 | 165（合并后） |
-| 0% 字段数 | 19 | 0（已删） |
-| candidates 字段数 | 18 | 13（精简） |
+| 字段 | 改造前 | 改造后 | 变化 |
+|---|---|---|---|
+| candidates.gender | 52.0% | **90.7%** | ↑ +38.7 |
+| candidates.age | 52.0% | **72.0%** | ↑ +20.0 |
+| candidates.current_city | 41.3% | **53.3%** | ↑ +12.0 |
+| 无年龄候选人 | 36/75 | **21/75** | ↓ 减 41% |
+| skills 人均条数 | 8.79 | **2.20** | ↓ 减 75% |
+| skills 总条数 | 659 | 165 | 合并去重 |
+| 0% 填充率字段数 | 19 | **0** | 全删 |
+| candidates 字段数 | 18 | 13 | 精简 |
+| 平台命名 | BOSS/BOSS直聘 混用 | 统一 BOSS直聘 | |
 
-#### 后续
+仍偏低但属现实约束（**简历本身不写**，prompt 已说"留 null 不要硬填"）：
+- candidates.wechat 11%（平台简历少给微信）
+- candidates.birth_date 24%（简历多写年龄不写出生日）
+- education.degree 10%（中文简历少写"工学学士"等学位名）
+- work.industry 16%（简历少明确写行业）
+- job_intention.job_status 13%（多数简历不写求职状态）
 
-- 用户手动执行 `python -X utf8 scripts/migrate_resume_db.py --phase ai-fill` 补全 age/gender/current_city。
-- 下一批入库后再跑 `audit_resume_db.py`，确认 prompt 改造的实际收益。
+#### 踩坑记录
+
+1. **AI 嵌套包装层** — DeepSeek 偶尔把候选人字段嵌进 `{"candidates": {...}}` 子对象。根因是初版 prompt 用了 `## candidates 主信息` 标题。修复：
+   - prompt 顶部加"输出结构"段，给出 16 个顶层字段名 + `{"candidates":{...}}` 反例。
+   - service 层加 `_unwrap_candidate_envelope()` 兜底，遇到 `candidates / candidate / data / result` 包装层自动解开。
+2. **scripts 缺 sys.path 注入** — `scripts/migrate_resume_db.py` 直接 `python` 调用时 import `recruitment_assistant.*` 报 ModuleNotFoundError。修复：与 `scripts/init_db.py` 同模式，顶部 `sys.path.insert(0, parents[1])`。
+3. **`pyproject.toml` 漏写 `openai`** — streamlit 那边能用是因为某次手动 `pip install` 装到了别的环境；新建 venv 跑 `--phase ai-fill` 报 `No module named openai`。修复：补进 `dependencies`。
+
+### V2.17.1 后续修补
+
+- **prompt 漏字段补齐**：把 `project_date` / `project_duty` / `honor_date` 加进 prompt（旧版漏掉，导致这 3 字段填充率 0%）；prompt 测试 `REQUIRED_FIELDS` 同步增加防回归。
+- **删 V2.17 前手工 sample**：`DELETE FROM candidates WHERE candidate_id=1`（张三/13800138000，实测无任何业务数据）。
+- **honors 段在 prompt 中位置变化**：现在排在 project 之后、skills 之前。json_object 模式下字段顺序对 AI 输出影响很小，未观察到回归。
+
+#### 后续观察点
+
+- 下一批入库后再跑 `audit_resume_db.py`，确认 P0 补的 3 个字段（project_date/project_duty/honor_date）实际填充率。
+- candidates.current_city 53% 仍不达 75%，部分简历只在工作经历里隐含现居城市。下一版 prompt 可加"若无明示则从最近工作经历推断"，但风险是猜错（异地工作）—— 暂不动。
+
 
 ## 2026-05-18
 

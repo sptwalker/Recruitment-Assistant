@@ -16,13 +16,14 @@ REQUIRED_FIELDS = [
     # work
     "company_name", "industry", "position", "job_content",
     # project
-    "project_name", "project_role", "project_desc", "project_result",
+    "project_name", "project_role", "project_date", "project_desc",
+    "project_duty", "project_result",
     # skills
     "skill_type", "skill_name", "proficiency",
     # intention
     "target_position", "target_city", "expected_salary", "job_status",
     # honors
-    "honor_name", "honor_level",
+    "honor_name", "honor_date", "honor_level",
 ]
 
 

@@ -20,10 +20,12 @@ from recruitment_assistant.schemas.raw_resume import RawResumeCreate
 from recruitment_assistant.services.crawl_task_service import CrawlTaskService, platform_candidate_record
 from recruitment_assistant.services.raw_resume_service import RawResumeService
 from recruitment_assistant.storage.db import create_session, init_database
+from recruitment_assistant.storage.resume_db import init_resume_database
 from recruitment_assistant.storage.models import RawResume
 from recruitment_assistant.utils.hash_utils import text_hash
 
 init_database()
+init_resume_database()
 
 settings = get_settings()
 st.set_page_config(page_title="采集任务", layout="wide", initial_sidebar_state="collapsed")
@@ -164,8 +166,8 @@ def default_task_config() -> dict:
         "搜索时间分钟": None,
         "采集速度": "快速采集（5-15s间隔）",
         "每候选人最大等待秒数": 20,
-        "索要简历": False,
-        "request_resume_if_missing": False,
+        "索要简历": True,
+        "request_resume_if_missing": True,
         "账号标识": "default",
         "间隔秒": "5-15",
         "任务状态": "等待启动",
@@ -960,7 +962,7 @@ def render_task_editor(task_config: dict, login_states: dict[str, bool], disable
         index=0 if str(task_config.get("采集速度", "快速采集（5-15s间隔）")).startswith("快速") else 1,
         disabled=disabled,
     )
-    request_resume_default = bool(task_config.get("索要简历", task_config.get("request_resume_if_missing", False)))
+    request_resume_default = bool(task_config.get("索要简历", task_config.get("request_resume_if_missing", True)))
     request_resume_label = row[3].selectbox(
         "索要简历",
         request_options,
@@ -968,15 +970,14 @@ def render_task_editor(task_config: dict, login_states: dict[str, bool], disable
         disabled=disabled,
     )
     request_resume_if_missing = request_resume_label == "索要"
-    per_candidate_wait_seconds = int(task_config.get("每候选人最大等待秒数") or task_config.get("每候选人等待秒数") or 20)
-    per_candidate_wait_seconds = int(row[4].number_input(
-        "每候选人最大等待秒数",
-        min_value=5,
-        max_value=180,
-        value=per_candidate_wait_seconds,
-        step=5,
-        disabled=disabled,
-    ))
+    try:
+        dedup_total = get_profile_dedup_count("zhilian")
+    except Exception:
+        dedup_total = 0
+    row[4].metric("去重数据库记录数", dedup_total)
+    per_candidate_wait_seconds = int(
+        task_config.get("每候选人最大等待秒数") or task_config.get("每候选人等待秒数") or 20
+    )
 
     updated_task = {
         **task_config,
@@ -1344,7 +1345,7 @@ def run_collect_task(task_config: dict, runtime: dict | None = None) -> None:
             "wait_seconds": run_seconds,
             "per_candidate_wait_seconds": per_candidate_wait,
             "min_download_interval_seconds": min_download_interval,
-            "request_resume_if_missing": bool(task_config.get("索要简历", task_config.get("request_resume_if_missing", False))),
+            "request_resume_if_missing": bool(task_config.get("索要简历", task_config.get("request_resume_if_missing", True))),
             "on_resume_saved": on_resume_saved,
             "on_resume_skipped": on_resume_skipped,
             "should_continue": should_pause_or_stop,

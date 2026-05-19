@@ -12,7 +12,7 @@ st.set_page_config(page_title="系统设置", layout="wide", initial_sidebar_sta
 inject_vibe_style("系统设置")
 page_header("系统设置", "管理账号登录态、采集策略、风控参数与通知方式。")
 
-tabs = st.tabs(["账号", "采集", "风控", "通知"])
+tabs = st.tabs(["账号", "采集", "风控", "通知", "AI模型"])
 
 with tabs[0]:
     st.markdown('<div class="vibe-card"><h3>账号设置</h3>', unsafe_allow_html=True)
@@ -95,6 +95,48 @@ with tabs[3]:
     st.text_input("通知邮箱")
     st.text_input("Webhook 地址")
     st.multiselect("通知事件", ["任务完成", "任务失败", "登录态失效", "导出完成"], default=["任务完成", "登录态失效"])
+    st.markdown('</div>', unsafe_allow_html=True)
+
+with tabs[4]:
+    st.markdown('<div class="vibe-card"><h3>AI 大模型配置</h3>', unsafe_allow_html=True)
+    st.caption("用于简历结构化解析、岗位匹配等 AI 功能。支持 DeepSeek / 通义千问 / OpenAI 等兼容 OpenAI 格式的 API。")
+    from pathlib import Path
+    env_path = Path(".env")
+    env_lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
+    def _get_env_value(key: str) -> str:
+        for line in env_lines:
+            if line.strip().startswith(f"{key}="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+        return ""
+    current_key = _get_env_value("AI_API_KEY")
+    current_url = _get_env_value("AI_BASE_URL") or "https://api.deepseek.com/v1"
+    current_model = _get_env_value("AI_MODEL") or "deepseek-chat"
+
+    ai_api_key = st.text_input("API Key", value=current_key, type="password", key="ai_api_key_input",
+                               help="DeepSeek / 通义千问 / OpenAI 的 API Key")
+    presets = {
+        "DeepSeek": ("https://api.deepseek.com/v1", "deepseek-chat"),
+        "通义千问": ("https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen-plus"),
+        "OpenAI": ("https://api.openai.com/v1", "gpt-4o-mini"),
+        "自定义": (current_url, current_model),
+    }
+    preset_choice = st.selectbox("预设模型", list(presets.keys()), key="ai_preset",
+                                 index=0 if "deepseek" in current_url else (1 if "dashscope" in current_url else (2 if "openai" in current_url else 3)))
+    preset_url, preset_model = presets[preset_choice]
+    ai_base_url = st.text_input("API Base URL", value=preset_url, key="ai_base_url_input")
+    ai_model = st.text_input("模型名称", value=preset_model, key="ai_model_input")
+
+    if st.button("💾 保存 AI 配置", key="save_ai_config"):
+        new_env = {"AI_API_KEY": ai_api_key, "AI_BASE_URL": ai_base_url, "AI_MODEL": ai_model}
+        existing = {}
+        if env_path.exists():
+            for line in env_path.read_text(encoding="utf-8").splitlines():
+                if "=" in line and not line.strip().startswith("#"):
+                    k, v = line.split("=", 1)
+                    existing[k.strip()] = v.strip()
+        existing.update(new_env)
+        env_path.write_text("\n".join(f"{k}={v}" for k, v in existing.items()) + "\n", encoding="utf-8")
+        st.success("AI 配置已保存到 .env 文件。重启 Streamlit 后生效。")
     st.markdown('</div>', unsafe_allow_html=True)
 
 if st.button("统一保存设置", type="primary"):

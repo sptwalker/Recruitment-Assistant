@@ -1924,3 +1924,74 @@ python scripts/capture_zhilian_manual_pages.py --account default --max-pages 5
 - Chrome 下载目录遗漏数是否非零（说明扩展回传 ack 偶发丢失）
 
 攒 3-5 轮可看出趋势，下一轮针对性优化。
+
+## 2026-05-19 简历 AI 解析 ValidationError 修复
+
+### 现象
+
+林鸿俊 / 任果 / 文国斌 / 陈启屏 4 份简历 AI 解析全部抛 `1 validation error for CandidateCreate`，整份候选人无法入库，进入 "AI 解析异常" 失败桶。日志只看到笼统的首行计数，看不到字段路径，难以定位。
+
+### 根因
+
+`recruitment_assistant/schemas/resume_archive.py` 中 4 个嵌套子结构的主标识字段被定义成了**必填 str**：
+
+| 子结构 | 必填字段 | AI 漏识别场景 |
+|---|---|---|
+| `EducationCreate` | `school_name` | 简历只写"本科 / 计算机专业"没写学校 |
+| `WorkExperienceCreate` | `company_name` | 工作段只有岗位描述没标公司抬头 |
+| `ProjectExperienceCreate` | `project_name` | 项目段只有正文没标题 |
+| `HonorCreate` | `honor_name` | 荣誉段只有"校级 / 三等"等级别 |
+
+只要 AI 在 `educations / work_experiences / project_experiences / honors` 任一数组里返回了一条**主标识缺失**的元素，整份 `CandidateCreate` 就被 pydantic 整体打回 → 候选人主体（姓名、电话、学历、自评等都正常识别到了）也跟着丢。
+
+另外 `app/pages/07_简历管理.py` 的失败分支只 `log(f"... {exc}")`，pydantic ValidationError 多行细节（字段路径 / 实际值 / 错误类型）被吞，只剩首行 "1 validation error for CandidateCreate"，没法直接看到是哪个字段触发的。
+
+### 修复
+
+#### 1. `recruitment_assistant/schemas/resume_archive.py` — 放宽 4 个嵌套字段为 Optional
+
+`school_name / company_name / project_name / honor_name` 全部改为 `str | None = None`，让 AI 偶尔漏识别这些字段时，候选人主体仍能通过 pydantic 校验进入入库流程。
+
+#### 2. `recruitment_assistant/services/resume_archive_service.py` — service 入库前丢弃空壳子记录
+
+ORM 层的 `school_name / company_name / project_name / honor_name` 仍保留 `nullable=False`（不动 DB schema、不需要迁移、保持完整性约束）。在 `create_candidate` 的 4 个 `for` 循环各加一道 `if not xxx: continue`：
+
+- 没学校名的"空壳教育条目"丢弃
+- 没公司名的"空壳工作经历"丢弃
+- 没项目名的"空壳项目经历"丢弃
+- 没荣誉名的"空壳荣誉条目"丢弃
+
+候选人主体 + 联系方式 + 自评 + 完整子条目照常落库，空壳条目不污染数据库，也不会触发 SQLite IntegrityError。
+
+#### 3. `app/pages/07_简历管理.py` — ValidationError 多行细节进日志
+
+```python
+err_lines = str(exc).splitlines() or [repr(exc)]
+log(f"           ❌ AI 解析异常：{err_lines[0]}")
+for sub in err_lines[1:8]:
+    log(f"              {sub}")
+```
+
+首行进 "AI 解析异常" 计数和摘要，后续最多 7 行（字段路径 / 实际值 / 错误类型）单独缩进打到日志窗口。下次再遇到疑难简历，直接能在 UI 日志里看到 `educations.0.school_name | Field required | input_value=...` 这种定位信息，不用再让 AI 反查代码。
+
+### 设计取舍
+
+考虑过 3 种方案：
+
+- **A. 改 ORM 也允许 NULL** — 数据库已有数据，需要迁移，性价比低
+- **B. service 层兜 sentinel "未填写"** — 会污染数据库，且后续过滤需要专门处理
+- **C. service 层丢弃空壳子记录**（采用） — 空壳条目本来就没价值，丢掉更合理；DB 完整性约束保留；不需要迁移
+
+### 验证
+
+```powershell
+python -c "import ast; [ast.parse(open(p, encoding='utf-8').read()) for p in ['recruitment_assistant/schemas/resume_archive.py','recruitment_assistant/services/resume_archive_service.py','recruitment_assistant/services/resume_ai_service.py','app/pages/07_简历管理.py']]"
+```
+
+→ SYNTAX OK。需重启 streamlit 让 Pydantic 模型重新加载，再把 4 份简历重跑验证。
+
+### 顺手收下的两个小改动（同批次）
+
+- `recruitment_assistant/services/resume_ai_service.py`
+  - `parse_resume_text` 调用 LLM 时加 `response_format={"type": "json_object"}`，强约束 DeepSeek / OpenAI 兼容端点返回合法 JSON 对象，减少 markdown 代码块剥离的边界情况。
+  - `match_candidates` 也试加过 `json_object` 模式，但因为返回的是 JSON **数组**（`json_object` 只支持顶层 object），已回滚并加注释说明。

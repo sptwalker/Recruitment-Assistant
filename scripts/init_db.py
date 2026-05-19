@@ -4,10 +4,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from recruitment_assistant.storage.db import init_database
+from recruitment_assistant.storage.resume_db import init_resume_database
 
 
 def main() -> None:
     init_database()
+    init_resume_database()
     print("Database tables created or already exist.")
 
 

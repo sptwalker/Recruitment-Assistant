@@ -20,6 +20,11 @@ class Settings(BaseSettings):
     snapshot_dir: Path = Field(default=Path("data/snapshots"))
     log_level: str = "INFO"
 
+    # AI 大模型配置（兼容 OpenAI 格式，支持 DeepSeek / 通义千问）
+    ai_api_key: str = ""
+    ai_base_url: str = "https://api.deepseek.com/v1"
+    ai_model: str = "deepseek-chat"
+
     def ensure_local_dirs(self) -> None:
         for path in [
             self.export_dir,

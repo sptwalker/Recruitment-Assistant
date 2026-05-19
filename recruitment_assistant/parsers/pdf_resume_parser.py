@@ -22,6 +22,8 @@ JOB_HINTS = [
     "工程师", "开发", "经理", "主管", "专员", "助理", "运营", "产品", "设计", "销售", "财务", "人事", "行政", "顾问", "总监",
     "算法", "测试", "前端", "后端", "架构", "实施", "运维", "会计", "出纳", "法务", "教师", "司机", "客服", "Unity", "Java", "Python",
     "AI", "大模型", "人工智能", "UI", "交互", "美工", "平面", "视觉", "数据", "机器学习", "深度学习",
+    "编辑", "编剧", "剪辑", "摄像", "摄影", "原画", "动画", "插画", "美术", "策划", "编导", "导演", "视频",
+    "招聘", "采购", "市场", "营销", "品牌", "公关", "翻译", "校对", "记者", "主播", "客户经理", "项目经理", "项目管理",
 ]
 KNOWN_CITIES = {"广州", "深圳", "上海", "北京", "杭州", "南京", "苏州", "成都", "重庆", "武汉", "长沙", "西安", "盐城"}
 STATUS_WORDS = ["离职", "在职", "全职", "兼职", "正在找工作", "求职状态", "目前状态", "随时到岗"]
@@ -189,8 +191,11 @@ def clean_candidate_signature(signature: str) -> tuple[str | None, str | None]:
     parts = [part for part in parts if part and not is_noise_token(part)]
     name = first_valid_name(*parts[:6])
     job = None
+    direction_re = re.compile(r"^(?:[A-Za-z\s]+|[一-龥]+)?方向$")
     for part in parts:
         if part == name or re.search(r"\d+岁|\d+年|本科|硕士|博士|大专|深圳|广州|上海|北京", part):
+            continue
+        if direction_re.match(part):
             continue
         if any(hint in part for hint in JOB_HINTS) and 2 <= len(part) <= 40:
             job = part
@@ -558,3 +563,69 @@ def find_skills(text: str) -> list[str]:
     ]
     lower_text = text.lower()
     return [skill for skill in common_skills if skill.lower() in lower_text]
+
+
+def extract_text_from_pdf(path: str | Path) -> str:
+    """用 pypdf 提取 PDF 纯文本，去水印/空行/冗余排版。"""
+    from pypdf import PdfReader
+    path = Path(path)
+    try:
+        reader = PdfReader(str(path))
+    except Exception:
+        return ""
+    pages_text = []
+    for page in reader.pages:
+        text = page.extract_text() or ""
+        pages_text.append(text)
+    raw = "\n".join(pages_text)
+    # 去水印：常见水印关键词行
+    lines = raw.split("\n")
+    watermark_keywords = ["confidential", "watermark", "仅供内部", "严禁外传", "智联招聘", "BOSS直聘", "前程无忧", "51job"]
+    cleaned_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if any(wk.lower() in stripped.lower() for wk in watermark_keywords) and len(stripped) < 30:
+            continue
+        cleaned_lines.append(stripped)
+    return "\n".join(cleaned_lines)
+
+
+def extract_text_from_docx(path: str | Path) -> str:
+    """用 python-docx 提取 DOCX 纯文本，去空行。"""
+    from docx import Document
+    path = Path(path)
+    try:
+        doc = Document(str(path))
+    except Exception:
+        return ""
+    lines = []
+    for para in doc.paragraphs:
+        text = para.text.strip()
+        if text:
+            lines.append(text)
+    for table in doc.tables:
+        for row in table.rows:
+            row_text = " | ".join(cell.text.strip() for cell in row.cells if cell.text.strip())
+            if row_text:
+                lines.append(row_text)
+    return "\n".join(lines)
+
+
+def is_empty_or_corrupted(path: str | Path) -> bool:
+    """检测文件是否为空白或损坏（无法解析 / 文本少于 50 字符）。"""
+    path = Path(path)
+    if not path.exists() or path.stat().st_size < 100:
+        return True
+    suffix = path.suffix.lower()
+    try:
+        if suffix == ".pdf":
+            text = extract_text_from_pdf(path)
+        elif suffix in (".docx", ".doc"):
+            text = extract_text_from_docx(path)
+        else:
+            return True
+        return len(text.strip()) < 50
+    except Exception:
+        return True

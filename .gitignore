@@ -15,6 +15,10 @@ env/
 /data/attachments/
 /data/browser_state/
 /data/snapshots/
+/data/*.db
+/data/*.db.backup-*
+/data/audit-*.txt
+/data/migrate-*.log
 /logs/
 
 *.log

@@ -239,39 +239,51 @@ class ResumeAIService:
             raise
 
     def match_candidates(
-        self, position_requirements: str, candidates: list[dict], top_n: int = 10
+        self, position_requirements: str, candidates: list[dict]
     ) -> list[dict]:
-        """AI 匹配岗位需求与候选人列表，返回排序结果。"""
+        """AI 匹配岗位需求与候选人列表，返回全部候选人的评分结果。
+
+        每个 candidate dict 应包含：candidate_id, name, education_level, current_city,
+        position (最近职位), skills (技能摘要), work_summary (工作经历摘要)。
+        返回：[{"candidate_id": int, "match_score": 0-100, "reason": str}, ...]
+        """
         if not self.is_configured:
             raise RuntimeError("AI API Key 未配置")
         candidates_text = "\n".join(
-            f"ID={c.get('candidate_id')} 姓名={c.get('name')} 学历={c.get('education_level')} "
-            f"城市={c.get('current_city')} 岗位={c.get('position', '')}"
-            for c in candidates[:50]
+            f"ID={c.get('candidate_id')} 姓名={c.get('name')} "
+            f"学历={c.get('education_level', '-')} 城市={c.get('current_city', '-')} "
+            f"最近职位={c.get('position', '-')} 技能={c.get('skills', '-')} "
+            f"工作摘要={c.get('work_summary', '-')}"
+            for c in candidates
         )
         prompt = (
             f"岗位要求：\n{position_requirements}\n\n"
-            f"候选人列表：\n{candidates_text}\n\n"
-            f"请从中选出最匹配的 {top_n} 位候选人，按匹配度从高到低排序。\n"
-            f"输出 JSON 数组：[{{\"candidate_id\": ID, \"match_score\": 0-100, \"reason\": \"匹配原因\"}}]"
+            f"候选人列表（共 {len(candidates)} 人）：\n{candidates_text}\n\n"
+            "请对每位候选人评估与该岗位的匹配度（0-100 分），并给出简短评语。\n"
+            "输出 JSON 数组，包含所有候选人：\n"
+            '[{"candidate_id": ID, "match_score": 0-100, "reason": "一句话匹配评语"}]'
         )
         try:
-            # 注意：这里返回的是 JSON 数组，不能用 json_object 模式（json_object 只支持对象）
             resp = self.client.chat.completions.create(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": "你是招聘匹配助手，只输出 JSON 数组。"},
+                    {"role": "system", "content": "你是招聘匹配助手。对每位候选人评估岗位匹配度（0-100），输出完整 JSON 数组，不要遗漏任何候选人。"},
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.2,
-                timeout=60,
+                timeout=120,
             )
             content = resp.choices[0].message.content.strip()
             if content.startswith("```"):
                 content = content.split("\n", 1)[1] if "\n" in content else content[3:]
             if content.endswith("```"):
                 content = content[:-3]
-            return json.loads(content.strip())
+            results = json.loads(content.strip())
+            if isinstance(results, dict) and "candidates" in results:
+                results = results["candidates"]
+            if isinstance(results, dict) and "results" in results:
+                results = results["results"]
+            return results if isinstance(results, list) else []
         except Exception as exc:
             logger.error("AI 岗位匹配失败：{}", exc)
             return []

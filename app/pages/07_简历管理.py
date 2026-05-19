@@ -6,8 +6,10 @@ Tab 3: 招聘岗位录入/匹配（录入岗位 → AI 匹配候选人）
 Tab 4: 面试评价（填写评分 / 查看历史）
 """
 
+import os
 import time
-from datetime import datetime
+from collections import defaultdict
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import streamlit as st
@@ -79,7 +81,13 @@ def extract_text(path: Path) -> str:
 
 
 # ==================== 4 Tab 页面 ====================
-tabs = st.tabs(["📥 简历自动解析入库", "📋 简历库浏览", "🎯 招聘岗位录入/匹配", "💬 面试评价"])
+tabs = st.tabs([
+    "📥 简历自动解析入库",
+    "📋 简历库浏览",
+    "🎯 招聘岗位录入/匹配",
+    "📧 面试邀约",
+    "💬 面试评价",
+])
 
 # ==================== Tab 1: 简历自动解析入库 ====================
 with tabs[0]:
@@ -112,6 +120,8 @@ with tabs[0]:
         st.session_state.parse_queue = []
     if "parse_index" not in st.session_state:
         st.session_state.parse_index = 0
+    if "parse_since_date" not in st.session_state:
+        st.session_state.parse_since_date = date.today() - timedelta(days=7)
     if "parse_results" not in st.session_state:
         st.session_state.parse_results = {
             "success_count": 0,
@@ -143,6 +153,10 @@ with tabs[0]:
         if not files:
             lines.append("  ℹ️ 三个平台目录下暂无简历文件")
         else:
+            since_repr = st.session_state.get(
+                "parse_since_date", date.today() - timedelta(days=7)
+            ).isoformat()
+            lines.append(f"  ⏰ 当前日期过滤：≥ {since_repr}（可在按钮行调整）")
             if ai_service.is_configured:
                 lines.append("  👉 点击下方「开始自动解析入库」按钮启动任务")
             else:
@@ -172,14 +186,14 @@ with tabs[0]:
           .resume-log-window {{
             height: 460px;
             overflow-y: auto;
-            background: #0e1117;
-            color: #d4d4d8;
+            background: #ffffff;
+            color: #1f2328;
             font-family: 'Consolas','Monaco','Microsoft YaHei Mono','Microsoft YaHei',monospace;
             font-size: 13px;
             line-height: 1.55;
             padding: 12px 14px;
             border-radius: 6px;
-            border: 1px solid #334155;
+            border: 1px solid #d0d7de;
             white-space: pre-wrap;
             word-break: break-all;
             user-select: text;            /* 允许选中文字 */
@@ -187,13 +201,23 @@ with tabs[0]:
             flex-direction: column-reverse; /* 最新行贴底显示 */
           }}
           .resume-log-window .log-row {{
-            color: #e4e4e7;
+            color: #1f2328;
           }}
+          .resume-log-window::-webkit-scrollbar {{ width: 10px; }}
+          .resume-log-window::-webkit-scrollbar-track {{ background: #f6f8fa; }}
+          .resume-log-window::-webkit-scrollbar-thumb {{
+            background: #c6cdd5;
+            border-radius: 5px;
+          }}
+          .resume-log-window::-webkit-scrollbar-thumb:hover {{ background: #8c959f; }}
         </style>
         """
         st.markdown(html, unsafe_allow_html=True)
 
     render_log_window()
+
+    # 日志窗口与按钮区之间的视觉气口
+    st.markdown("<div style='height: 18px'></div>", unsafe_allow_html=True)
 
     # ---------- 操作按钮区（窗口外不显示任何任务信息）----------
     task_state = st.session_state.parse_task_state
@@ -201,10 +225,37 @@ with tabs[0]:
     is_running = task_state == "running"
     is_stopping = task_state == "stopping"
 
-    btn_cols = st.columns([1.4, 1.2, 1, 1, 3.4])
+    btn_cols = st.columns([1.4, 1.4, 1.4, 1.4, 3.0])
+    # 索引 0=日期过滤 1=开始/停止 2=重新扫描 3=清空 4=进度
+
+    # 在按钮列上方放同高度的占位行，让按钮顶部和 picker 的输入框顶部对齐
+    _label_style = "font-size:18px; font-weight:bold; margin-bottom:6px;"
+    for _i in (1, 2, 3, 4):
+        btn_cols[_i].markdown(
+            f"<div style='{_label_style}'>&nbsp;</div>", unsafe_allow_html=True
+        )
+
+    with btn_cols[0]:
+        st.markdown(
+            f"<div style='{_label_style}'>请选择最远整理日期</div>",
+            unsafe_allow_html=True,
+        )
+        # 把 date_input 塞进左半子列，宽度缩到 picker 列的一半
+        _picker_sub_cols = st.columns([1, 1])
+        with _picker_sub_cols[0]:
+            since = st.date_input(
+                "请选择最远整理日期",
+                value=st.session_state.parse_since_date,
+                max_value=date.today(),
+                label_visibility="collapsed",
+                key="parse_since_date_picker",
+                help="只整理修改时间晚于此日期的简历（含当天）",
+                disabled=not is_idle,
+            )
+        st.session_state.parse_since_date = since
 
     if is_idle:
-        start_btn = btn_cols[0].button(
+        start_btn = btn_cols[1].button(
             "🚀 开始自动解析入库",
             type="primary",
             disabled=(not ai_service.is_configured) or (not all_files),
@@ -213,15 +264,15 @@ with tabs[0]:
         stop_btn = False
     else:
         start_btn = False
-        stop_btn = btn_cols[0].button(
+        stop_btn = btn_cols[1].button(
             "⏹ 停止解析任务",
             type="secondary",
             disabled=is_stopping,
             key="parse_stop_btn",
         )
 
-    refresh_btn = btn_cols[1].button("🔄 重新扫描", disabled=not is_idle, key="parse_refresh_btn")
-    clear_btn = btn_cols[2].button("🧹 清空窗口", disabled=not is_idle, key="parse_clear_btn")
+    refresh_btn = btn_cols[2].button("🔄 重新扫描", disabled=not is_idle, key="parse_refresh_btn")
+    clear_btn = btn_cols[3].button("🧹 清空窗口", disabled=not is_idle, key="parse_clear_btn")
 
     # 运行中显示进度副文本（也只在窗口外的"状态条"，不输出任务信息）
     if is_running or is_stopping:
@@ -243,9 +294,14 @@ with tabs[0]:
         st.rerun()
 
     if start_btn:
-        # 任务开始：快照文件列表 + 初始化统计
+        # 任务开始：按日期过滤文件列表 + 初始化统计
         st.session_state.parse_task_state = "running"
-        st.session_state.parse_queue = list(all_files)
+        since_dt = datetime.combine(st.session_state.parse_since_date, datetime.min.time())
+        filtered_files = [
+            f for f in all_files
+            if datetime.fromtimestamp(f["path"].stat().st_mtime) >= since_dt
+        ]
+        st.session_state.parse_queue = filtered_files
         st.session_state.parse_index = 0
         st.session_state.parse_results = {
             "success_count": 0,
@@ -264,7 +320,8 @@ with tabs[0]:
         ts = datetime.now().strftime("%H:%M:%S")
         st.session_state.parse_log_lines.append("─" * 60)
         st.session_state.parse_log_lines.append(f"[{ts}] 🚀 解析任务开始")
-        st.session_state.parse_log_lines.append(f"  待处理简历：{len(all_files)} 份")
+        st.session_state.parse_log_lines.append(f"  日期过滤：≥ {st.session_state.parse_since_date.isoformat()}")
+        st.session_state.parse_log_lines.append(f"  待处理简历：{len(filtered_files)} 份（原始扫描 {len(all_files)} 份）")
         st.session_state.parse_log_lines.append("─" * 60)
         st.rerun()
 
@@ -419,135 +476,886 @@ with tabs[0]:
 
 
 # ==================== Tab 2: 简历库浏览 ====================
+def _fmt_date(d) -> str:
+    """date 或 datetime 对象 → YYYY-MM-DD；None → ''。"""
+    if not d:
+        return ""
+    try:
+        return d.strftime("%Y-%m-%d")
+    except Exception:
+        return str(d)
+
+
+@st.dialog("发起面试邀约")
+def _open_invite_dialog():
+    """弹窗：选岗位（可不选）→ 检查去重 → 写库。
+
+    用 session_state['invite_dialog_cid'] 在浏览页 → dialog 之间传候选人 ID。
+    """
+    cid = st.session_state.get("invite_dialog_cid")
+    if not cid:
+        st.error("未选中候选人")
+        return
+    session = create_resume_session()
+    svc = ResumeArchiveService(session)
+    try:
+        cand = svc.get_candidate(cid)
+        if not cand:
+            st.error("候选人不存在")
+            return
+
+        st.markdown(
+            f"**候选人：** {cand.name}（"
+            f"{cand.age or '?'}岁 · {cand.education_level or '-'}"
+            f"）"
+        )
+
+        # 去重检测：同一候选人同时只能有 1 条 pending
+        already_pending = svc.has_pending_invitation(cid)
+        if already_pending:
+            st.warning("⚠️ 该候选人已有进行中的邀约，请先到「面试邀约」Tab 解除或完成。")
+
+        # 岗位下拉（可不选）
+        positions = svc.list_positions(status="open")
+        pos_options = ["（不指定岗位）"] + [
+            f"{p.position_id} | {p.title}（{p.department or '-'} · {p.work_city or '-'}）"
+            for p in positions
+        ]
+        pick = st.selectbox(
+            "拟招聘岗位（可选）",
+            pos_options,
+            key=f"invite_pos_pick_{cid}",
+        )
+        notes = st.text_area(
+            "备注（可选）",
+            key=f"invite_notes_{cid}",
+            height=80,
+        )
+
+        confirm_col, cancel_col = st.columns(2)
+        if confirm_col.button(
+            "✅ 确认邀约",
+            type="primary",
+            disabled=already_pending,
+            use_container_width=True,
+            key=f"invite_confirm_{cid}",
+        ):
+            position_id = None
+            if pick != "（不指定岗位）":
+                position_id = int(pick.split(" | ", 1)[0])
+            svc.create_invitation(candidate_id=cid, position_id=position_id, notes=notes)
+            st.session_state.pop("invite_dialog_cid", None)
+            st.rerun()
+        if cancel_col.button(
+            "取消",
+            use_container_width=True,
+            key=f"invite_cancel_{cid}",
+        ):
+            st.session_state.pop("invite_dialog_cid", None)
+            st.rerun()
+    finally:
+        session.close()
+
+
+def _render_candidate_detail(c, svc, session) -> None:
+    """右侧详情区：把候选人的所有字段按段落渲染。"""
+    head_cols = st.columns([4, 1, 1, 1])
+    head_cols[0].markdown(f"## {c.name}")
+    # ⭐ 关注复选框（实时落库）
+    new_fav = head_cols[1].checkbox(
+        "⭐ 关注",
+        value=bool(c.is_favorite),
+        key=f"browse_fav_{c.candidate_id}",
+    )
+    if int(new_fav) != int(c.is_favorite or 0):
+        svc.update_candidate_field(c.candidate_id, is_favorite=int(new_fav))
+        st.rerun()
+    if head_cols[2].button("📧 面试邀约", key=f"browse_invite_{c.candidate_id}"):
+        st.session_state["invite_dialog_cid"] = c.candidate_id
+        _open_invite_dialog()
+    if head_cols[3].button("🗑️ 删除", key=f"browse_del_{c.candidate_id}"):
+        svc.delete_candidate(c.candidate_id)
+        st.session_state.pop("browse_selected_cid", None)
+        session.close()
+        st.rerun()
+
+    # 基本信息
+    st.markdown("##### 基本信息")
+    info_items = [
+        ("性别", c.gender),
+        ("年龄", f"{c.age}岁" if c.age else None),
+        ("生日", _fmt_date(c.birth_date) or None),
+        ("学历", c.education_level),
+        ("现居城市", c.current_city),
+        ("手机", c.phone),
+        ("邮箱", c.email),
+        ("微信", c.wechat),
+    ]
+    info_lines = [f"- **{k}**：{v}" for k, v in info_items if v]
+    st.markdown("\n".join(info_lines) if info_lines else "_（无）_")
+
+    # 教育经历
+    st.markdown("##### 教育经历")
+    if c.educations:
+        for edu in c.educations:
+            head = f"- **{edu.school_name}**"
+            if edu.start_date or edu.end_date:
+                head += f"（{_fmt_date(edu.start_date) or '?'} — {_fmt_date(edu.end_date) or '至今'}）"
+            st.markdown(head)
+            subs = [edu.education_level, edu.degree, edu.major,
+                    "全日制" if edu.is_full_time else "非全日制"]
+            subs = [s for s in subs if s]
+            if subs:
+                st.markdown(f"  - {' · '.join(subs)}")
+    else:
+        st.markdown("_（无）_")
+
+    # 工作经历
+    st.markdown("##### 工作经历")
+    if c.work_experiences:
+        for w in c.work_experiences:
+            head = f"- **{w.company_name}**"
+            if w.start_date or w.end_date:
+                head += f"（{_fmt_date(w.start_date) or '?'} — {_fmt_date(w.end_date) or '至今'}）"
+            st.markdown(head)
+            subs = [s for s in (w.position, w.industry) if s]
+            if subs:
+                st.markdown(f"  - {' · '.join(subs)}")
+            if w.job_content:
+                st.markdown(f"  - 工作内容：{w.job_content}")
+    else:
+        st.markdown("_（无）_")
+
+    # 项目经历
+    st.markdown("##### 项目经历")
+    if c.project_experiences:
+        for p in c.project_experiences:
+            head = f"- **{p.project_name}**"
+            if p.project_date:
+                head += f"（{p.project_date}）"
+            st.markdown(head)
+            if p.project_role:
+                st.markdown(f"  - 角色：{p.project_role}")
+            if p.project_desc:
+                st.markdown(f"  - 项目描述：{p.project_desc}")
+            if p.project_duty:
+                st.markdown(f"  - 我的职责：{p.project_duty}")
+            if p.project_result:
+                st.markdown(f"  - 项目成果：{p.project_result}")
+    else:
+        st.markdown("_（无）_")
+
+    # 技能 / 证书（按 skill_type 分组）
+    st.markdown("##### 技能 / 证书")
+    if c.skills:
+        by_type: dict[str, list] = defaultdict(list)
+        for s in c.skills:
+            by_type[s.skill_type or "其他"].append(s)
+        for stype, items in by_type.items():
+            parts = []
+            for s in items:
+                name = s.skill_name or ""
+                if s.proficiency:
+                    name += f"（{s.proficiency}）"
+                parts.append(name)
+            st.markdown(f"- **{stype}**：{'、'.join(parts)}")
+    else:
+        st.markdown("_（无）_")
+
+    # 求职意向
+    st.markdown("##### 求职意向")
+    if c.job_intention:
+        ji = c.job_intention
+        ji_items = [
+            ("目标岗位", ji.target_position),
+            ("期望城市", ji.target_city),
+            ("期望薪资", ji.expected_salary),
+            ("求职状态", ji.job_status),
+        ]
+        ji_lines = [f"- **{k}**：{v}" for k, v in ji_items if v]
+        st.markdown("\n".join(ji_lines) if ji_lines else "_（无）_")
+    else:
+        st.markdown("_（无）_")
+
+    # 荣誉
+    st.markdown("##### 荣誉")
+    if c.honors:
+        for h in c.honors:
+            line = f"- **{h.honor_name}**"
+            extras = [x for x in (h.honor_level, _fmt_date(h.honor_date)) if x]
+            if extras:
+                line += f"（{' · '.join(extras)}）"
+            st.markdown(line)
+    else:
+        st.markdown("_（无）_")
+
+    # 自我评价（完整展示，不截断）
+    st.markdown("##### 自我评价")
+    st.markdown(c.self_intro if c.self_intro else "_（无）_")
+
+    # 简历来源（含本地文件地址）
+    st.markdown("##### 简历来源")
+    if c.resume_source:
+        rs = c.resume_source
+        src_lines = []
+        if rs.source_platform:
+            src_lines.append(f"- **来源平台**：{rs.source_platform}")
+        if rs.file_name:
+            src_lines.append(f"- **原始文件名**：{rs.file_name}")
+        if rs.file_type:
+            src_lines.append(f"- **文件类型**：{rs.file_type}")
+        if rs.crawl_time:
+            src_lines.append(f"- **入库时间**：{rs.crawl_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        st.markdown("\n".join(src_lines) if src_lines else "_（无）_")
+        if rs.file_path:
+            st.markdown("**📎 简历文件本地地址：**")
+            st.code(rs.file_path, language=None)
+            fp = Path(rs.file_path)
+            file_exists = fp.exists()
+            dir_exists = fp.parent.exists()
+            op_cols = st.columns([1, 1, 6])
+            if op_cols[0].button("📄 打开", key=f"browse_open_file_{c.candidate_id}",
+                                  disabled=not file_exists,
+                                  help="用默认应用打开简历文件"):
+                try:
+                    os.startfile(str(fp))
+                except OSError as exc:
+                    st.error(f"打开失败：{exc}")
+            if op_cols[1].button("📁 访问目录", key=f"browse_open_dir_{c.candidate_id}",
+                                  disabled=not dir_exists,
+                                  help="在资源管理器中打开文件所在目录"):
+                try:
+                    os.startfile(str(fp.parent))
+                except OSError as exc:
+                    st.error(f"打开目录失败：{exc}")
+            if not file_exists:
+                st.warning("⚠️ 文件不存在，可能已被移动或删除")
+    else:
+        st.markdown("_（无）_")
+
+
 with tabs[1]:
     st.markdown("### 简历库浏览")
 
-    # 搜索栏
-    search_cols = st.columns([1.5, 1, 1, 1, 0.8])
-    s_name = search_cols[0].text_input("姓名", key="browse_name")
-    s_city = search_cols[1].text_input("城市", key="browse_city")
-    s_edu = search_cols[2].selectbox("学历", ["全部", "博士", "硕士", "本科", "大专", "高中", "中专"], key="browse_edu")
-    s_platform = search_cols[3].selectbox("来源", ["全部", "BOSS直聘", "智联招聘", "51前程无忧"], key="browse_platform")
-    page_num = search_cols[4].number_input("页码", min_value=1, value=1, step=1, key="browse_page")
+    # 过滤条
+    filt_cols = st.columns([1.4, 1.0, 1.0, 1.0, 1.0])
+    f_name = filt_cols[0].text_input("姓名", key="browse_name")
+    f_city = filt_cols[1].text_input("城市", key="browse_city")
+    f_edu = filt_cols[2].selectbox(
+        "学历", ["全部", "博士", "硕士", "本科", "大专", "高中", "中专"], key="browse_edu"
+    )
+    f_platform = filt_cols[3].selectbox(
+        "来源", ["全部", "BOSS直聘", "智联招聘", "51前程无忧"], key="browse_platform"
+    )
+    f_mark = filt_cols[4].selectbox("标记", ["全部", "关注"], key="browse_mark")
 
     session = create_resume_session()
     svc = ResumeArchiveService(session)
+    # 一次拉全部（不分页，左侧列表滚动浏览）。page_size 设大可保证全量返回。
     candidates, total = svc.list_candidates(
-        page=page_num,
-        page_size=20,
-        name=s_name or None,
-        city=s_city or None,
-        education_level=s_edu if s_edu != "全部" else None,
-        platform=s_platform if s_platform != "全部" else None,
+        page=1,
+        page_size=10000,
+        name=f_name or None,
+        city=f_city or None,
+        education_level=f_edu if f_edu != "全部" else None,
+        platform=f_platform if f_platform != "全部" else None,
+        favorite_only=(f_mark == "关注"),
     )
-    st.caption(f"共 {total} 条记录，当前第 {page_num} 页")
+    st.caption(f"共 {total} 条候选人")
 
-    if candidates:
-        for c in candidates:
-            with st.expander(f"**{c.name}** | {c.gender or ''} | {c.age or ''}岁 | {c.education_level or ''} | {c.current_city or ''} | {c.phone or ''}"):
-                detail_cols = st.columns([3, 1])
-                with detail_cols[0]:
-                    if c.educations:
-                        st.markdown("**教育经历**")
-                        for edu in c.educations:
-                            st.text(f"  {edu.school_name} | {edu.education_level or ''} | {edu.major or ''}")
-                    if c.work_experiences:
-                        st.markdown("**工作经历**")
-                        for w in c.work_experiences:
-                            st.text(f"  {w.company_name} | {w.position or ''} | {w.industry or ''}")
-                    if c.skills:
-                        st.markdown("**技能**")
-                        st.text("  " + "、".join(s.skill_name or "" for s in c.skills if s.skill_name))
-                    if c.job_intention:
-                        st.markdown("**求职意向**")
-                        ji = c.job_intention
-                        st.text(f"  {ji.target_position or ''} | {ji.target_city or ''} | {ji.expected_salary or ''}")
-                    if c.self_intro:
-                        st.markdown("**自我评价**")
-                        st.text(f"  {c.self_intro[:200]}")
-                with detail_cols[1]:
-                    if st.button("🗑️ 删除", key=f"del_{c.candidate_id}"):
-                        svc.delete_candidate(c.candidate_id)
-                        session.close()
-                        st.rerun()
-    else:
+    if not candidates:
         st.info("暂无候选人数据。请先在「简历自动解析入库」中导入简历。")
-    session.close()
+        session.close()
+    else:
+        # session_state 记忆当前选中候选人。过滤后若原选中不在结果集内，回退第一条
+        valid_cids = {c.candidate_id for c in candidates}
+        if st.session_state.get("browse_selected_cid") not in valid_cids:
+            st.session_state.browse_selected_cid = candidates[0].candidate_id
+
+        list_col, detail_col = st.columns([1, 3])
+
+        with list_col:
+            st.markdown("**候选人列表**")
+            # 列表内按钮基础样式：白底黑字 + 左对齐 + primary 态高亮
+            # 注：关注高亮改用 label "⭐ " 前缀（见 for 循环），不再依赖 nth-child CSS
+            # —— 早期版本用 nth-child 选择器在 Streamlit 1.56 的 DOM 嵌套层数下命中失败，
+            #    且条件性注入 fav CSS 会让整个容器位置漂移
+            st.markdown(
+                """
+                <style>
+                div[data-testid="stVerticalBlockBorderWrapper"] button {
+                    text-align: left !important;
+                    justify-content: flex-start !important;
+                    background: #ffffff !important;
+                    color: #1a1a1a !important;
+                    border: 1px solid #e2e8f0 !important;
+                    font-weight: normal !important;
+                }
+                div[data-testid="stVerticalBlockBorderWrapper"] button p {
+                    text-align: left !important;
+                    color: #1a1a1a !important;
+                }
+                div[data-testid="stVerticalBlockBorderWrapper"] button:hover {
+                    background: #f1f5f9 !important;
+                    border-color: #94a3b8 !important;
+                }
+                div[data-testid="stVerticalBlockBorderWrapper"] button[kind="primary"] {
+                    background: #e0e7ff !important;
+                    border-color: #6366f1 !important;
+                    font-weight: 600 !important;
+                }
+                </style>
+                """,
+                unsafe_allow_html=True,
+            )
+            with st.container(height=1400, border=True):
+                for c in candidates:
+                    is_selected = c.candidate_id == st.session_state.browse_selected_cid
+                    prefix = "⭐ " if c.is_favorite else ""
+                    label = f"{prefix}{c.name} | {c.age or '?'}岁 | {c.education_level or '-'}"
+                    if st.button(
+                        label,
+                        key=f"browse_pick_{c.candidate_id}",
+                        use_container_width=True,
+                        type="primary" if is_selected else "secondary",
+                    ):
+                        st.session_state.browse_selected_cid = c.candidate_id
+                        st.rerun()
+
+        with detail_col:
+            selected = next(
+                (c for c in candidates if c.candidate_id == st.session_state.browse_selected_cid),
+                None,
+            )
+            if selected:
+                _render_candidate_detail(selected, svc, session)
+
+        session.close()
 
 # ==================== Tab 3: 招聘岗位录入/匹配 ====================
+SALARY_LOW_OPTIONS = ["不限", "3K", "5K", "8K", "10K", "12K", "15K", "20K", "25K", "30K", "40K", "50K"]
+SALARY_HIGH_OPTIONS = ["不限", "5K", "8K", "10K", "12K", "15K", "20K", "25K", "30K", "40K", "50K", "80K", "100K"]
+EDU_OPTIONS = ["不限", "大专", "本科", "硕士以上"]
+EXP_OPTIONS = ["不限", "1-3年", "3-5年", "5-10年", "10年以上"]
+
+
+def _render_position_form(prefill=None, key_suffix: str = "new"):
+    """录入/编辑岗位表单。prefill 为 JobPosition 实例则做编辑预填，否则空表单。
+    返回 (clicked, dict) — clicked=True 表示用户点了保存按钮。"""
+    title = st.text_input("岗位名称", value=getattr(prefill, "title", "") or "",
+                          key=f"posf_title_{key_suffix}")
+    dept = st.text_input("部门", value=getattr(prefill, "department", "") or "",
+                         key=f"posf_dept_{key_suffix}")
+    req = st.text_area("岗位要求", value=getattr(prefill, "requirements", "") or "",
+                       height=300, key=f"posf_req_{key_suffix}")
+
+    sal_cols = st.columns([1, 0.2, 1])
+
+    def _safe_index(opts, value, default=0):
+        try:
+            return opts.index(value)
+        except ValueError:
+            return default
+
+    cur_low, cur_high = "不限", "不限"
+    if prefill and prefill.salary_range and "-" in prefill.salary_range:
+        parts = prefill.salary_range.split("-", 1)
+        cur_low, cur_high = parts[0].strip(), parts[1].strip()
+    sal_low = sal_cols[0].selectbox("薪资下限", SALARY_LOW_OPTIONS,
+                                     index=_safe_index(SALARY_LOW_OPTIONS, cur_low),
+                                     key=f"posf_sallow_{key_suffix}")
+    sal_cols[1].markdown("<div style='text-align:center; padding-top:32px;'>—</div>",
+                          unsafe_allow_html=True)
+    sal_high = sal_cols[2].selectbox("薪资上限", SALARY_HIGH_OPTIONS,
+                                      index=_safe_index(SALARY_HIGH_OPTIONS, cur_high),
+                                      key=f"posf_salhigh_{key_suffix}")
+
+    extra_cols = st.columns(2)
+    edu = extra_cols[0].selectbox("学历要求", EDU_OPTIONS,
+                                   index=_safe_index(EDU_OPTIONS, getattr(prefill, "min_education", None) or "不限"),
+                                   key=f"posf_edu_{key_suffix}")
+    exp = extra_cols[1].selectbox("工作年限", EXP_OPTIONS,
+                                   index=_safe_index(EXP_OPTIONS, getattr(prefill, "min_experience", None) or "不限"),
+                                   key=f"posf_exp_{key_suffix}")
+
+    btn_label = "💾 保存修改" if prefill else "保存岗位"
+    clicked = st.button(btn_label, type="primary", key=f"posf_btn_{key_suffix}")
+
+    if sal_low == "不限" and sal_high == "不限":
+        salary_range = ""
+    elif sal_low == "不限":
+        salary_range = f"≤{sal_high}"
+    elif sal_high == "不限":
+        salary_range = f"≥{sal_low}"
+    else:
+        salary_range = f"{sal_low}-{sal_high}"
+
+    return clicked, {
+        "title": title, "department": dept, "requirements": req,
+        "salary_range": salary_range,
+        "min_education": None if edu == "不限" else edu,
+        "min_experience": None if exp == "不限" else exp,
+    }
+
+
+@st.dialog("编辑岗位", width="large")
+def _open_edit_position_dialog():
+    pos_id = st.session_state.get("edit_pos_id")
+    if not pos_id:
+        st.error("缺少岗位 ID")
+        return
+    session = create_resume_session()
+    svc = ResumeArchiveService(session)
+    pos = session.get(JobPosition, pos_id)
+    if not pos:
+        session.close()
+        st.error("岗位不存在")
+        return
+    clicked, data = _render_position_form(prefill=pos, key_suffix=f"edit_{pos_id}")
+    if clicked:
+        if not data["title"]:
+            st.warning("请填写岗位名称")
+        else:
+            svc.update_position(pos_id, **data)
+            session.close()
+            st.session_state.pop("edit_pos_id", None)
+            st.success("修改已保存")
+            st.rerun()
+    else:
+        session.close()
+
+
 with tabs[2]:
     st.markdown("### 招聘岗位录入/匹配")
 
-    # 岗位录入
     with st.expander("➕ 录入新岗位", expanded=False):
-        pos_cols = st.columns([2, 1, 2, 1, 1])
-        pos_title = pos_cols[0].text_input("岗位名称", key="pos_title")
-        pos_dept = pos_cols[1].text_input("部门", key="pos_dept")
-        pos_req = pos_cols[2].text_area("岗位要求", key="pos_req", height=100)
-        pos_salary = pos_cols[3].text_input("薪资范围", key="pos_salary")
-        pos_city = pos_cols[4].text_input("工作城市", key="pos_city")
-        if st.button("保存岗位", type="primary"):
-            if pos_title:
+        clicked, data = _render_position_form(prefill=None, key_suffix="new")
+        if clicked:
+            if not data["title"]:
+                st.warning("请填写岗位名称")
+            else:
                 session = create_resume_session()
                 svc = ResumeArchiveService(session)
-                svc.create_position(
-                    title=pos_title, department=pos_dept,
-                    requirements=pos_req, salary_range=pos_salary, work_city=pos_city,
-                )
+                svc.create_position(**data)
                 session.close()
-                st.success(f"岗位「{pos_title}」已保存")
+                st.success(f"岗位「{data['title']}」已保存")
                 st.rerun()
-            else:
-                st.warning("请填写岗位名称")
 
-    # 已有岗位列表 + AI 匹配
+    # ---- 两栏布局：左 1/3 岗位列表，右 2/3 匹配结果 ----
     session = create_resume_session()
     svc = ResumeArchiveService(session)
     positions = svc.list_positions()
 
-    if positions:
-        st.markdown("**已有岗位**")
-        for pos in positions:
-            pos_exp = st.expander(f"📌 {pos.title} | {pos.department or ''} | {pos.work_city or ''} | {pos.salary_range or ''}")
-            with pos_exp:
-                st.text(f"要求：{pos.requirements or '无'}")
-                match_cols = st.columns([1, 1, 2])
-                if match_cols[0].button("🎯 AI 匹配", key=f"match_{pos.position_id}"):
-                    if not ai_service.is_configured:
-                        st.error("AI API Key 未配置")
-                    else:
-                        all_candidates, _ = svc.list_candidates(page=1, page_size=100)
-                        candidate_dicts = [
-                            {"candidate_id": c.candidate_id, "name": c.name,
-                             "education_level": c.education_level, "current_city": c.current_city,
-                             "position": c.work_experiences[0].position if c.work_experiences else ""}
-                            for c in all_candidates
-                        ]
-                        with st.spinner("AI 正在匹配..."):
-                            results = ai_service.match_candidates(pos.requirements or pos.title, candidate_dicts)
-                        if results:
-                            st.markdown("**匹配结果**")
-                            for r in results[:10]:
-                                st.text(f"  ID={r.get('candidate_id')} | 匹配度={r.get('match_score')}% | {r.get('reason', '')}")
-                        else:
-                            st.info("未找到匹配候选人")
-                if match_cols[1].button("📝 生成面试大纲", key=f"outline_{pos.position_id}"):
-                    if not ai_service.is_configured:
-                        st.error("AI API Key 未配置")
-                    else:
-                        with st.spinner("AI 正在生成面试大纲..."):
-                            outline = ai_service.generate_interview_outline("（通用候选人）", pos.title)
-                        st.markdown(outline)
-                if match_cols[2].button("🗑️ 删除岗位", key=f"delpos_{pos.position_id}"):
-                    svc.delete_position(pos.position_id)
-                    session.close()
-                    st.rerun()
-    else:
+    if not positions:
         st.info("暂无岗位。请先录入招聘岗位。")
-    session.close()
+        session.close()
+    else:
+        if "match_selected_pos" not in st.session_state or \
+           st.session_state.match_selected_pos not in {p.position_id for p in positions}:
+            st.session_state.match_selected_pos = positions[0].position_id
 
-# ==================== Tab 4: 面试评价 ====================
+        pos_col, match_col = st.columns([1, 2])
+
+        # ---- 左栏：岗位 expander 列表 ----
+        with pos_col:
+            st.markdown("**招聘岗位**")
+            # 缩小左栏岗位 expander 内的 markdown / caption 字体（保留 streamlit 原生排版）
+            st.markdown(
+                """<style>
+                div[data-testid="stExpander"] .stMarkdown p,
+                div[data-testid="stExpander"] .stMarkdown li,
+                div[data-testid="stExpander"] .stMarkdown h1,
+                div[data-testid="stExpander"] .stMarkdown h2,
+                div[data-testid="stExpander"] .stMarkdown h3,
+                div[data-testid="stExpander"] [data-testid="stCaptionContainer"],
+                div[data-testid="stExpander"] [data-testid="stCaptionContainer"] p {
+                    font-size: 13px !important;
+                    line-height: 1.5 !important;
+                }
+                </style>""",
+                unsafe_allow_html=True,
+            )
+            for pos in positions:
+                is_sel = pos.position_id == st.session_state.match_selected_pos
+                exp_label = ("▶ " if is_sel else "") + pos.title
+                if pos.salary_range:
+                    exp_label += f"（{pos.salary_range}）"
+                with st.expander(exp_label, expanded=is_sel):
+                    if not is_sel:
+                        # 用专属 container（带唯一 key）包按钮，再用 has-selector 锚定容器内的按钮
+                        view_btn_container = st.container(key=f"viewbtn_wrap_{pos.position_id}")
+                        st.markdown(
+                            f"""<style>
+                            div.st-key-viewbtn_wrap_{pos.position_id} button,
+                            div.st-key-viewbtn_wrap_{pos.position_id} button:focus,
+                            div.st-key-viewbtn_wrap_{pos.position_id} button:active {{
+                                background-color: #dcfce7 !important;
+                                color: #166534 !important;
+                                border-color: #86efac !important;
+                            }}
+                            div.st-key-viewbtn_wrap_{pos.position_id} button p {{
+                                color: #166534 !important;
+                            }}
+                            div.st-key-viewbtn_wrap_{pos.position_id} button:hover {{
+                                background-color: #bbf7d0 !important;
+                                border-color: #4ade80 !important;
+                                color: #14532d !important;
+                            }}
+                            div.st-key-viewbtn_wrap_{pos.position_id} button:hover p {{
+                                color: #14532d !important;
+                            }}
+                            </style>""",
+                            unsafe_allow_html=True,
+                        )
+                        with view_btn_container:
+                            if st.button("查看匹配结果 >>>", key=f"pos_view_{pos.position_id}",
+                                         use_container_width=True):
+                                st.session_state.match_selected_pos = pos.position_id
+                                st.rerun()
+                    meta_bits = []
+                    if pos.department:
+                        meta_bits.append(f"部门：{pos.department}")
+                    if pos.min_education:
+                        meta_bits.append(f"学历：{pos.min_education}")
+                    if pos.min_experience:
+                        meta_bits.append(f"年限：{pos.min_experience}")
+                    if meta_bits:
+                        st.caption(" | ".join(meta_bits))
+                    if pos.requirements:
+                        st.markdown(pos.requirements)
+                    else:
+                        st.caption("（无岗位要求说明）")
+
+                    pos_btn_cols = st.columns(2)
+                    if pos_btn_cols[0].button("🎯 智能匹配", key=f"pos_match_{pos.position_id}",
+                                               type="primary", use_container_width=True,
+                                               disabled=not ai_service.is_configured):
+                        st.session_state.match_selected_pos = pos.position_id
+                        st.session_state["trigger_match"] = pos.position_id
+                        st.rerun()
+                    if pos_btn_cols[1].button("🧹 清除匹配", key=f"pos_clear_{pos.position_id}",
+                                               use_container_width=True):
+                        st.session_state.match_selected_pos = pos.position_id
+                        session_tmp = create_resume_session()
+                        ResumeArchiveService(session_tmp).clear_position_matches(pos.position_id)
+                        session_tmp.close()
+                        st.rerun()
+                    pos_btn_cols2 = st.columns(2)
+                    if pos_btn_cols2[0].button("✏️ 编辑岗位", key=f"pos_edit_{pos.position_id}",
+                                               use_container_width=True):
+                        st.session_state["edit_pos_id"] = pos.position_id
+                        _open_edit_position_dialog()
+                    if pos_btn_cols2[1].button("🗑️ 删除", key=f"pos_del_{pos.position_id}",
+                                               use_container_width=True):
+                        svc.delete_position(pos.position_id)
+                        st.session_state.pop("match_selected_pos", None)
+                        session.close()
+                        st.rerun()
+
+        # ---- 右栏：只放匹配的候选人简历 ----
+        def _score_color(score: int) -> str:
+            """50% → 红棕, 95%+ → 亮绿, HSL 连续渐变。"""
+            clamped = max(50, min(score, 95))
+            hue = 15 + (clamped - 50) * 105 / 45
+            return f"hsl({hue:.0f}, 70%, 38%)"
+
+        with match_col:
+            sel_pos = next((p for p in positions if p.position_id == st.session_state.match_selected_pos), None)
+            if not sel_pos:
+                session.close()
+            else:
+                # 如果左栏触发了匹配，执行 AI 评估
+                if st.session_state.pop("trigger_match", None) == sel_pos.position_id:
+                    all_candidates, _ = svc.list_candidates(page=1, page_size=10000)
+                    candidate_dicts = []
+                    for c in all_candidates:
+                        skills_str = "、".join(s.skill_name or "" for s in c.skills if s.skill_name)[:100]
+                        work_str = "; ".join(
+                            f"{w.company_name}({w.position or '-'})"
+                            for w in (c.work_experiences or [])[:3]
+                        )
+                        candidate_dicts.append({
+                            "candidate_id": c.candidate_id,
+                            "name": c.name,
+                            "education_level": c.education_level or "-",
+                            "current_city": c.current_city or "-",
+                            "position": c.work_experiences[0].position if c.work_experiences else "-",
+                            "skills": skills_str or "-",
+                            "work_summary": work_str or "-",
+                        })
+                    svc.clear_position_matches(sel_pos.position_id)
+                    total = len(candidate_dicts)
+                    chunk_size = max(3, min(20, total // 5))
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    all_results = []
+                    for i in range(0, total, chunk_size):
+                        chunk = candidate_dicts[i:i + chunk_size]
+                        done = min(i + chunk_size, total)
+                        status_text.markdown(f"AI 正在评估候选人匹配度… **{i}/{total}**")
+                        progress_bar.progress(i / total if total > 0 else 0)
+                        results = ai_service.match_candidates(
+                            sel_pos.requirements or sel_pos.title, chunk
+                        )
+                        all_results.extend(results)
+                    progress_bar.progress(1.0)
+                    status_text.markdown(f"AI 评估完成 **{total}/{total}**，正在保存…")
+                    for r in all_results:
+                        cid = r.get("candidate_id")
+                        score = r.get("match_score", 0)
+                        reason = r.get("reason", "")
+                        if cid and isinstance(score, (int, float)):
+                            svc.save_position_match(sel_pos.position_id, int(cid), int(score), reason)
+                    progress_bar.empty()
+                    status_text.empty()
+                    st.rerun()
+
+                # 展示匹配结果 Banner
+                matches = svc.list_position_matches(sel_pos.position_id, min_score=50)
+                if matches:
+                    st.markdown(f"**{sel_pos.title}** — 匹配结果（≥50%，共 {len(matches)} 人）")
+                    for match_row, cand in matches:
+                        score = match_row.score
+                        reason = match_row.reason or ""
+                        with st.container(border=True):
+                            # 第一行：姓名+主信息 左顶头 | 匹配度右侧 | 邀约按钮
+                            h_cols = st.columns([3.5, 1.5, 0.3, 1.2])
+                            info_parts = []
+                            if cand.gender:
+                                info_parts.append(cand.gender)
+                            if cand.age:
+                                info_parts.append(f"{cand.age}岁")
+                            if cand.education_level:
+                                info_parts.append(cand.education_level)
+                            if cand.current_city:
+                                info_parts.append(cand.current_city)
+                            if cand.work_experiences and cand.work_experiences[0].position:
+                                info_parts.append(cand.work_experiences[0].position)
+                            info_str = f"&nbsp;&nbsp;&nbsp;{'  |  '.join(info_parts)}" if info_parts else ""
+                            h_cols[0].markdown(
+                                f"<div style='margin:0; line-height:1.4; padding-top:12px;'>"
+                                f"<span style='font-size:22px; font-weight:700; color:#000;'>{cand.name}</span>"
+                                f"<span style='font-size:14px; color:#333;'>{info_str}</span></div>",
+                                unsafe_allow_html=True,
+                            )
+                            color = _score_color(score)
+                            h_cols[1].markdown(
+                                f"<div style='text-align:right;'>"
+                                f"<span style='font-size:12px; color:#666;'>匹配度 </span>"
+                                f"<span style='font-size:32px; font-weight:700; color:{color};'>{score}%</span>"
+                                f"</div>",
+                                unsafe_allow_html=True,
+                            )
+                            # 第 3 列空白做气口
+                            with h_cols[3]:
+                                st.markdown("<div style='padding-top:10px;'></div>",
+                                            unsafe_allow_html=True)
+                                if st.button("📧 邀约面试", key=f"match_invite_{sel_pos.position_id}_{cand.candidate_id}"):
+                                    st.session_state["invite_dialog_cid"] = cand.candidate_id
+                                    _open_invite_dialog()
+
+                            # AI 评语：深蓝色（紧贴上方）
+                            if reason:
+                                st.markdown(
+                                    f"<div style='color:#1e3a8a; margin:0;'>"
+                                    f"💡 <b>AI 评语：</b>{reason}</div>",
+                                    unsafe_allow_html=True,
+                                )
+
+                            # 简要履历
+                            edu_str = " / ".join(
+                                f"{e.school_name}({e.education_level or ''}·{e.major or ''})"
+                                for e in (cand.educations or [])[:2]
+                            )
+                            work_str = " → ".join(
+                                f"{w.company_name}·{w.position or '-'}（{_fmt_date(w.start_date) or '?'} 至 {_fmt_date(w.end_date) or '至今'}）"
+                                for w in (cand.work_experiences or [])[:3]
+                            )
+                            if edu_str:
+                                st.markdown(f"🎓 {edu_str}")
+                            if work_str:
+                                st.markdown(f"💼 {work_str}")
+
+                            # 联系方式（黑色正常字号）
+                            contacts = []
+                            if cand.phone:
+                                contacts.append(f"📱 {cand.phone}")
+                            if cand.email:
+                                contacts.append(f"📧 {cand.email}")
+                            if cand.wechat:
+                                contacts.append(f"💬 {cand.wechat}")
+                            contact_text = (" | ".join(contacts) if contacts else "无联系方式")
+                            st.markdown(
+                                f"<div style='color:#000; font-size:14px; margin:4px 0;'>{contact_text}</div>",
+                                unsafe_allow_html=True,
+                            )
+
+                            # 简历文件 + 右下角来源信息
+                            if cand.resume_source and cand.resume_source.file_path:
+                                fp = Path(cand.resume_source.file_path)
+                                file_btn_key = f"filebtns_{sel_pos.position_id}_{cand.candidate_id}"
+                                st.markdown(
+                                    f"""<style>
+                                    .st-key-{file_btn_key} {{
+                                        margin-top: -8px !important;
+                                        margin-bottom: 0 !important;
+                                    }}
+                                    .st-key-{file_btn_key} [data-testid="stHorizontalBlock"] {{
+                                        gap: 4px !important;
+                                        align-items: center !important;
+                                    }}
+                                    .st-key-{file_btn_key} button {{
+                                        min-width: 32px !important;
+                                        width: 32px !important;
+                                        height: 32px !important;
+                                        padding: 0 !important;
+                                        display: inline-flex !important;
+                                        align-items: center !important;
+                                        justify-content: center !important;
+                                        border-radius: 6px !important;
+                                        font-size: 14px !important;
+                                        line-height: 1 !important;
+                                    }}
+                                    .st-key-{file_btn_key} button p {{
+                                        margin: 0 !important;
+                                        padding: 0 !important;
+                                        font-size: 14px !important;
+                                        line-height: 1 !important;
+                                    }}
+                                    </style>""",
+                                    unsafe_allow_html=True,
+                                )
+                                src_info = ""
+                                if cand.resume_source:
+                                    rs = cand.resume_source
+                                    src_info = f"来源：{rs.source_platform or '-'} | 入库：{rs.crawl_time.strftime('%Y-%m-%d') if rs.crawl_time else '-'}"
+                                with st.container(key=file_btn_key):
+                                    file_cols = st.columns([7, 0.6, 0.6, 5])
+                                    file_cols[0].markdown(
+                                        f"<div style='color:#000; font-size:13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; padding-top:6px;'>📎 {fp}</div>",
+                                        unsafe_allow_html=True,
+                                    )
+                                    if file_cols[1].button("📄", key=f"mopen_{sel_pos.position_id}_{cand.candidate_id}", help="打开文件"):
+                                        try:
+                                            os.startfile(str(fp))
+                                        except OSError:
+                                            pass
+                                    if file_cols[2].button("📁", key=f"mdir_{sel_pos.position_id}_{cand.candidate_id}", help="访问目录"):
+                                        try:
+                                            os.startfile(str(fp.parent))
+                                        except OSError:
+                                            pass
+                                    file_cols[3].markdown(
+                                        f"<div style='text-align:right; color:#888; font-size:12px; padding-top:8px;'>{src_info}</div>",
+                                        unsafe_allow_html=True,
+                                    )
+                else:
+                    st.info("暂无匹配结果。在左侧岗位中点击「🎯 智能匹配」开始 AI 评估。")
+
+                session.close()
+
+# ==================== Tab 4: 面试邀约 ====================
 with tabs[3]:
+    st.markdown("### 面试邀约")
+
+    session = create_resume_session()
+    svc = ResumeArchiveService(session)
+    invitations = svc.list_invitations(status="pending")
+    completed_invs = svc.list_invitations(status="completed")
+    cancelled_invs = svc.list_invitations(status="cancelled")
+
+    # 顶部统计
+    stat_cols = st.columns(4)
+    stat_cols[0].metric("进行中邀约", len(invitations))
+    stat_cols[1].metric("已完成", len(completed_invs))
+    stat_cols[2].metric("已解除", len(cancelled_invs))
+
+    if not invitations:
+        st.info(
+            "暂无进行中的邀约。在「简历库浏览」中选中候选人，"
+            "点击「📧 面试邀约」即可发起。"
+        )
+        session.close()
+    else:
+        # 一次拉所有岗位做映射，避免循环里 N 次查询
+        positions_map = {p.position_id: p for p in svc.list_positions()}
+
+        for inv in invitations:
+            cand = svc.get_candidate(inv.candidate_id)
+            if not cand:
+                continue
+            pos = positions_map.get(inv.position_id) if inv.position_id else None
+
+            with st.container(border=True):
+                # 头部：姓名 + 拟招岗位 + 完成/解除按钮
+                head_cols = st.columns([3, 3, 1, 1])
+                title = f"### ⭐ {cand.name}" if cand.is_favorite else f"### {cand.name}"
+                head_cols[0].markdown(title)
+                if pos:
+                    head_cols[1].markdown(
+                        f"**拟招岗位**：{pos.title}"
+                        + (f"（{pos.work_city}）" if pos.work_city else "")
+                    )
+                else:
+                    head_cols[1].markdown("**拟招岗位**：（未指定）")
+
+                if head_cols[2].button(
+                    "✓ 完成",
+                    key=f"inv_done_{inv.invitation_id}",
+                    type="primary",
+                    use_container_width=True,
+                ):
+                    svc.update_invitation_status(inv.invitation_id, "completed")
+                    st.rerun()
+                if head_cols[3].button(
+                    "✗ 解除",
+                    key=f"inv_cancel_{inv.invitation_id}",
+                    use_container_width=True,
+                ):
+                    svc.update_invitation_status(inv.invitation_id, "cancelled")
+                    st.rerun()
+
+                # 主信息行：性别 · 年龄 · 学历 · 城市 · 当前/最近岗位
+                info_parts = []
+                if cand.gender:
+                    info_parts.append(cand.gender)
+                if cand.age:
+                    info_parts.append(f"{cand.age}岁")
+                if cand.education_level:
+                    info_parts.append(cand.education_level)
+                if cand.current_city:
+                    info_parts.append(cand.current_city)
+                if cand.work_experiences:
+                    last = cand.work_experiences[0]
+                    if last.position:
+                        info_parts.append(last.position)
+                if info_parts:
+                    st.markdown(" · ".join(info_parts))
+
+                # 联系方式（手机/邮箱/微信）
+                contact_lines = []
+                if cand.phone:
+                    contact_lines.append(f"📱 **手机**：{cand.phone}")
+                if cand.email:
+                    contact_lines.append(f"📧 **邮箱**：{cand.email}")
+                if cand.wechat:
+                    contact_lines.append(f"💬 **微信**：{cand.wechat}")
+                if contact_lines:
+                    st.markdown(" &nbsp;&nbsp;|&nbsp;&nbsp; ".join(contact_lines))
+                else:
+                    st.caption("⚠️ 无联系方式")
+
+                # 备注 + 发起时间
+                meta_parts = [f"发起：{inv.create_time.strftime('%Y-%m-%d %H:%M')}"]
+                if inv.notes:
+                    meta_parts.append(f"备注：{inv.notes}")
+                st.caption(" · ".join(meta_parts))
+
+        session.close()
+
+
+# ==================== Tab 5: 面试评价 ====================
+with tabs[4]:
     st.markdown("### 面试评价")
 
     session = create_resume_session()

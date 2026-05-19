@@ -1,5 +1,136 @@
 # 开发日志
 
+## 2026-05-20
+
+### V2.18 简历库浏览大改 + 面试邀约 + 智能匹配重构
+
+#### 背景
+
+V2.17 完成 AI 解析层优化后，使用流程暴露三个 UI/数据层短板：
+1. Tab 2 简历库浏览只显示一半字段、用 expander 折叠不直观、需翻页
+2. 没有从浏览到邀约的闭环 — 看到合适候选人只能记下来再操作
+3. Tab 3 AI 匹配只是把 50 行候选人摘要丢给 AI 取 top 10，结果不持久化、信息量不够、刷新即丢
+
+#### 数据库改动
+
+**新增 2 张表 + 1 列**：
+- `interview_invitations`：面试邀约（候选人/岗位/状态/备注），candidate_id CASCADE，position_id SET NULL
+- `position_matches`：岗位匹配评分（position_id+candidate_id 唯一约束），CASCADE 删除
+- `candidates.is_favorite`：⭐ 关注标记
+- `job_positions.min_education` / `min_experience`：学历/年限要求枚举
+
+所有 ALTER 通过 `init_resume_database()` 的 `create_all()` + 手动 ALTER 落地，幂等。
+
+#### Service 层新增方法
+
+```
+update_candidate_field        - 浏览页 ⭐ 关注开关实时落库
+has_pending_invitation        - 邀约去重（同人同时只能 1 条 pending）
+create_invitation             - 发起邀约
+list_invitations              - 按 status 筛选
+update_invitation_status      - completed / cancelled
+update_position               - 编辑岗位
+clear_position_matches        - 清空岗位匹配（重跑前调用）
+save_position_match           - 保存单条匹配（merge 幂等）
+list_position_matches         - 按 score 降序读取（min_score 阈值过滤）
+```
+
+#### Tab 2 简历库浏览：完全重写
+
+| 改动 | 之前 | 现在 |
+|---|---|---|
+| 列表布局 | expander 折叠 + 翻页 | 左 1/4 滚动列表 1400px + 右 3/4 详情 |
+| 字段展示 | 只 14 个字段 | 全部 30+ 字段平铺，无截断 |
+| 标签格式 | 全角空格分隔 | `姓名 ｜ 28岁 ｜ 本科` 左对齐白底黑字 |
+| 关注高亮 | 无 | 关注候选人 label 加 ⭐ 前缀 |
+| 候选人操作 | 删除 | ⭐ 关注 + 📧 邀约 + 🗑️ 删除 |
+| 文件操作 | 显示路径 | 📄 打开 + 📁 访问目录 |
+| 过滤条 | 姓名/城市/学历/来源 + 翻页 | + 标记下拉（全部/关注） |
+
+新增 `_render_candidate_detail()` 函数渲染右侧详情，按 9 段平铺（基本信息 / 教育 / 工作 / 项目 / 技能 / 求职意向 / 荣誉 / 自我评价 / 简历来源）。
+
+#### Tab 3 招聘岗位/匹配：完全重写
+
+**两栏布局**：左 1/3 岗位 expander 列表，右 2/3 匹配结果 Banner。
+
+**录入岗位表单升级**：
+- 岗位要求 `text_area` 高度 100→300（3 倍）
+- 薪资改两个下拉框（下限 / 上限）
+- 学历下拉（不限 / 大专 / 本科 / 硕士以上）
+- 工作年限下拉（不限 / 1-3年 / 3-5年 / 5-10年 / 10年以上）
+- 删除工作城市输入框
+
+**抽出 `_render_position_form()` 复用**：录入和编辑共用同一个表单。新增 `@st.dialog` `_open_edit_position_dialog()` 用于编辑。
+
+**左栏岗位 expander**：
+- 标题：`岗位名（薪资）`，选中加 `▶` 前缀触发手风琴效果
+- 内容：部门/学历/年限 caption + 岗位要求 markdown（CSS 缩字号 13px 但保留 markdown 排版）
+- 按钮：🎯 智能匹配 / 🧹 清除匹配 / ✏️ 编辑岗位 / 🗑️ 删除
+- 未选中时顶部加「查看匹配结果 >>>」淡绿色按钮（`#dcfce7`）
+
+**右栏匹配 Banner**：
+- 头部：候选人姓名（22px 黑体）+ 主信息（| 分隔）+ 匹配度（32px，HSL 渐变 50%红棕→95%亮绿）+ 📧 邀约
+- AI 评语：深蓝 `#1e3a8a`
+- 简要履历：教育 + 最近 3 段工作（`「2022 至 至今」`，避免 markdown `~` 删除线）
+- 联系方式：黑色，不灰化
+- 底部：📎 文件路径 + [📄] [📁] 32x32 图标按钮 + 来源/入库时间右下角
+
+**AI 匹配分批进度**：
+```python
+chunk_size = max(3, min(20, total // 5))
+```
+自适应批次：5 人 → 3/批，74 人 → 14/批，500 人 → 20/批。每批后实时显示 `0/74 → 14/74 → 28/74` + 进度条。
+
+#### Tab 4 面试邀约：新增
+
+新增 5 个 Tab 中第 4 个（Tab 重排：入库 / 浏览 / 岗位 / 邀约 / 评价）。
+
+- 顶部 metric：进行中 / 已完成 / 已解除
+- 列表卡片：姓名（关注加 ⭐）+ 拟招岗位 + ✓完成 / ✗解除 + 主信息行 + 全部联系方式 + 创建时间 + 备注
+- 邀约入口：浏览页详情头部 📧 按钮 → `@st.dialog` 选岗位 → 去重检查 → 写库
+
+#### AI 服务改动 (`resume_ai_service.py`)
+
+`match_candidates`：
+- 移除 `top_n` 限制，对 **所有** 候选人评分（持久化由调用方负责）
+- candidate dict 字段从 5 个扩成 7 个（加 `skills` / `work_summary` 两段摘要）
+- 增加 `_unwrap_candidate_envelope` 兜底：AI 偶尔返回 `{"candidates": [...]}` 包装时自动解包
+- prompt 强调"完整 JSON 数组，不要遗漏任何候选人"
+
+#### CSS Scope 技术沉淀
+
+为给特定 widget 染色又不影响其他按钮，固化了一个模式：
+```python
+container = st.container(key=f"unique_X")
+st.markdown(f"<style>div.st-key-unique_X button {{ ... }}</style>", ...)
+with container:
+    st.button(...)
+```
+
+`.st-key-XXX` 是 Streamlit 1.36+ 给 `st.container(key=...)` 自动生成的稳定 class，是目前唯一能 scope CSS 到特定 widget 的可靠方式。已用于：
+- 「查看匹配结果 >>>」按钮淡绿染色
+- 文件路径行 [📄] [📁] 32x32 图标按钮强制等大居中
+- 文件路径行 container 上 margin -8px 消除空行
+
+#### 踩坑记录
+
+1. **Markdown `~` 渲染删除线**：工作经历 `start~end` 直接被渲染成删除线。改全角「 至 」。
+2. **CSS `:contains` `:has` 跨浏览器支持差**：用 `.st-key-XXX` 容器 class 替代。
+3. **CSS 优先级被 Streamlit 主题覆盖**：默认 `.st-key-X button` 不够，需要 `div.st-key-X button` + 同时覆盖 `:focus / :active / button p` 状态。
+4. **手风琴效果的副作用**：依赖 expander label 变化（`▶ ` 前缀）触发 widget key 变化让 streamlit 重置 expanded 状态，意外地解决了"展开多个岗位"的问题。
+5. **`_render_candidate_detail` 函数 forward 引用 dialog**：`_open_invite_dialog` 必须在 detail 渲染函数之前定义，否则 NameError。
+6. **`st.container(key=...)` 默认有 padding**：导致紧贴上方内容时出现空行。`margin-top:-8px` 拉回去。
+7. **AI 单次评估 70+ 人 prompt 超长**：分批 + chunk_size 自适应，5-20 之间。
+
+#### 文件变更
+
+| 文件 | 改动 |
+|---|---|
+| `recruitment_assistant/storage/resume_models.py` | +50 行（InterviewInvitation + PositionMatch + 3 列） |
+| `recruitment_assistant/services/resume_archive_service.py` | +95 行（9 个新方法） |
+| `recruitment_assistant/services/resume_ai_service.py` | match_candidates 重写 |
+| `app/pages/07_简历管理.py` | +1038 行（Tab 2/3/4 全部重写 + dialog + 表单复用） |
+
 ## 2026-05-19
 
 ### V2.17 简历 AI 解析三轴优化（D 方案：prompt + schema + 数据治理）

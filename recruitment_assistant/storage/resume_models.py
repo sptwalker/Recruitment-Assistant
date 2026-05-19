@@ -38,6 +38,7 @@ class Candidate(ResumeBase):
     current_city: Mapped[str | None] = mapped_column(String(50))
     education_level: Mapped[str | None] = mapped_column(String(20))
     self_intro: Mapped[str | None] = mapped_column(Text)
+    is_favorite: Mapped[int] = mapped_column(Integer, default=0, index=True)
     create_time: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     update_time: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
 
@@ -178,6 +179,8 @@ class JobPosition(ResumeBase):
     requirements: Mapped[str | None] = mapped_column(Text)
     salary_range: Mapped[str | None] = mapped_column(String(50))
     work_city: Mapped[str | None] = mapped_column(String(50))
+    min_education: Mapped[str | None] = mapped_column(String(20))
+    min_experience: Mapped[str | None] = mapped_column(String(20))
     status: Mapped[str] = mapped_column(String(20), default="open")
     create_time: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
@@ -196,4 +199,51 @@ class InterviewEvaluation(ResumeBase):
     conclusion: Mapped[str | None] = mapped_column(String(20))
     notes: Mapped[str | None] = mapped_column(Text)
     interview_time: Mapped[datetime | None] = mapped_column(DateTime)
+    create_time: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class InterviewInvitation(ResumeBase):
+    """面试邀约：浏览页发起 → 邀约 Tab 跟进 → 完成/解除。
+
+    status 流转：pending(默认) → completed / cancelled。
+    历史保留：完成/解除都是更新 status，不删除记录。
+    去重：同一候选人同一时刻最多 1 条 pending（Service 层 has_pending_invitation 拦截）。
+    """
+
+    __tablename__ = "interview_invitations"
+
+    invitation_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    candidate_id: Mapped[int] = mapped_column(
+        ForeignKey("candidates.candidate_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    position_id: Mapped[int | None] = mapped_column(
+        ForeignKey("job_positions.position_id", ondelete="SET NULL")
+    )
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    notes: Mapped[str | None] = mapped_column(Text)
+    create_time: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    update_time: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class PositionMatch(ResumeBase):
+    __tablename__ = "position_matches"
+    __table_args__ = (
+        UniqueConstraint("position_id", "candidate_id", name="uq_pos_cand_match"),
+    )
+
+    match_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    position_id: Mapped[int] = mapped_column(
+        ForeignKey("job_positions.position_id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    candidate_id: Mapped[int] = mapped_column(
+        ForeignKey("candidates.candidate_id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    score: Mapped[int] = mapped_column(Integer, index=True)
+    reason: Mapped[str | None] = mapped_column(Text)
     create_time: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())

@@ -9,8 +9,10 @@ from recruitment_assistant.storage.resume_models import (
     Education,
     Honor,
     InterviewEvaluation,
+    InterviewInvitation,
     JobIntention,
     JobPosition,
+    PositionMatch,
     ProjectExperience,
     ResumeSource,
     SkillCertificate,
@@ -134,6 +136,7 @@ class ResumeArchiveService:
         city: str | None = None,
         education_level: str | None = None,
         platform: str | None = None,
+        favorite_only: bool = False,
     ) -> tuple[list[Candidate], int]:
         stmt = select(Candidate)
         if name:
@@ -144,6 +147,8 @@ class ResumeArchiveService:
             stmt = stmt.where(Candidate.education_level == education_level)
         if platform:
             stmt = stmt.join(ResumeSource).where(ResumeSource.source_platform == platform)
+        if favorite_only:
+            stmt = stmt.where(Candidate.is_favorite == 1)
         total = self.session.scalar(select(func.count()).select_from(stmt.subquery())) or 0
         stmt = stmt.order_by(Candidate.candidate_id.desc()).offset((page - 1) * page_size).limit(page_size)
         return list(self.session.scalars(stmt).all()), total
@@ -166,12 +171,25 @@ class ResumeArchiveService:
 
     # --- 岗位 CRUD ---
 
-    def create_position(self, title: str, department: str = "", requirements: str = "", salary_range: str = "", work_city: str = "") -> JobPosition:
-        pos = JobPosition(title=title, department=department, requirements=requirements, salary_range=salary_range, work_city=work_city)
+    def create_position(self, title: str, department: str = "", requirements: str = "",
+                        salary_range: str = "", work_city: str = "",
+                        min_education: str | None = None,
+                        min_experience: str | None = None) -> JobPosition:
+        pos = JobPosition(
+            title=title, department=department, requirements=requirements,
+            salary_range=salary_range, work_city=work_city,
+            min_education=min_education, min_experience=min_experience,
+        )
         self.session.add(pos)
         self.session.commit()
         self.session.refresh(pos)
         return pos
+
+    def update_position(self, position_id: int, **fields) -> bool:
+        stmt = update(JobPosition).where(JobPosition.position_id == position_id).values(**fields)
+        result = self.session.execute(stmt)
+        self.session.commit()
+        return result.rowcount > 0
 
     def list_positions(self, status: str | None = None) -> list[JobPosition]:
         stmt = select(JobPosition)
@@ -226,3 +244,76 @@ class ResumeArchiveService:
             stmt = stmt.where(InterviewEvaluation.candidate_id == candidate_id)
         stmt = stmt.order_by(InterviewEvaluation.eval_id.desc())
         return list(self.session.scalars(stmt).all())
+
+    # --- 面试邀约 CRUD ---
+
+    def has_pending_invitation(self, candidate_id: int) -> bool:
+        """检测候选人是否已有 pending 邀约（用于发起邀约前去重）。"""
+        stmt = (
+            select(InterviewInvitation.invitation_id)
+            .where(
+                InterviewInvitation.candidate_id == candidate_id,
+                InterviewInvitation.status == "pending",
+            )
+            .limit(1)
+        )
+        return self.session.scalar(stmt) is not None
+
+    def create_invitation(
+        self,
+        candidate_id: int,
+        position_id: int | None = None,
+        notes: str = "",
+    ) -> InterviewInvitation:
+        inv = InterviewInvitation(
+            candidate_id=candidate_id,
+            position_id=position_id,
+            notes=notes or None,
+            status="pending",
+        )
+        self.session.add(inv)
+        self.session.commit()
+        self.session.refresh(inv)
+        return inv
+
+    def list_invitations(self, status: str | None = "pending") -> list[InterviewInvitation]:
+        """默认只列 pending；status=None 表示全部。"""
+        stmt = select(InterviewInvitation)
+        if status:
+            stmt = stmt.where(InterviewInvitation.status == status)
+        stmt = stmt.order_by(InterviewInvitation.invitation_id.desc())
+        return list(self.session.scalars(stmt).all())
+
+    def update_invitation_status(self, invitation_id: int, status: str) -> bool:
+        """status: pending / completed / cancelled"""
+        inv = self.session.get(InterviewInvitation, invitation_id)
+        if not inv:
+            return False
+        inv.status = status
+        self.session.commit()
+        return True
+
+    # --- 岗位匹配 CRUD ---
+
+    def clear_position_matches(self, position_id: int) -> int:
+        result = self.session.execute(
+            delete(PositionMatch).where(PositionMatch.position_id == position_id)
+        )
+        self.session.commit()
+        return result.rowcount
+
+    def save_position_match(self, position_id: int, candidate_id: int, score: int, reason: str) -> None:
+        self.session.merge(PositionMatch(
+            position_id=position_id, candidate_id=candidate_id,
+            score=score, reason=reason,
+        ))
+        self.session.commit()
+
+    def list_position_matches(self, position_id: int, min_score: int = 50) -> list[tuple]:
+        stmt = (
+            select(PositionMatch, Candidate)
+            .join(Candidate, PositionMatch.candidate_id == Candidate.candidate_id)
+            .where(PositionMatch.position_id == position_id, PositionMatch.score >= min_score)
+            .order_by(PositionMatch.score.desc(), PositionMatch.match_id)
+        )
+        return list(self.session.execute(stmt).all())

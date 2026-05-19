@@ -66,11 +66,56 @@ def normalize_platform(name: str | None) -> str | None:
     return PLATFORM_ALIAS.get(name.strip(), name)
 
 
+# AI 偶尔会把候选人字段嵌进 candidates / candidate / data 包装层（早期 prompt 用 "candidates 主信息" 标题诱导出来的）。
+# CandidateCreate 期望平铺，遇到这种结构自动解包。
+_CANDIDATE_ENVELOPE_KEYS = ("candidates", "candidate", "data", "result")
+
+
+def _unwrap_candidate_envelope(data: dict) -> dict:
+    """如果 AI 把候选人字段包进了一层包装，自动解开成平铺 dict。"""
+    if not isinstance(data, dict):
+        return data
+    # 当 name 缺失但发现包装 key 下面挂了 dict，把包装层解开（合并外层数组字段）
+    if "name" in data:
+        return data
+    for key in _CANDIDATE_ENVELOPE_KEYS:
+        inner = data.get(key)
+        if isinstance(inner, dict) and "name" in inner:
+            # 合并：内层覆盖外层（外层可能有 honors/educations 等并列项）
+            merged = {**data, **inner}
+            merged.pop(key, None)
+            logger.warning("AI 输出嵌套了 {} 包装层，已自动解包", key)
+            return merged
+    return data
+
+
 _SYSTEM_PROMPT_TEMPLATE = """你是一个专业的简历解析助手。把下列简历纯文本结构化为标准 JSON 对象。
 
-# 输出 JSON 字段表
+# 输出结构
 
-## candidates 主信息
+JSON 顶层就是一个候选人对象，**不要**再嵌套 `candidates` 之类的外层包装。
+顶层字段名固定为下列 16 个之一：
+  name, gender, age, birth_date, phone, email, wechat, current_city,
+  education_level, self_intro, educations, work_experiences,
+  project_experiences, skills, job_intention, honors
+
+例：
+```
+{
+  "name": "张三",
+  "age": 28,
+  "phone": "13800000000",
+  ...,
+  "educations": [...],
+  "work_experiences": [...]
+}
+```
+
+不要写成 `{"candidates": {"name": ..., ...}}` —— 那是错的。
+
+# 顶层字段表
+
+## 候选人主信息（直接放在顶层，不要嵌套）
 - name (str, 必填)：姓名。中文名/英文名/单字名都要识别。
 - gender (str)：性别，只能是 "男" / "女"。从姓名/称谓/简历头部识别。
 - age (int)：年龄。识别优先级：(1) 简历明确写"XX岁"取值 (2) 只写出生日期 → 用 {current_year} 减去出生年得到 (3) 简历只写工作年限或毕业年 → 不要硬猜，留 null。
@@ -181,6 +226,7 @@ class ResumeAIService:
                 content = content[:-3]
             content = content.strip()
             data = json.loads(content)
+            data = _unwrap_candidate_envelope(data)
             return CandidateCreate(**data)
         except json.JSONDecodeError as exc:
             logger.warning("AI 返回内容非合法 JSON：{}", exc)

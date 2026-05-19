@@ -20,7 +20,7 @@ from recruitment_assistant.parsers.pdf_resume_parser import (
     is_empty_or_corrupted,
 )
 from recruitment_assistant.schemas.resume_archive import CandidateCreate, ResumeSourceCreate
-from recruitment_assistant.services.resume_ai_service import ResumeAIService
+from recruitment_assistant.services.resume_ai_service import ResumeAIService, normalize_platform
 from recruitment_assistant.services.resume_archive_service import ResumeArchiveService
 from recruitment_assistant.storage.resume_db import create_resume_session, init_resume_database
 
@@ -393,7 +393,7 @@ with tabs[0]:
                             results["skip_count"] += 1
                         else:
                             candidate_data.resume_source = ResumeSourceCreate(
-                                source_platform=platform,
+                                source_platform=normalize_platform(platform),
                                 file_name=fname,
                                 file_type=path.suffix.lstrip(".").upper(),
                                 file_path=str(path),

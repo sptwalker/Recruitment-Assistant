@@ -44,6 +44,28 @@ def _normalize_base_url(base_url: str) -> str:
     return url
 
 
+PLATFORM_ALIAS = {
+    "BOSS": "BOSS直聘",
+    "boss": "BOSS直聘",
+    "Boss": "BOSS直聘",
+    "BOSS直聘": "BOSS直聘",
+    "智联": "智联招聘",
+    "智联招聘": "智联招聘",
+    "51": "51前程无忧",
+    "51job": "51前程无忧",
+    "前程无忧": "51前程无忧",
+    "51前程无忧": "51前程无忧",
+}
+PLATFORM_VALID = {"BOSS直聘", "智联招聘", "51前程无忧"}
+
+
+def normalize_platform(name: str | None) -> str | None:
+    """把 source_platform 规范成 3 个枚举值之一，未知值返回原值。"""
+    if not name:
+        return name
+    return PLATFORM_ALIAS.get(name.strip(), name)
+
+
 _SYSTEM_PROMPT_TEMPLATE = """你是一个专业的简历解析助手。把下列简历纯文本结构化为标准 JSON 对象。
 
 # 输出 JSON 字段表

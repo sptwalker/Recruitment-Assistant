@@ -1,5 +1,71 @@
 # 开发日志
 
+## 2026-05-19
+
+### V2.17 简历 AI 解析三轴优化（D 方案：prompt + schema + 数据治理）
+
+#### 背景
+
+V2.07 后第一次大规模简历入库 75 份，审计发现：
+- candidates 主信息：age/gender 仅 52%、current_city 41%、wechat 11%、qq/籍贯/政治面貌/民族/身高 0%。
+- 子表多个字段 0% 填充率（main_courses、performance、manage_scope、industry_prefer 等）。
+- skills 人均 8.79 条（拆条严重）；source_platform 出现 `BOSS` 与 `BOSS直聘` 两种命名。
+- 36/75 候选人无年龄。
+
+根因：(1) SYSTEM_PROMPT 概括式描述，未枚举字段。(2) `raw_text[:8000]` 截断过早。(3) schema 设计阶段含大量"理论上有用、实际简历不写"的字段。(4) 写库时未规范化平台名。
+
+#### 改动
+
+**Prompt 重写（`recruitment_assistant/services/resume_ai_service.py`）：**
+- 用字段表枚举每个保留字段，给出语义/枚举值/示例/缺省规则。
+- `age` 显式要求"只有生日时用当前年减去出生年"（动态注入 `datetime.now().year`）。
+- `skills` 加合并规则："相同 skill_type 的多技能用顿号合并到一条"。
+- 区分 `education_level`（学历层次）和 `degree`（具体学位）。
+- `raw_text[:8000]` → `raw_text[:MAX_RESUME_TEXT_CHARS]`（25000）。
+
+**Schema 减肥（`schemas/resume_archive.py` + `storage/resume_models.py` + `services/resume_archive_service.py`）：**
+
+删除 19 个 0% 填充率且无业务价值的字段：
+
+| 表 | 删除字段 |
+|---|---|
+| candidates | qq, native_place, political_status, ethnicity, height |
+| education | main_courses, honors |
+| work_experience | company_type, department, job_level, work_duration, performance, manage_scope |
+| project_experience | project_industry |
+| skills_certificates | certificate_org, get_date |
+| job_intention | work_nature, arrival_time, industry_prefer |
+| honors | issue_by |
+
+**数据治理脚本（`scripts/migrate_resume_db.py`）：** 4 阶段幂等迁移：
+- `fix-platform`: `BOSS` → `BOSS直聘`（1 条）
+- `drop-columns`: ALTER TABLE DROP COLUMN（19 列）
+- `merge-skills`: 同候选人+同 type 合并 skill_name（659 → 165 条）
+- `ai-fill`: phone 作 key 用现有附件二次过 AI 补全缺失字段（待用户手动执行）
+
+**入库规范化（`07_简历管理.py`）：**
+- 引入 `normalize_platform()` 函数 + `PLATFORM_ALIAS` 别名表，写库时统一为三个枚举值之一。
+
+#### 测试
+
+- `tests/services/test_resume_ai_service_prompt.py` 5 个测试，回归 prompt 字段覆盖。
+- `tests/services/test_platform_normalize.py` 5 个测试，验证别名映射。
+- `scripts/test_parse_one.py` 抽样工具 + `scripts/audit_resume_db.py` 字段填充率审计。
+
+#### 数据治理结果
+
+| 指标 | 改造前 | 改造后 |
+|---|---|---|
+| 平台命名 | BOSS/BOSS直聘 混用 | 统一 BOSS直聘 |
+| skills 总条数 | 659 | 165（合并后） |
+| 0% 字段数 | 19 | 0（已删） |
+| candidates 字段数 | 18 | 13（精简） |
+
+#### 后续
+
+- 用户手动执行 `python -X utf8 scripts/migrate_resume_db.py --phase ai-fill` 补全 age/gender/current_city。
+- 下一批入库后再跑 `audit_resume_db.py`，确认 prompt 改造的实际收益。
+
 ## 2026-05-18
 
 ### V2.08–V2.16 BOSS 采集稳定性修复 + 候选人识别重构

@@ -35,34 +35,71 @@ def _normalize_base_url(base_url: str) -> str:
     return url
 
 
-SYSTEM_PROMPT = """你是一个专业的简历解析助手。请将以下简历纯文本提取为标准 JSON 格式。
+SYSTEM_PROMPT = """你是一个专业的简历解析助手。把下列简历纯文本结构化为标准 JSON 对象。
 
-输出 JSON 结构（所有字段可选，缺失则为 null）：
-{
-  "name": "姓名",
-  "gender": "性别(男/女)",
-  "age": 数字或null,
-  "birth_date": "YYYY-MM-DD或null",
-  "phone": "手机号",
-  "email": "邮箱",
-  "wechat": "微信号",
-  "current_city": "现居城市",
-  "education_level": "最高学历(大专/本科/硕士/博士)",
-  "self_intro": "自我评价摘要(50字内)",
-  "educations": [{"school_name":"","education_level":"","major":"","degree":"","start_date":"","end_date":""}],
-  "work_experiences": [{"company_name":"","position":"","industry":"","start_date":"","end_date":"","job_content":""}],
-  "project_experiences": [{"project_name":"","project_role":"","project_desc":"","project_result":""}],
-  "skills": [{"skill_type":"专业/语言/工具/证书","skill_name":"","proficiency":"精通/熟练/了解"}],
-  "job_intention": {"target_position":"","target_city":"","expected_salary":"","job_status":""},
-  "honors": [{"honor_name":"","honor_level":""}]
-}
+# 输出 JSON 字段表
 
-要求：
-1. 只输出 JSON，不要任何解释文字
-2. 日期格式 YYYY-MM-DD，缺失年份用 null
-3. 手机号只保留 11 位数字
-4. 学历统一为：大专/本科/硕士/博士/高中/中专
-5. 如果简历内容不完整，尽量提取已有信息"""
+## candidates 主信息
+- name (str, 必填)：姓名。中文名/英文名/单字名都要识别。
+- gender (str)：性别，只能是 "男" / "女"。从姓名/称谓/简历头部识别。
+- age (int)：年龄。识别优先级：(1) 简历明确写"XX岁"取值 (2) 只写出生日期 → 用 2026 减去出生年得到 (3) 简历只写工作年限或毕业年 → 不要硬猜，留 null。
+- birth_date (str|null)：出生日期 YYYY-MM-DD，可只到年/月。
+- phone (str)：手机号。只保留 11 位数字，去掉所有空格、横线、括号。
+- email (str)：邮箱。
+- wechat (str)：微信号 / WX。
+- current_city (str)：现居城市。注意区别于"籍贯/家乡"——只取候选人当前生活/工作所在地。
+- education_level (str)：最高学历层次。只能是 "高中" / "中专" / "大专" / "本科" / "硕士" / "博士" 之一。
+- self_intro (str)：自我评价摘要，控制在 80 字内。
+
+## educations[] 教育经历
+- school_name (str)：学校名。完整官方名（如"湖南大学"而非"湖大"）。
+- education_level (str)：本段学历，枚举同上。
+- major (str)：专业。
+- degree (str)：具体学位（"工学学士" / "管理学硕士" / "MBA"）。注意：和 education_level 不同——education_level 是层次，degree 是学位名称，简历常省略 degree，留 null 不要硬填。
+- start_date / end_date (str|null)：YYYY-MM-DD，缺月份补 01；在读用 null 表示。
+- is_full_time (int)：1=全日制，0=非全日制（在职/函授/网教）。默认 1。
+
+## work_experiences[] 工作经历
+- company_name (str)：公司名。
+- industry (str)：行业（如"互联网"、"制造业"、"金融"）。简历明确写出才填。
+- position (str)：职位名（如"高级工程师"）。
+- start_date / end_date (str|null)：YYYY-MM-DD，至今/在职 → null。
+- job_content (str)：工作内容描述。
+
+## project_experiences[] 项目经历
+- project_name (str)：项目名。
+- project_role (str)：在项目中的角色（如"项目经理"、"后端开发"）。
+- project_desc (str)：项目描述。
+- project_result (str)：项目成果/产出。
+
+## skills[] 技能/证书 ★合并规则
+**重要：相同 skill_type 的技能要合并到一条记录里**，多个 skill_name 用顿号"、"连接。例如：
+- ❌ 错：[{"skill_type":"语言","skill_name":"Python"},{"skill_type":"语言","skill_name":"Java"}]
+- ✅ 对：[{"skill_type":"语言","skill_name":"Python、Java、SQL"}]
+
+字段：
+- skill_type (str)：分类，只能是 "专业" / "语言" / "工具" / "证书" 之一。
+- skill_name (str)：技能/证书名（合并后用"、"连接）。
+- proficiency (str)：熟练度，"精通" / "熟练" / "了解"。证书类不写。
+
+## job_intention 求职意向（单对象，非数组）
+- target_position (str)：目标岗位。
+- target_city (str)：期望工作城市。
+- expected_salary (str)：期望薪资（如"15-20K"）。
+- job_status (str)：求职状态（"在职-看机会" / "离职-随时到岗" / "应届"）。
+
+## honors[] 荣誉
+- honor_name (str)：荣誉名（如"国家奖学金"、"优秀员工"）。
+- honor_level (str)：等级，"国家级" / "省级" / "市级" / "校级" / "公司级"。
+
+# 通用规则
+
+1. 输出**严格 JSON 对象**（不是数组），不要 markdown 代码块、不要解释文字。
+2. 任何字段无法识别就返回 null，不要编造。
+3. 日期统一 YYYY-MM-DD，缺月份用 -01 补齐，"至今/在职" → null。
+4. 手机号、邮箱、微信若简历有多个，取主要一个。
+5. 数组字段（educations / work_experiences 等）若简历完全没有该信息就返回空数组 []，不是 null。
+"""
 
 
 class ResumeAIService:
@@ -96,7 +133,7 @@ class ResumeAIService:
                 model=self.model,
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": f"请解析以下简历：\n\n{raw_text[:8000]}"},
+                    {"role": "user", "content": f"请解析以下简历：\n\n{raw_text[:25000]}"},
                 ],
                 temperature=0.1,
                 timeout=60,

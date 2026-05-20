@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  const CONTENT_SCRIPT_VERSION = "1.82.0";
+  const CONTENT_SCRIPT_VERSION = "1.86.0";
 
   // 平台注册表：每个平台的 hostname、WS 端口、文本标记、localStorage key 一站式声明。
   // 这是从单平台升级到多平台的核心入口——新加平台只需在此对象增加一条配置。
@@ -267,6 +267,38 @@
       .sort((a, b) => b.score - a.score)[0]?.el || null;
   }
 
+  async function clickBossChattingTab() {
+    // 在 BOSS 沟通页顶部按文本"沟通中"找标签并点击。
+    // 没有稳定 ID/class，按文本扫描可点击元素，限制范围在页面上半部分（避免误中正文里的"沟通中"字样）。
+    const candidates = [];
+    const all = document.querySelectorAll("a, button, span, li, [role='tab'], [class*='tab'], [class*='filter']");
+    for (const el of all) {
+      const text = (el.innerText || el.textContent || "").trim();
+      if (text !== "沟通中") continue;
+      const rect = el.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) continue;
+      if (rect.top < 0 || rect.top > window.innerHeight * 0.5) continue;
+      if (rect.width > 200) continue; // 标签通常很窄
+      candidates.push({ el, rect });
+    }
+    if (candidates.length === 0) {
+      emit({ type: "boss_chatting_tab_skip", data: { reason: "not_found", url: location.href } });
+      return false;
+    }
+    // 取最靠上的那个
+    candidates.sort((a, b) => a.rect.top - b.rect.top);
+    const target = candidates[0].el;
+    try {
+      clickElementReliably(target);
+      emit({ type: "boss_chatting_tab_clicked", data: { rect: candidates[0].rect, text: "沟通中" } });
+      await sleep(800);
+      return true;
+    } catch (exc) {
+      emit({ type: "boss_chatting_tab_skip", data: { reason: "click_failed", error: String(exc) } });
+      return false;
+    }
+  }
+
   async function resetCandidateListScroll() {
     const container = findBestListContainer();
     if (container) {
@@ -333,14 +365,10 @@
       .trim();
   }
 
-  function isInvalidCandidateNameToken(value = "") {
-    const baseValue = value.replace(/先生|女士/g, "");
-    const blacklist = new Set([
-      "沟通", "在线", "附件", "附件简历", "简历附件", "交换微信", "常用语", "招聘者", "职位管理", "推荐牛人", "搜索",
-      "刚刚", "刚刚活跃", "今日", "今日活跃", "昨日", "昨日活跃", "活跃", "下载", "查看", "简历", "下载简历", "查看简历", "下简历",
-      "游戏", "标注", "运营", "开发", "测试", "设计", "运维", "策划", "编程", "销售", "教育", "培训", "直播", "电商", "外贸",
-    ]);
-    return !baseValue || blacklist.has(value) || blacklist.has(baseValue) || /简历|下载|附件|查看|沟通|职位|推荐|搜索|客服|工具|数据标注|数据分析|数据运营|游戏策划|游戏测试|游戏运营|产品经理|产品助理|前端开发|后端开发|全栈开发|运维工程|测试工程|算法工程|人工智能|机器学习|深度学习|自然语言|计算机视|软件开发|软件工程|系统运维|网络工程|项目经理|项目管理|电商运营|新媒体|内容运营|短视频|直播运营|平面设计|UI设计|视觉设计|交互设计|客户经理|商务拓展|市场营销|人力资源|行政助理|财务会计/.test(baseValue);
+  function isInvalidCandidateNameToken(_value = "") {
+    // 完全忠实采集策略下不再过滤任何姓名 token。
+    // 保留此 stub 仅为不破坏外部调用点（如 getTopProfileTokens 路径仍可能间接调用）。
+    return false;
   }
 
   function parseContactText(text) {
@@ -355,12 +383,10 @@
     if (ageMatch) {
       const beforeAge = clean.slice(0, ageMatch.index).trim();
       const nameMatches = Array.from(beforeAge.matchAll(/[\u4e00-\u9fa5]{2,4}(?:先生|女士)?/g)).map((m) => m[0]);
-      for (let i = nameMatches.length - 1; i >= 0; i--) {
-        const value = nameMatches[i];
-        if (!isInvalidCandidateNameToken(value)) {
-          name = value;
-          break;
-        }
+      // 完全忠实采集：取年龄前最后一个匹配到的连续中文片段（最靠近年龄的）。
+      // 不做职位词/无效名过滤——网站上看到什么就采集什么。
+      if (nameMatches.length > 0) {
+        name = nameMatches[nameMatches.length - 1];
       }
     }
 
@@ -422,20 +448,11 @@
   }
 
   function parseTopProfileName(text = "") {
-    const clean = stripActivityText(text).replace(/刚刚活跃|今日活跃|昨日活跃|活跃|在线/g, " ").trim();
-    const titledName = clean.match(/([\u4e00-\u9fa5]{1,3}(?:先生|女士))/);
-    if (titledName && !isInvalidCandidateNameToken(titledName[1])) return titledName[1];
-    const beforeLocation = clean.split(/在|现居|居住|位于|来自/)[0].trim();
-    const source = beforeLocation || clean;
-    const names = Array.from(source.matchAll(/[\u4e00-\u9fa5]{2,4}/g)).map((m) => m[0]);
-    for (const value of names) {
-      if (!isInvalidCandidateNameToken(value)) return value;
-    }
-    const englishName = source.match(/^([A-Za-z][A-Za-z\s.\-]{1,24}[A-Za-z.])/);
-    if (englishName) return englishName[1].trim();
-    const singleChar = source.match(/^([一-龥])\s*\d/);
-    if (singleChar && !isInvalidCandidateNameToken(singleChar[1])) return singleChar[1];
-    return "";
+    // 完全忠实采集：原样返回页面文本，仅剥离明确的 UI 噪音（按钮文字 + 活跃状态）。
+    // 不做任何"内容修正"——包括"先生/女士"优先匹配、地名/职业词剥离、
+    // 名字长度检查、单字兜底等。如果用户在网站填写的就是看起来"奇怪"的姓名，
+    // 也忠实保留——否则会导致同一候选人在不同读取时识别出不一致的姓名。
+    return stripActivityText(text).trim();
   }
 
   function parseTopProfileText(text) {
@@ -583,9 +600,10 @@
     const largest = findLargestFontElement(container, ageCenterY);
     if (!largest) return null;
     const rawName = largest.text.replace(/[\u2642\u2640\s]/g, "").trim();
-    const cleanName = stripActivityText(rawName);
-    const nameFromLargest = parseTopProfileName(cleanName) || cleanName.replace(/\u5728\u7ebf|\u6d3b\u8dc3|\u5206\u949f\u524d.*$/g, "").trim();
-    if (!nameFromLargest || isInvalidCandidateNameToken(nameFromLargest)) return null;
+    // \u76f4\u63a5\u7528\u6700\u5927\u5b57\u53f7\u5143\u7d20\u7684\u6587\u672c\u4f5c\u4e3a\u59d3\u540d\uff0c\u4ec5\u5265\u6389\u660e\u663e\u7684\u6d3b\u52a8\u72b6\u6001\u540e\u7f00\uff08\u521a\u521a\u6d3b\u8dc3/\u5728\u7ebf/X\u5206\u949f\u524d\u6d3b\u8dc3 \u7b49\uff09\u3002
+    // \u4e0d\u505a"\u662f\u5426\u5408\u7406"\u7684\u5224\u65ad\u2014\u2014\u4fdd\u7559\u9875\u9762\u4e0a\u7aef\u539f\u6837\u7684\u8fde\u7eed\u5927\u5b57\u53f7\u5b57\u7b26\u4e32\uff0c\u5bf9\u91c7\u96c6\u7cfb\u7edf\u800c\u8a00\u8fd9\u5c31\u8db3\u4ee5\u505a\u5339\u914d/\u53bb\u91cd\u3002
+    const nameFromLargest = stripActivityText(rawName);
+    if (!nameFromLargest || nameFromLargest.length < 1) return null;
     if (largest.el === ageAnchor.el) return null;
     const genderOk = hasGenderIndicator(largest.el);
     const education = extractEducationFromPipes(container);
@@ -2352,6 +2370,10 @@
     const downloadButton = await waitForDownloadButton(candidateId, signature, 5000);
     if (!downloadButton) {
       emit({ type: "all_download_strategies_exhausted", data: { candidate_id: candidateId, candidate_signature: signature, preview_source: preview?.info?.preview_source || "" } });
+      // 兜底进入手动学习模式：所有自动策略都失败，让用户手动点一次重新捕获 selector
+      if (await learnManualDownloadClickAfterFailure(candidateId, signature, info, "all_strategies_exhausted")) {
+        return;
+      }
       await skipCandidate(candidateId, signature, "download_button_not_found");
       return;
     }
@@ -3008,7 +3030,7 @@
 
     emit({ type: "page_ready", data: { url: location.href } });
 
-    await resetCandidateListScroll();
+    await clickBossChattingTab();
     let items = getCandidateItems();
     if (items.length === 0) {
       emit({ type: "error", data: { message: "未找到候选人列表", stage: "scan" } });

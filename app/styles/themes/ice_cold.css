@@ -1,0 +1,38 @@
+/*
+theme-id: ice_cold
+theme-name: 寒冰冷酷风
+theme-description: 冰蓝、银白与冷灰，清冷克制。
+*/
+:root {
+  --color-primary: #0284c7;
+  --color-primary-hover: #0369a1;
+  --color-primary-active: #075985;
+  --color-primary-soft: #e0f2fe;
+  --color-secondary: #64748b;
+  --color-accent: #38bdf8;
+  --color-success: #0f9f6e;
+  --color-success-soft: #ecfdf5;
+  --color-warning: #ca8a04;
+  --color-warning-soft: #fefce8;
+  --color-danger: #e11d48;
+  --color-danger-soft: #fff1f2;
+  --color-info: #0284c7;
+  --color-bg: #eff6ff;
+  --color-bg-soft: #f8fbff;
+  --color-surface: #ffffff;
+  --color-surface-muted: #f0f9ff;
+  --color-border: #bae6fd;
+  --color-border-strong: #7dd3fc;
+  --color-text: #0f2537;
+  --color-text-secondary: #345269;
+  --color-text-muted: #607d95;
+  --color-hover: #e0f2fe;
+  --color-active: #bae6fd;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --radius-xl: 20px;
+  --shadow-sm: 0 8px 22px rgba(2, 132, 199, 0.08);
+  --shadow-md: 0 18px 42px rgba(2, 132, 199, 0.13);
+  --focus-ring: 0 0 0 3px rgba(2, 132, 199, 0.18);
+  --primary: var(--color-primary); --bg: var(--color-bg); --white: var(--color-surface); --success: var(--color-success-soft); --accent: var(--color-accent); --text: var(--color-text); --muted: var(--color-text-muted); --line: var(--color-border); --danger: var(--color-danger); --warn: var(--color-warning);
+}

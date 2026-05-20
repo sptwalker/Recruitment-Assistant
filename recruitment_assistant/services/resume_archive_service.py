@@ -245,6 +245,13 @@ class ResumeArchiveService:
         stmt = stmt.order_by(InterviewEvaluation.eval_id.desc())
         return list(self.session.scalars(stmt).all())
 
+    def delete_interview_evals(self, candidate_id: int) -> int:
+        result = self.session.execute(
+            delete(InterviewEvaluation).where(InterviewEvaluation.candidate_id == candidate_id)
+        )
+        self.session.commit()
+        return result.rowcount
+
     # --- 面试邀约 CRUD ---
 
     def has_pending_invitation(self, candidate_id: int) -> bool:

@@ -1,9 +1,8 @@
-"""简历分析管理模块 — 4 Tab 页面。
+"""简历分析管理模块 — 3 Tab 页面。
 
 Tab 1: 简历自动解析入库（扫描 → 提取文本 → AI 结构化 → 去重 → 入库）
-Tab 2: 简历库浏览（搜索 / 详情 / 删除 / 屏蔽）
+Tab 2: 简历库浏览（搜索 / 详情 / 删除 / 屏蔽 / 面试邀约）
 Tab 3: 招聘岗位录入/匹配（录入岗位 → AI 匹配候选人）
-Tab 4: 面试评价（填写评分 / 查看历史）
 """
 
 import os
@@ -25,13 +24,14 @@ from recruitment_assistant.schemas.resume_archive import CandidateCreate, Resume
 from recruitment_assistant.services.resume_ai_service import ResumeAIService, normalize_platform
 from recruitment_assistant.services.resume_archive_service import ResumeArchiveService
 from recruitment_assistant.storage.resume_db import create_resume_session, init_resume_database
+from recruitment_assistant.storage.resume_models import JobPosition
 
 init_resume_database()
 settings = get_settings()
 
 st.set_page_config(page_title="简历管理", layout="wide", initial_sidebar_state="collapsed")
 inject_vibe_style("简历管理")
-page_header("简历分析管理", "自动解析入库、浏览管理、岗位匹配、面试评价。")
+page_header("简历分析管理", "自动解析入库、浏览管理、岗位匹配。面试跟进请到「面试管理」。")
 
 
 @st.cache_resource
@@ -80,13 +80,11 @@ def extract_text(path: Path) -> str:
     return ""
 
 
-# ==================== 4 Tab 页面 ====================
+# ==================== 3 Tab 页面 ====================
 tabs = st.tabs([
     "📥 简历自动解析入库",
     "📋 简历库浏览",
     "🎯 招聘岗位录入/匹配",
-    "📧 面试邀约",
-    "💬 面试评价",
 ])
 
 # ==================== Tab 1: 简历自动解析入库 ====================
@@ -513,7 +511,7 @@ def _open_invite_dialog():
         # 去重检测：同一候选人同时只能有 1 条 pending
         already_pending = svc.has_pending_invitation(cid)
         if already_pending:
-            st.warning("⚠️ 该候选人已有进行中的邀约，请先到「面试邀约」Tab 解除或完成。")
+            st.warning("⚠️ 该候选人已有进行中的邀约，请先到「面试管理」页面取消或完成。")
 
         # 岗位下拉（可不选）
         positions = svc.list_positions(status="open")
@@ -1253,170 +1251,3 @@ with tabs[2]:
                     st.info("暂无匹配结果。在左侧岗位中点击「🎯 智能匹配」开始 AI 评估。")
 
                 session.close()
-
-# ==================== Tab 4: 面试邀约 ====================
-with tabs[3]:
-    st.markdown("### 面试邀约")
-
-    session = create_resume_session()
-    svc = ResumeArchiveService(session)
-    invitations = svc.list_invitations(status="pending")
-    completed_invs = svc.list_invitations(status="completed")
-    cancelled_invs = svc.list_invitations(status="cancelled")
-
-    # 顶部统计
-    stat_cols = st.columns(4)
-    stat_cols[0].metric("进行中邀约", len(invitations))
-    stat_cols[1].metric("已完成", len(completed_invs))
-    stat_cols[2].metric("已解除", len(cancelled_invs))
-
-    if not invitations:
-        st.info(
-            "暂无进行中的邀约。在「简历库浏览」中选中候选人，"
-            "点击「📧 面试邀约」即可发起。"
-        )
-        session.close()
-    else:
-        # 一次拉所有岗位做映射，避免循环里 N 次查询
-        positions_map = {p.position_id: p for p in svc.list_positions()}
-
-        for inv in invitations:
-            cand = svc.get_candidate(inv.candidate_id)
-            if not cand:
-                continue
-            pos = positions_map.get(inv.position_id) if inv.position_id else None
-
-            with st.container(border=True):
-                # 头部：姓名 + 拟招岗位 + 完成/解除按钮
-                head_cols = st.columns([3, 3, 1, 1])
-                title = f"### ⭐ {cand.name}" if cand.is_favorite else f"### {cand.name}"
-                head_cols[0].markdown(title)
-                if pos:
-                    head_cols[1].markdown(
-                        f"**拟招岗位**：{pos.title}"
-                        + (f"（{pos.work_city}）" if pos.work_city else "")
-                    )
-                else:
-                    head_cols[1].markdown("**拟招岗位**：（未指定）")
-
-                if head_cols[2].button(
-                    "✓ 完成",
-                    key=f"inv_done_{inv.invitation_id}",
-                    type="primary",
-                    use_container_width=True,
-                ):
-                    svc.update_invitation_status(inv.invitation_id, "completed")
-                    st.rerun()
-                if head_cols[3].button(
-                    "✗ 解除",
-                    key=f"inv_cancel_{inv.invitation_id}",
-                    use_container_width=True,
-                ):
-                    svc.update_invitation_status(inv.invitation_id, "cancelled")
-                    st.rerun()
-
-                # 主信息行：性别 · 年龄 · 学历 · 城市 · 当前/最近岗位
-                info_parts = []
-                if cand.gender:
-                    info_parts.append(cand.gender)
-                if cand.age:
-                    info_parts.append(f"{cand.age}岁")
-                if cand.education_level:
-                    info_parts.append(cand.education_level)
-                if cand.current_city:
-                    info_parts.append(cand.current_city)
-                if cand.work_experiences:
-                    last = cand.work_experiences[0]
-                    if last.position:
-                        info_parts.append(last.position)
-                if info_parts:
-                    st.markdown(" · ".join(info_parts))
-
-                # 联系方式（手机/邮箱/微信）
-                contact_lines = []
-                if cand.phone:
-                    contact_lines.append(f"📱 **手机**：{cand.phone}")
-                if cand.email:
-                    contact_lines.append(f"📧 **邮箱**：{cand.email}")
-                if cand.wechat:
-                    contact_lines.append(f"💬 **微信**：{cand.wechat}")
-                if contact_lines:
-                    st.markdown(" &nbsp;&nbsp;|&nbsp;&nbsp; ".join(contact_lines))
-                else:
-                    st.caption("⚠️ 无联系方式")
-
-                # 备注 + 发起时间
-                meta_parts = [f"发起：{inv.create_time.strftime('%Y-%m-%d %H:%M')}"]
-                if inv.notes:
-                    meta_parts.append(f"备注：{inv.notes}")
-                st.caption(" · ".join(meta_parts))
-
-        session.close()
-
-
-# ==================== Tab 5: 面试评价 ====================
-with tabs[4]:
-    st.markdown("### 面试评价")
-
-    session = create_resume_session()
-    svc = ResumeArchiveService(session)
-
-    # 填写评价
-    with st.expander("➕ 新增面试评价", expanded=False):
-        eval_cols = st.columns([1.5, 1.5, 1, 1])
-        # 候选人选择
-        all_candidates, _ = svc.list_candidates(page=1, page_size=200)
-        candidate_options = {f"{c.name} (ID:{c.candidate_id})": c.candidate_id for c in all_candidates}
-        selected_candidate = eval_cols[0].selectbox("候选人", list(candidate_options.keys()) or ["暂无候选人"], key="eval_candidate")
-        # 岗位选择
-        positions = svc.list_positions()
-        position_options = {f"{p.title} (ID:{p.position_id})": p.position_id for p in positions}
-        selected_position = eval_cols[1].selectbox("应聘岗位", ["无"] + list(position_options.keys()), key="eval_position")
-        interviewer = eval_cols[2].text_input("面试官", key="eval_interviewer")
-        interview_round = eval_cols[3].selectbox("轮次", ["初试", "复试", "终面"], key="eval_round")
-
-        eval_cols2 = st.columns([1, 2, 2])
-        score = eval_cols2[0].slider("评分", 1, 10, 5, key="eval_score")
-        strengths = eval_cols2[1].text_area("优势", key="eval_strengths", height=80)
-        weaknesses = eval_cols2[2].text_area("不足", key="eval_weaknesses", height=80)
-
-        eval_cols3 = st.columns([1, 2])
-        conclusion = eval_cols3[0].selectbox("结论", ["通过", "待定", "淘汰"], key="eval_conclusion")
-        notes = eval_cols3[1].text_input("备注", key="eval_notes")
-
-        if st.button("💾 保存评价", type="primary"):
-            if candidate_options and selected_candidate in candidate_options:
-                cid = candidate_options[selected_candidate]
-                pid = position_options.get(selected_position) if selected_position != "无" else None
-                svc.create_interview_eval(
-                    candidate_id=cid,
-                    position_id=pid,
-                    interviewer=interviewer,
-                    interview_round=interview_round,
-                    score=score,
-                    strengths=strengths,
-                    weaknesses=weaknesses,
-                    conclusion=conclusion,
-                    notes=notes,
-                    interview_time=datetime.now(),
-                )
-                st.success("评价已保存")
-                st.rerun()
-            else:
-                st.warning("请先选择候选人")
-
-    # 历史评价列表
-    st.markdown("**历史面试评价**")
-    evals = svc.list_interview_evals()
-    if evals:
-        for ev in evals[:50]:
-            candidate = svc.get_candidate(ev.candidate_id)
-            c_name = candidate.name if candidate else f"ID:{ev.candidate_id}"
-            st.markdown(
-                f"- **{c_name}** | 面试官：{ev.interviewer or '未填'} | "
-                f"轮次：{ev.interview_round or ''} | 评分：{ev.score or '-'}/10 | "
-                f"结论：**{ev.conclusion or '未填'}** | {ev.strengths or ''}"
-            )
-    else:
-        st.info("暂无面试评价记录。")
-    session.close()

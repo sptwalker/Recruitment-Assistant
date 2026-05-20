@@ -1,0 +1,47 @@
+/*
+theme-id: luxury_business
+theme-name: 轻奢商务风格
+theme-description: 深蓝金色点缀，适合商务后台和招聘管理场景。
+*/
+:root {
+  --color-primary: #1f4ed8;
+  --color-primary-hover: #193fb0;
+  --color-primary-active: #17358e;
+  --color-primary-soft: #edf3ff;
+  --color-secondary: #0f766e;
+  --color-accent: #c49a3a;
+  --color-success: #16a34a;
+  --color-success-soft: #eaf8ef;
+  --color-warning: #d97706;
+  --color-warning-soft: #fff7e6;
+  --color-danger: #dc2626;
+  --color-danger-soft: #fff1f2;
+  --color-info: #2563eb;
+  --color-bg: #f4f6fb;
+  --color-bg-soft: #f8fafc;
+  --color-surface: #ffffff;
+  --color-surface-muted: #f7f9fd;
+  --color-border: #dde5f2;
+  --color-border-strong: #b9c6da;
+  --color-text: #172033;
+  --color-text-secondary: #475569;
+  --color-text-muted: #6b7280;
+  --color-hover: #eef4ff;
+  --color-active: #dce9ff;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-xl: 22px;
+  --shadow-sm: 0 8px 22px rgba(31, 78, 216, 0.08);
+  --shadow-md: 0 16px 38px rgba(15, 23, 42, 0.1);
+  --focus-ring: 0 0 0 3px rgba(31, 78, 216, 0.16);
+  --primary: var(--color-primary);
+  --bg: var(--color-bg);
+  --white: var(--color-surface);
+  --success: var(--color-success-soft);
+  --accent: var(--color-accent);
+  --text: var(--color-text);
+  --muted: var(--color-text-muted);
+  --line: var(--color-border);
+  --danger: var(--color-danger);
+  --warn: var(--color-warning);
+}

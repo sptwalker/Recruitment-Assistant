@@ -113,7 +113,7 @@ with col3:
 if st.session_state.show_new_task_dialog:
     new_task_dialog()
 
-st.write("")
+st.markdown("<br>", unsafe_allow_html=True)
 s1, s2, s3 = st.columns(3)
 for col, icon, label, value, trend in [
     (s1, "◌", "今日采集", "126", "+18% 较昨日"),

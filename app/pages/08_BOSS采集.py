@@ -355,7 +355,7 @@ with st.container(border=True):
     top_cols[3].metric("当前去重记录数", current_dedup_total)
 
     btn_cols = st.columns([1, 1, 1, 1, 1.4, 4])
-    if btn_cols[0].button("开始采集", disabled=is_running or not ws_connected, type="primary"):
+    if btn_cols[0].button("开始采集", disabled=is_running or not ws_connected, type="primary", use_container_width=True):
         if collect_mode == "按时间采集":
             effective_max = 0
         else:
@@ -367,13 +367,13 @@ with st.container(border=True):
             "request_resume_if_missing": request_resume_if_missing,
         })
         st.rerun()
-    if btn_cols[1].button("暂停", disabled=not is_running or is_paused):
+    if btn_cols[1].button("暂  停", disabled=not is_running or is_paused, use_container_width=True):
         bridge.pause_collect()
         st.rerun()
-    if btn_cols[2].button("继续", disabled=not is_paused):
+    if btn_cols[2].button("继  续", disabled=not is_paused, use_container_width=True):
         bridge.resume_collect()
         st.rerun()
-    if btn_cols[3].button("停止", disabled=not is_running):
+    if btn_cols[3].button("停  止", disabled=not is_running, use_container_width=True):
         bridge.stop_collect()
         st.rerun()
     if btn_cols[4].button("打开简历目录", use_container_width=True):

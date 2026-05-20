@@ -1,11 +1,14 @@
+import json
+from pathlib import Path
+
 import streamlit as st
 
-PRIMARY = "#4A90E2"
-BG = "#F5F7FA"
-WHITE = "#FFFFFF"
-SUCCESS_BG = "#E6F4EA"
-ACCENT = "#FF9F43"
-APP_VERSION = "V2.16"
+APP_VERSION = "V2.30"
+STYLE_DIR = Path("app/styles")
+STYLE_FILES = ("theme.css", "global.css", "components.css")
+THEME_DIR = STYLE_DIR / "themes"
+THEME_CONFIG_PATH = Path("data/theme_config.json")
+DEFAULT_THEME_ID = "luxury_business"
 
 MENU_ITEMS = [
     ("首页", "⌂", "/"),
@@ -13,91 +16,107 @@ MENU_ITEMS = [
     ("BOSS直聘采集", "◇", "/BOSS采集"),
     ("51前程无忧采集", "◈", "/51前程无忧采集"),
     ("简历管理", "◫", "/简历管理"),
+    ("面试管理", "▣", "/面试管理"),
     ("系统设置", "⚙", "/平台登录"),
 ]
 
+TOPBAR_LINKS = [
+    ("⌁ 智联招聘采集", "/智联采集"),
+    ("◇ BOSS直聘采集", "/BOSS采集"),
+    ("◈ 51前程无忧采集", "/51前程无忧采集"),
+    ("☷ 简历管理", "/简历管理"),
+    ("▣ 面试管理", "/面试管理"),
+    ("⚙ 系统设置", "/平台登录"),
+]
 
-def inject_vibe_style(active: str = "首页") -> None:
+THEME_CSS_HOOK = """
+/* UI_THEME_EXTENSION_HOOK: 后续主题 CSS 统一接入入口，请在此处覆盖 :root 变量或扩展 .vibe-* 样式。 */
+"""
+
+
+def _read_css_file(file_name: str) -> str:
+    try:
+        return (STYLE_DIR / file_name).read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+def _parse_theme_meta(css_path: Path) -> dict[str, str]:
+    meta = {"id": css_path.stem, "name": css_path.stem, "description": ""}
+    try:
+        for line in css_path.read_text(encoding="utf-8").splitlines()[:12]:
+            clean_line = line.strip().strip("/*").strip("*/").strip()
+            if clean_line.startswith("theme-id:"):
+                meta["id"] = clean_line.split(":", 1)[1].strip() or css_path.stem
+            elif clean_line.startswith("theme-name:"):
+                meta["name"] = clean_line.split(":", 1)[1].strip() or css_path.stem
+            elif clean_line.startswith("theme-description:"):
+                meta["description"] = clean_line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return meta
+
+
+def list_theme_options() -> list[dict[str, str]]:
+    if not THEME_DIR.exists():
+        return []
+    themes = [_parse_theme_meta(path) for path in sorted(THEME_DIR.glob("*.css"))]
+    return sorted(themes, key=lambda item: (item["id"] != DEFAULT_THEME_ID, item["name"]))
+
+
+def get_current_theme_id() -> str:
+    if not THEME_CONFIG_PATH.exists():
+        return DEFAULT_THEME_ID
+    try:
+        theme_id = json.loads(THEME_CONFIG_PATH.read_text(encoding="utf-8")).get("theme_id", DEFAULT_THEME_ID)
+    except (OSError, json.JSONDecodeError, TypeError):
+        return DEFAULT_THEME_ID
+    theme_ids = {theme["id"] for theme in list_theme_options()}
+    return theme_id if theme_id in theme_ids else DEFAULT_THEME_ID
+
+
+def save_current_theme(theme_id: str) -> None:
+    theme_ids = {theme["id"] for theme in list_theme_options()}
+    if theme_id not in theme_ids:
+        raise ValueError(f"未知主题：{theme_id}")
+    THEME_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    THEME_CONFIG_PATH.write_text(json.dumps({"theme_id": theme_id}, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def get_theme_css(theme_id: str | None = None) -> str:
+    current_theme_id = theme_id or get_current_theme_id()
+    try:
+        return (THEME_DIR / f"{current_theme_id}.css").read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+def _style_block() -> str:
+    base_css = "\n".join(_read_css_file(file_name) for file_name in STYLE_FILES)
+    theme_css = get_theme_css()
+    return f"<style>\n{base_css}\n{theme_css}\n{THEME_CSS_HOOK}\n</style>"
+
+
+def _topbar_html() -> str:
+    links = "".join(f'<a href="{href}" target="_self">{label}</a>' for label, href in TOPBAR_LINKS)
+    return f"""
+<div class="vibe-topbar">
+  <div class="vibe-brand"><div class="vibe-logo">⌁</div><span>简历智采助手 {APP_VERSION}</span></div>
+  <div class="vibe-actions">{links}<div class="vibe-avatar">HR</div></div>
+</div>
+"""
+
+
+def _sidebar_html(active: str) -> str:
     menu_html = "".join(
         f'<a class="vibe-side-item {"active" if label == active else ""}" href="{href}" target="_self"><span>{icon}</span><b>{label}</b></a>'
         for label, icon, href in MENU_ITEMS
     )
-    st.markdown(
-        f"""
-<style>
-:root {{
-  --primary:{PRIMARY}; --bg:{BG}; --white:{WHITE}; --success:{SUCCESS_BG}; --accent:{ACCENT};
-  --text:#1F2937; --muted:#6B7280; --line:#E5EAF2; --danger:#E85D75; --warn:#FF9F43;
-}}
-* {{ font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }}
-html, body, [data-testid="stAppViewContainer"] {{ background: var(--bg); color: var(--text); }}
-[data-testid="stHeader"] {{ height: 0; background: transparent; }}
-[data-testid="stSidebar"],
-[data-testid="stSidebarNav"],
-[data-testid="collapsedControl"],
-button[kind="header"],
-a[href="/首页看板"],
-a[href="/候选人管理"],
-a[href="/岗位管理"],
-a[href="/导出中心"] {{ display:none !important; }}
-section[data-testid="stSidebar"] {{ width:0 !important; min-width:0 !important; }}
-[data-testid="stAppViewContainer"] {{ margin-left:0 !important; }}
-.block-container {{ max-width: 1680px; padding: 84px 28px 48px 248px !important; }}
-.vibe-topbar {{ position:fixed; top:0; left:0; right:0; z-index:9999; height:60px; background:rgba(255,255,255,.96); backdrop-filter:blur(16px); box-shadow:0 8px 24px rgba(31,41,55,.06); display:flex; align-items:center; justify-content:space-between; padding:0 28px; }}
-.vibe-brand {{ display:flex; align-items:center; gap:12px; font-size:18px; font-weight:800; letter-spacing:.2px; }}
-.vibe-logo {{ width:34px; height:34px; border-radius:12px; background:linear-gradient(135deg,var(--primary),#8FC4FF); display:grid; place-items:center; color:white; box-shadow:0 10px 20px rgba(74,144,226,.22); }}
-.vibe-actions {{ display:flex; align-items:center; gap:20px; color:var(--muted); font-size:14px; }}
-.vibe-actions a {{ color:var(--muted) !important; text-decoration:none !important; cursor:pointer; transition:.22s ease; }} .vibe-actions a:hover {{ color:var(--primary) !important; transform:translateY(-1px); }}
-.vibe-avatar {{ width:34px; height:34px; border-radius:50%; background:var(--success); color:var(--primary); display:grid; place-items:center; font-weight:800; cursor:pointer; }}
-.vibe-sidebar {{ position:fixed; top:60px; left:0; bottom:0; z-index:9998; width:220px; background:#F2F5F8; border-right:1px solid var(--line); padding:18px 10px; display:flex; flex-direction:column; transition:.24s ease; }}
-.vibe-side-item {{ height:44px; border-radius:14px; display:flex; align-items:center; gap:12px; padding:0 14px; margin:4px 0; color:#5D6B7A !important; font-size:14px; cursor:pointer; border-left:3px solid transparent; transition:.2s ease; text-decoration:none !important; }}
-.vibe-side-item span {{ width:20px; text-align:center; color:var(--primary); font-weight:600; }}
-.vibe-side-item:hover {{ background:#EAF3FF; color:var(--primary); transform:translateX(2px); }}
-.vibe-side-item.active {{ background:var(--success); color:var(--primary); border-left-color:var(--primary); font-weight:700; }}
-.vibe-version {{ margin-top:auto; padding:12px 14px; color:#94A3B8; font-size:12px; }}
-.vibe-page-title {{ display:flex; align-items:flex-end; justify-content:space-between; gap:16px; margin-bottom:18px; }}
-.vibe-page-title h1 {{ margin:0; font-size:28px; line-height:1.2; letter-spacing:-.4px; }}
-.vibe-page-title p {{ margin:6px 0 0; color:var(--muted); font-size:14px; }}
-.vibe-card {{ background:var(--white); border:1px solid rgba(229,234,242,.9); border-radius:22px; padding:22px; box-shadow:0 12px 32px rgba(31,41,55,.05); transition:.24s ease; }}
-.vibe-card:hover {{ transform:translateY(-3px); box-shadow:0 18px 40px rgba(31,41,55,.08); }}
-.vibe-soft-card {{ background:#F7F9FC; border-radius:18px; padding:18px; border:1px solid var(--line); }}
-.vibe-icon {{ width:42px; height:42px; border-radius:15px; background:#EAF3FF; color:var(--primary); display:grid; place-items:center; font-size:22px; margin-bottom:14px; }}
-.vibe-stat {{ font-size:30px; font-weight:800; color:#172033; margin:6px 0; }}
-.vibe-muted {{ color:var(--muted); font-size:13px; }}
-.vibe-btn-row {{ display:flex; gap:10px; flex-wrap:wrap; margin-top:16px; }}
-.vibe-primary-btn,.vibe-outline-btn,.vibe-accent-btn {{ border-radius:12px; padding:9px 14px; font-size:13px; font-weight:700; display:inline-flex; align-items:center; gap:8px; transition:.18s ease; text-decoration:none; }}
-.vibe-primary-btn {{ background:var(--primary); color:white !important; }} .vibe-outline-btn {{ border:1px solid var(--primary); color:var(--primary) !important; background:white; }} .vibe-accent-btn {{ background:var(--accent); color:white !important; }}
-.vibe-primary-btn:hover,.vibe-outline-btn:hover,.vibe-accent-btn:hover {{ filter:brightness(.96); transform:translateY(-1px); }}
-.vibe-pill {{ display:inline-flex; align-items:center; border-radius:999px; padding:5px 10px; font-size:12px; font-weight:700; background:#EAF3FF; color:var(--primary); margin:3px; }}
-.vibe-pill.ok {{ background:var(--success); color:#168A45; }} .vibe-pill.warn {{ background:#FFF4E6; color:#C96E08; }} .vibe-pill.err {{ background:#FFECEF; color:#C73552; }}
-.vibe-candidate {{ display:flex; align-items:center; gap:16px; background:white; border:1px solid var(--line); border-radius:20px; padding:16px 18px; margin:12px 0; box-shadow:0 10px 26px rgba(31,41,55,.04); transition:.2s ease; }}
-.vibe-candidate:hover {{ transform:translateY(-2px); border-color:#C8DDF7; }}
-.vibe-candidate-avatar {{ width:48px; height:48px; border-radius:50%; background:#EAF3FF; color:var(--primary); display:grid; place-items:center; font-weight:800; flex:0 0 auto; }}
-.vibe-candidate-main {{ flex:1; }} .vibe-candidate-main strong {{ font-size:16px; }} .vibe-candidate-main p {{ margin:4px 0 0; color:var(--muted); font-size:13px; }}
-.vibe-actions-icons {{ color:var(--muted); display:flex; gap:12px; font-size:18px; }}
-.vibe-detail-grid {{ display:grid; grid-template-columns:280px 1fr; gap:18px; }}
-.vibe-module {{ border-left:4px solid var(--primary); background:white; border-radius:16px; padding:16px; margin-bottom:12px; box-shadow:0 8px 22px rgba(31,41,55,.04); }}
-.vibe-progress {{ height:8px; border-radius:99px; background:#E9EEF5; overflow:hidden; }} .vibe-progress i {{ display:block; height:100%; background:linear-gradient(90deg,var(--primary),#87BFFF); border-radius:99px; }}
-.vibe-card-button-row [data-testid="column"] {{ width:auto !important; flex:0 0 auto !important; min-width:0 !important; }}
-.vibe-card-button-row div.stButton > button {{ width:auto !important; min-height:34px !important; padding:7px 13px !important; font-size:13px !important; }}
-div.stButton > button, div.stDownloadButton > button, [data-testid="stFormSubmitButton"] button {{ border-radius:12px !important; border:1px solid var(--primary) !important; background:var(--primary) !important; color:white !important; font-weight:700 !important; transition:.16s ease !important; }}
-div.stButton > button:hover, div.stDownloadButton > button:hover, [data-testid="stFormSubmitButton"] button:hover {{ filter:brightness(.95); transform:translateY(-1px); }}
-div.stButton > button:active, div.stDownloadButton > button:active {{ transform:scale(.98); }}
-div.stButton > button:disabled {{ background:#D1D5DB !important; border-color:#D1D5DB !important; color:white !important; }}
-[data-baseweb="input"]:focus-within, [data-baseweb="select"]:focus-within, textarea:focus {{ border-color:var(--primary) !important; box-shadow:0 0 0 3px rgba(74,144,226,.12) !important; }}
-[data-testid="stDataFrame"] {{ border-radius:18px; overflow:hidden; border:1px solid var(--line); box-shadow:0 8px 24px rgba(31,41,55,.04); }}
-.stTabs [data-baseweb="tab-list"] {{ gap:8px; }} .stTabs [data-baseweb="tab"] {{ border-radius:12px; padding:8px 16px; }}
-@media (max-width:1200px) {{ .vibe-sidebar {{ width:60px; }} .vibe-side-item {{ justify-content:center; padding:0; }} .vibe-side-item b,.vibe-version {{ display:none; }} .block-container {{ padding-left:84px !important; padding-right:18px !important; }} .vibe-actions span {{ display:none; }} .vibe-detail-grid {{ grid-template-columns:1fr; }} }}
-@media (max-width:760px) {{ .block-container {{ padding-top:76px !important; padding-left:78px !important; }} .vibe-page-title {{ display:block; }} .vibe-topbar {{ padding:0 14px; }} .vibe-card {{ padding:16px; border-radius:18px; }} }}
-</style>
-<div class="vibe-topbar">
-  <div class="vibe-brand"><div class="vibe-logo">⌁</div><span>简历智采助手 {APP_VERSION}</span></div>
-  <div class="vibe-actions"><a href="/智联采集" target="_self">⌁ 智联招聘采集</a><a href="/BOSS采集" target="_self">◇ BOSS直聘采集</a><a href="/51前程无忧采集" target="_self">◈ 51前程无忧采集</a><a href="/简历管理" target="_self">☷ 简历管理</a><a href="/平台登录" target="_self">⚙ 系统设置</a><div class="vibe-avatar">HR</div></div>
-</div>
-<aside class="vibe-sidebar">{menu_html}<div class="vibe-version">Resume AI Collector<br/>{APP_VERSION}</div></aside>
-""",
-        unsafe_allow_html=True,
-    )
+    return f'<aside class="vibe-sidebar">{menu_html}<div class="vibe-version">Resume AI Collector<br/>{APP_VERSION}</div></aside>'
+
+
+def inject_vibe_style(active: str = "首页") -> None:
+    st.markdown(_style_block() + _topbar_html() + _sidebar_html(active), unsafe_allow_html=True)
 
 
 def page_header(title: str, subtitle: str = "", action: str | None = None) -> None:
@@ -115,3 +134,4 @@ def toast(message: str, kind: str = "success") -> None:
         st.warning(message)
     else:
         st.success(message)
+

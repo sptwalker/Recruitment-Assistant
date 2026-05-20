@@ -1,0 +1,38 @@
+/*
+theme-id: candy_fine
+theme-name: 精致糖果风
+theme-description: 柔粉、莓紫与薄荷色，轻快精致。
+*/
+:root {
+  --color-primary: #ec4899;
+  --color-primary-hover: #db2777;
+  --color-primary-active: #be185d;
+  --color-primary-soft: #fce7f3;
+  --color-secondary: #8b5cf6;
+  --color-accent: #2dd4bf;
+  --color-success: #22c55e;
+  --color-success-soft: #ecfdf5;
+  --color-warning: #f59e0b;
+  --color-warning-soft: #fff7ed;
+  --color-danger: #f43f5e;
+  --color-danger-soft: #fff1f2;
+  --color-info: #a855f7;
+  --color-bg: #fff1f7;
+  --color-bg-soft: #fff8fb;
+  --color-surface: #ffffff;
+  --color-surface-muted: #fdf2f8;
+  --color-border: #fbcfe8;
+  --color-border-strong: #f9a8d4;
+  --color-text: #3b2032;
+  --color-text-secondary: #68435a;
+  --color-text-muted: #9d6687;
+  --color-hover: #fce7f3;
+  --color-active: #fbcfe8;
+  --radius-md: 16px;
+  --radius-lg: 22px;
+  --radius-xl: 30px;
+  --shadow-sm: 0 8px 24px rgba(236, 72, 153, 0.08);
+  --shadow-md: 0 18px 46px rgba(236, 72, 153, 0.13);
+  --focus-ring: 0 0 0 3px rgba(236, 72, 153, 0.18);
+  --primary: var(--color-primary); --bg: var(--color-bg); --white: var(--color-surface); --success: var(--color-success-soft); --accent: var(--color-accent); --text: var(--color-text); --muted: var(--color-text-muted); --line: var(--color-border); --danger: var(--color-danger); --warn: var(--color-warning);
+}

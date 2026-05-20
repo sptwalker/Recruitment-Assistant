@@ -1,0 +1,38 @@
+/*
+theme-id: simple_plain
+theme-name: 简洁素雅风
+theme-description: 黑白灰低干扰风格，强调清晰内容与效率。
+*/
+:root {
+  --color-primary: #111827;
+  --color-primary-hover: #374151;
+  --color-primary-active: #030712;
+  --color-primary-soft: #f3f4f6;
+  --color-secondary: #4b5563;
+  --color-accent: #6b7280;
+  --color-success: #15803d;
+  --color-success-soft: #f0fdf4;
+  --color-warning: #a16207;
+  --color-warning-soft: #fefce8;
+  --color-danger: #b91c1c;
+  --color-danger-soft: #fef2f2;
+  --color-info: #374151;
+  --color-bg: #f7f7f7;
+  --color-bg-soft: #fbfbfb;
+  --color-surface: #ffffff;
+  --color-surface-muted: #f5f5f5;
+  --color-border: #e5e7eb;
+  --color-border-strong: #d1d5db;
+  --color-text: #111827;
+  --color-text-secondary: #4b5563;
+  --color-text-muted: #6b7280;
+  --color-hover: #f3f4f6;
+  --color-active: #e5e7eb;
+  --radius-md: 9px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+  --shadow-sm: 0 4px 14px rgba(17, 24, 39, 0.04);
+  --shadow-md: 0 10px 28px rgba(17, 24, 39, 0.07);
+  --focus-ring: 0 0 0 3px rgba(17, 24, 39, 0.12);
+  --primary: var(--color-primary); --bg: var(--color-bg); --white: var(--color-surface); --success: var(--color-success-soft); --accent: var(--color-accent); --text: var(--color-text); --muted: var(--color-text-muted); --line: var(--color-border); --danger: var(--color-danger); --warn: var(--color-warning);
+}

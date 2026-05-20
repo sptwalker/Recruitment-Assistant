@@ -20,9 +20,9 @@ from recruitment_assistant.utils.hash_utils import text_hash
 from recruitment_assistant.utils.snapshot_utils import safe_filename
 
 
-BOSS_BRIDGE_VERSION = "1.89.0"
-BOSS_EXTENSION_EXPECTED_VERSION = "1.82.0"
-BOSS_CONTENT_SCRIPT_EXPECTED_VERSION = "1.82.0"
+BOSS_BRIDGE_VERSION = "1.93.0"
+BOSS_EXTENSION_EXPECTED_VERSION = "1.86.0"
+BOSS_CONTENT_SCRIPT_EXPECTED_VERSION = "1.86.0"
 
 
 class BossWSBridge:

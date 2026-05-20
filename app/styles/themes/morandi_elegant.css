@@ -1,0 +1,38 @@
+/*
+theme-id: morandi_elegant
+theme-name: 莫兰迪高雅风
+theme-description: 低饱和灰粉、灰蓝与雾紫，柔和高级。
+*/
+:root {
+  --color-primary: #7d8fa3;
+  --color-primary-hover: #66788d;
+  --color-primary-active: #536276;
+  --color-primary-soft: #eef1f5;
+  --color-secondary: #a98f8d;
+  --color-accent: #b8a77f;
+  --color-success: #7c9b7a;
+  --color-success-soft: #eef5ee;
+  --color-warning: #b79a63;
+  --color-warning-soft: #faf5ea;
+  --color-danger: #b06f72;
+  --color-danger-soft: #fbefef;
+  --color-info: #7d8fa3;
+  --color-bg: #f5f2ef;
+  --color-bg-soft: #faf8f6;
+  --color-surface: #fffdfb;
+  --color-surface-muted: #f1eeeb;
+  --color-border: #ded8d2;
+  --color-border-strong: #c9c0b7;
+  --color-text: #3c3b3a;
+  --color-text-secondary: #68615e;
+  --color-text-muted: #8a817c;
+  --color-hover: #f0ece8;
+  --color-active: #e8e1da;
+  --radius-md: 13px;
+  --radius-lg: 18px;
+  --radius-xl: 24px;
+  --shadow-sm: 0 8px 22px rgba(60, 59, 58, 0.06);
+  --shadow-md: 0 18px 42px rgba(60, 59, 58, 0.09);
+  --focus-ring: 0 0 0 3px rgba(125, 143, 163, 0.18);
+  --primary: var(--color-primary); --bg: var(--color-bg); --white: var(--color-surface); --success: var(--color-success-soft); --accent: var(--color-accent); --text: var(--color-text); --muted: var(--color-text-muted); --line: var(--color-border); --danger: var(--color-danger); --warn: var(--color-warning);
+}

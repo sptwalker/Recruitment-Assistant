@@ -41,7 +41,6 @@ st.markdown(
 .plain-section-title h3 { margin:0; font-size:18px; line-height:1.3; color:#1F2937; }
 .collect-panel-stat { color:#4A90E2; font-size:14px; font-weight:700; white-space:nowrap; }
 .collect-info-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; }
-.collect-info-item { background:#F7F9FC; border:1px solid #E5EAF2; border-radius:14px; padding:12px 14px; }
 .collect-info-label { color:#6B7280; font-size:13px; line-height:1.4; margin-bottom:5px; }
 .collect-info-value { color:#1F2937; font-size:14px; line-height:1.4; font-weight:700; word-break:break-all; }
 .collect-log-box { height:240px; overflow-y:auto; background:#FFFFFF; color:#1F2937; border:1px solid #E5EAF2; border-radius:16px; padding:14px; font-family:Consolas, Monaco, monospace; font-size:13px; line-height:1.55; white-space:pre-wrap; }

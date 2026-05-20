@@ -1,18 +1,28 @@
 import time
 
 import streamlit as st
+import streamlit.components.v1 as components
 
-from components.layout import inject_vibe_style, page_header
+from components.layout import (
+    get_current_theme_id,
+    get_theme_css,
+    inject_vibe_style,
+    list_theme_options,
+    page_header,
+    save_current_theme,
+)
 from recruitment_assistant.platforms.zhilian.adapter import ZhilianAdapter
 from recruitment_assistant.schemas.raw_resume import RawResumeCreate
 from recruitment_assistant.services.raw_resume_service import RawResumeService
 from recruitment_assistant.storage.db import create_session
 
+
 st.set_page_config(page_title="系统设置", layout="wide", initial_sidebar_state="collapsed")
 inject_vibe_style("系统设置")
 page_header("系统设置", "管理账号登录态、采集策略、风控参数与通知方式。")
 
-tabs = st.tabs(["账号", "采集", "风控", "通知", "AI模型"])
+tabs = st.tabs(["账号", "采集", "风控", "通知", "AI模型", "主题风格"])
+
 
 with tabs[0]:
     st.markdown('<div class="vibe-card"><h3>账号设置</h3>', unsafe_allow_html=True)
@@ -139,5 +149,86 @@ with tabs[4]:
         st.success("AI 配置已保存到 .env 文件。重启 Streamlit 后生效。")
     st.markdown('</div>', unsafe_allow_html=True)
 
-if st.button("统一保存设置", type="primary"):
-    st.success("设置已保存。")
+with tabs[5]:
+    st.markdown('<div class="vibe-card"><h3>主题风格</h3>', unsafe_allow_html=True)
+    themes = list_theme_options()
+    if not themes:
+        st.warning("未检测到主题样式文件，请检查 app/styles/themes 目录。")
+    else:
+        current_theme_id = get_current_theme_id()
+        theme_ids = [theme["id"] for theme in themes]
+        theme_names = {theme["id"]: theme["name"] for theme in themes}
+        theme_descriptions = {theme["id"]: theme.get("description", "") for theme in themes}
+        select_col, action_col, save_col, spacer_col = st.columns([0.28, 0.16, 0.16, 0.40])
+        selected_theme_id = select_col.selectbox(
+            "预设主题风格",
+            theme_ids,
+            index=theme_ids.index(current_theme_id) if current_theme_id in theme_ids else 0,
+            format_func=lambda theme_id: theme_names.get(theme_id, theme_id),
+            key="theme_style_select",
+        )
+        action_col.markdown("<div style='height: 28px'></div>", unsafe_allow_html=True)
+        save_col.markdown("<div style='height: 28px'></div>", unsafe_allow_html=True)
+        if action_col.button("应用主题", type="primary", key="apply_theme_style"):
+            save_current_theme(selected_theme_id)
+            st.success(f"已应用主题：{theme_names.get(selected_theme_id, selected_theme_id)}")
+            st.rerun()
+        if save_col.button("统一保存设置", key="save_all_settings_theme_tab"):
+            st.success("设置已保存。")
+        st.caption(theme_descriptions.get(selected_theme_id) or "选择主题后可在下方快速预览标题、正文、按钮、输入框、Banner、下拉框与进度条。")
+        preview_css = get_theme_css(selected_theme_id)
+        components.html(
+            f"""
+<style>
+{preview_css}
+body {{ margin: 0; font-family: var(--font-family-base, sans-serif); background: transparent; color: var(--color-text); }}
+.theme-preview {{ background: var(--color-bg); border: 1px solid var(--color-border); border-radius: var(--radius-xl); padding: 22px; box-shadow: var(--shadow-md); }}
+.theme-preview-banner {{ padding: 24px; border-radius: var(--radius-lg); background: linear-gradient(135deg, var(--color-primary), var(--color-secondary)); color: #fff; margin-bottom: 18px; }}
+.theme-preview-banner h2 {{ margin: 0 0 8px; font-size: 24px; }}
+.theme-preview-banner p {{ margin: 0; opacity: .9; }}
+.theme-preview-grid {{ display: grid; grid-template-columns: 1.2fr .8fr; gap: 16px; }}
+.theme-preview-card {{ background: var(--color-surface); border: 1px solid var(--color-border); border-radius: var(--radius-lg); padding: 18px; box-shadow: var(--shadow-sm); }}
+.theme-preview-title {{ margin: 0 0 8px; font-size: 20px; color: var(--color-text); }}
+.theme-preview-text {{ margin: 0 0 16px; line-height: 1.7; color: var(--color-text-secondary); }}
+.theme-preview-actions {{ display: flex; gap: 10px; flex-wrap: wrap; margin: 12px 0 18px; }}
+.theme-preview-btn {{ border: 0; border-radius: var(--radius-md); padding: 10px 16px; background: var(--color-primary); color: #fff; font-weight: 700; box-shadow: var(--shadow-xs); }}
+.theme-preview-btn.secondary {{ background: var(--color-primary-soft); color: var(--color-primary); border: 1px solid var(--color-border); }}
+.theme-preview-input, .theme-preview-select {{ width: 100%; box-sizing: border-box; border: 1px solid var(--color-border); border-radius: var(--radius-md); padding: 11px 12px; margin-bottom: 12px; background: var(--color-surface); color: var(--color-text); outline: none; }}
+.theme-preview-progress {{ height: 12px; background: var(--color-primary-soft); border-radius: 999px; overflow: hidden; margin-top: 8px; }}
+.theme-preview-progress span {{ display: block; width: 68%; height: 100%; background: linear-gradient(90deg, var(--color-primary), var(--color-accent)); }}
+.theme-preview-tags {{ display: flex; gap: 8px; flex-wrap: wrap; }}
+.theme-preview-tag {{ padding: 7px 10px; border-radius: 999px; background: var(--color-primary-soft); color: var(--color-primary); font-size: 12px; font-weight: 700; }}
+@media (max-width: 720px) {{ .theme-preview-grid {{ grid-template-columns: 1fr; }} }}
+</style>
+<div class="theme-preview">
+  <div class="theme-preview-banner">
+    <h2>{theme_names.get(selected_theme_id, selected_theme_id)}</h2>
+    <p>{theme_descriptions.get(selected_theme_id, "主题预览")}</p>
+  </div>
+  <div class="theme-preview-grid">
+    <div class="theme-preview-card">
+      <h3 class="theme-preview-title">招聘数据工作台</h3>
+      <p class="theme-preview-text">统一管理候选人采集、简历解析、面试跟进与数据导出，快速感受当前主题在真实业务元素中的展示效果。</p>
+      <div class="theme-preview-actions">
+        <button class="theme-preview-btn">主按钮</button>
+        <button class="theme-preview-btn secondary">次按钮</button>
+      </div>
+      <input class="theme-preview-input" value="候选人搜索输入框" />
+      <select class="theme-preview-select"><option>下拉选择：全部岗位</option></select>
+    </div>
+    <div class="theme-preview-card">
+      <h3 class="theme-preview-title">任务进度</h3>
+      <p class="theme-preview-text">当前采集任务完成度 68%</p>
+      <div class="theme-preview-progress"><span></span></div>
+      <div style="height:14px"></div>
+      <div class="theme-preview-tags"><span class="theme-preview-tag">成功</span><span class="theme-preview-tag">待处理</span><span class="theme-preview-tag">高优先级</span></div>
+    </div>
+  </div>
+</div>
+""",
+            height=430,
+        )
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
+

@@ -1,0 +1,38 @@
+/*
+theme-id: heavy_metal
+theme-name: 厚重金属风
+theme-description: 石墨黑、金属灰与铜色强调，硬朗沉稳。
+*/
+:root {
+  --color-primary: #6b7280;
+  --color-primary-hover: #9ca3af;
+  --color-primary-active: #4b5563;
+  --color-primary-soft: #252932;
+  --color-secondary: #a3a3a3;
+  --color-accent: #b87333;
+  --color-success: #4ade80;
+  --color-success-soft: #17261b;
+  --color-warning: #f59e0b;
+  --color-warning-soft: #33250b;
+  --color-danger: #f87171;
+  --color-danger-soft: #341719;
+  --color-info: #94a3b8;
+  --color-bg: #111318;
+  --color-bg-soft: #171a21;
+  --color-surface: #1f232c;
+  --color-surface-muted: #262b35;
+  --color-border: #3a404d;
+  --color-border-strong: #5b6473;
+  --color-text: #f3f4f6;
+  --color-text-secondary: #d1d5db;
+  --color-text-muted: #9ca3af;
+  --color-hover: #2a303b;
+  --color-active: #343b49;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-xl: 18px;
+  --shadow-sm: 0 10px 24px rgba(0, 0, 0, 0.28);
+  --shadow-md: 0 20px 48px rgba(0, 0, 0, 0.38);
+  --focus-ring: 0 0 0 3px rgba(184, 115, 51, 0.22);
+  --primary: var(--color-primary); --bg: var(--color-bg); --white: var(--color-surface); --success: var(--color-success-soft); --accent: var(--color-accent); --text: var(--color-text); --muted: var(--color-text-muted); --line: var(--color-border); --danger: var(--color-danger); --warn: var(--color-warning);
+}

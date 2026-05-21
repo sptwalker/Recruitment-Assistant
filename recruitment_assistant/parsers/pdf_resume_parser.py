@@ -6,6 +6,17 @@ from pathlib import Path
 from docx import Document
 from pypdf import PdfReader
 
+try:
+    import pymupdf as _pymupdf
+except ImportError:  # pragma: no cover - 仅在未装 pymupdf 时回落
+    _pymupdf = None
+
+# 嵌入子集字体常把数字 / 拉丁字符映射到 U+7700-U+77FF 私有区，
+# pymupdf 不会输出 U+FFFD 但仍是错字 — 这两种乱码都要识别。
+_GARBLE_CJK_RANGE = (0x7700, 0x77FF)
+# 任一字段同时满足"含 @/手机起始 1"且"附近 ≥ 3 个 CJK 私用区字符"就当乱码处理
+_GARBLE_THRESHOLD_RATIO = 0.30
+
 PHONE_RE = re.compile(r"(?<!\d)(?:1[3-9]\d{9})(?!\d)")
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 DEGREES = ["博士", "硕士", "研究生", "本科", "大专", "专科", "高中", "中专"]
@@ -47,6 +58,7 @@ class ParsedResume:
     current_position: str | None = None
     expected_position: str | None = None
     skills: list[str] = field(default_factory=list)
+    parsing_warnings: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -62,6 +74,7 @@ class ParsedResume:
             "current_position": self.current_position,
             "expected_position": self.expected_position,
             "skills": self.skills,
+            "parsing_warnings": self.parsing_warnings,
             "text_preview": self.text[:1000],
         }
 
@@ -75,14 +88,90 @@ def normalize_text(text: str) -> str:
     return "\n".join(lines)
 
 
-def extract_pdf_text(file_path: str | Path) -> str:
-    reader = PdfReader(str(file_path))
-    parts = []
+def _extract_pdf_pages_pymupdf(file_path: Path) -> list[str] | None:
+    """pymupdf 提取，按页返回纯文本；失败返回 None。"""
+    if _pymupdf is None:
+        return None
+    try:
+        with _pymupdf.open(str(file_path)) as doc:
+            return [page.get_text() or "" for page in doc]
+    except Exception:
+        return None
+
+
+def _extract_pdf_pages_pypdf(file_path: Path) -> list[str]:
+    """pypdf 提取，按页返回纯文本；任何异常吞掉返回空 list。"""
+    try:
+        reader = PdfReader(str(file_path))
+    except Exception:
+        return []
+    pages = []
     for page in reader.pages:
-        text = page.extract_text() or ""
-        if text.strip():
-            parts.append(text)
-    return normalize_text("\n".join(parts))
+        try:
+            pages.append(page.extract_text() or "")
+        except Exception:
+            pages.append("")
+    return pages
+
+
+def _score_pdf_extraction(pages: list[str]) -> tuple[int, int, int]:
+    """打分用于在 pymupdf / pypdf 间挑选更干净的结果。
+    返回 (有效字符数, U+FFFD 数, CJK 私用区数) — 第 1 项越大越好，后两项越小越好。
+    """
+    text = "\n".join(pages)
+    valid = sum(1 for ch in text if ch.strip())
+    fffd = text.count("�")
+    cjk_garble = sum(1 for ch in text if _GARBLE_CJK_RANGE[0] <= ord(ch) <= _GARBLE_CJK_RANGE[1])
+    return valid, fffd, cjk_garble
+
+
+def _extract_pdf_pages_best_effort(file_path: str | Path) -> list[str]:
+    """优先 pymupdf，若结果包含较多 U+FFFD / CJK 私用区伪字符就再试 pypdf 看是否更干净。"""
+    path = Path(file_path)
+    primary = _extract_pdf_pages_pymupdf(path)
+    if primary is None:
+        return _extract_pdf_pages_pypdf(path)
+    p_valid, p_fffd, p_cjk = _score_pdf_extraction(primary)
+    # pymupdf 完全没拿到字时直接试 pypdf
+    if p_valid == 0:
+        fallback = _extract_pdf_pages_pypdf(path)
+        return fallback or primary
+    # pymupdf 看上去都是乱码时也比较一下 pypdf
+    if p_fffd > 5 or p_cjk > 5:
+        fallback = _extract_pdf_pages_pypdf(path)
+        if fallback:
+            f_valid, f_fffd, f_cjk = _score_pdf_extraction(fallback)
+            if f_valid > 0 and (f_fffd + f_cjk) < (p_fffd + p_cjk):
+                return fallback
+    return primary
+
+
+def has_garbled_text(text: str) -> bool:
+    """判断文本是否含解析乱码（U+FFFD 或 CJK 私用区伪字符）。"""
+    if not text:
+        return False
+    fffd = text.count("�")
+    cjk_garble = sum(1 for ch in text if _GARBLE_CJK_RANGE[0] <= ord(ch) <= _GARBLE_CJK_RANGE[1])
+    if fffd >= 3 or cjk_garble >= 3:
+        return True
+    total_non_space = sum(1 for ch in text if not ch.isspace())
+    if total_non_space and (fffd + cjk_garble) / total_non_space >= _GARBLE_THRESHOLD_RATIO:
+        return True
+    return False
+
+
+def collect_parsing_warnings(text: str) -> list[str]:
+    """根据提取到的文本判断需要提示给人工的告警。"""
+    warnings: list[str] = []
+    if not has_garbled_text(text):
+        return warnings
+    warnings.append("PDF 文本含解析乱码（嵌入子集字体缺 ToUnicode 映射），邮箱/手机/年龄等数字字段可能识别失败，请人工补录。")
+    return warnings
+
+
+def extract_pdf_text(file_path: str | Path) -> str:
+    pages = _extract_pdf_pages_best_effort(file_path)
+    return normalize_text("\n".join(page for page in pages if page and page.strip()))
 
 
 def extract_docx_text(file_path: str | Path) -> str:
@@ -136,6 +225,7 @@ def parse_resume_pdf(file_path: str | Path) -> ParsedResume:
 def parse_resume_text(path: Path, text: str, candidate_signature: str | None = None) -> ParsedResume:
     lines = [line.strip() for line in text.split("\n") if line.strip()]
     parsed = ParsedResume(source_file=str(path), text=text)
+    parsed.parsing_warnings = collect_parsing_warnings(text)
     parsed.phone = find_phone(text)
     parsed.email = find_email(text)
     parsed.name = find_name(lines, parsed.phone, parsed.email)
@@ -566,17 +656,8 @@ def find_skills(text: str) -> list[str]:
 
 
 def extract_text_from_pdf(path: str | Path) -> str:
-    """用 pypdf 提取 PDF 纯文本，去水印/空行/冗余排版。"""
-    from pypdf import PdfReader
-    path = Path(path)
-    try:
-        reader = PdfReader(str(path))
-    except Exception:
-        return ""
-    pages_text = []
-    for page in reader.pages:
-        text = page.extract_text() or ""
-        pages_text.append(text)
+    """用 pymupdf 优先 + pypdf 兜底提取 PDF 纯文本，去水印/空行/冗余排版。"""
+    pages_text = _extract_pdf_pages_best_effort(path)
     raw = "\n".join(pages_text)
     # 去水印：常见水印关键词行
     lines = raw.split("\n")

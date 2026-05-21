@@ -12,7 +12,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 from sqlalchemy import delete, func, select
 
-from components.layout import APP_VERSION, inject_vibe_style, page_header
+from components.layout import APP_VERSION, get_theme_css, inject_vibe_style, page_header
 from recruitment_assistant.config.settings import get_settings
 from recruitment_assistant.parsers.pdf_resume_parser import clean_candidate_signature
 import recruitment_assistant.platforms.zhilian.adapter as zhilian_adapter_module
@@ -36,58 +36,62 @@ ensure_collect_databases_initialized()
 settings = get_settings()
 st.set_page_config(page_title="采集任务", layout="wide", initial_sidebar_state="collapsed")
 inject_vibe_style("智联招聘采集")
-page_header("智联招聘采集", "创建、执行并追踪智联招聘平台的简历采集任务。")
+page_header(
+    "智联招聘采集",
+    "创建、执行并追踪智联招聘平台的简历采集任务。",
+    icon="icon/智联招聘.jpeg",
+)
 
 st.markdown(
     """
 <style>
-.collect-panel { background:#fff; border:1px solid #E5EAF2; border-radius:22px; padding:20px; box-shadow:0 12px 32px rgba(31,41,55,.05); margin-bottom:18px; }
-.collect-panel h3 { margin:0 0 14px; font-size:18px; line-height:1.3; color:#1F2937; }
+.collect-panel { background:var(--color-surface); border:1px solid var(--color-border); border-radius:22px; padding:20px; box-shadow:var(--shadow-sm, 0 12px 32px rgba(31,41,55,.05)); margin-bottom:18px; }
+.collect-panel h3 { margin:0 0 14px; font-size:18px; line-height:1.3; color:var(--color-text); }
 .plain-section-title { display:flex; align-items:center; justify-content:space-between; gap:12px; margin:18px 0 10px; }
-.plain-section-title h3 { margin:0; font-size:18px; line-height:1.3; color:#1F2937; }
-.collect-panel-stat { color:#4A90E2; font-size:14px; font-weight:700; white-space:nowrap; }
+.plain-section-title h3 { margin:0; font-size:18px; line-height:1.3; color:var(--color-text); }
+.collect-panel-stat { color:var(--color-primary); font-size:14px; font-weight:700; white-space:nowrap; }
 .collect-info-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; }
-.collect-info-label { color:#6B7280; font-size:13px; line-height:1.4; margin-bottom:5px; }
-.collect-info-value { color:#1F2937; font-size:14px; line-height:1.4; font-weight:700; word-break:break-all; }
-.collect-log-box { height:240px; overflow-y:auto; background:#FFFFFF; color:#1F2937; border:1px solid #E5EAF2; border-radius:16px; padding:14px; font-family:Consolas, Monaco, monospace; font-size:13px; line-height:1.55; white-space:pre-wrap; }
+.collect-info-label { color:var(--color-text-secondary); font-size:13px; line-height:1.4; margin-bottom:5px; }
+.collect-info-value { color:var(--color-text); font-size:14px; line-height:1.4; font-weight:700; word-break:break-all; }
+.collect-log-box { height:240px; overflow-y:auto; background:var(--color-surface); color:var(--color-text); border:1px solid var(--color-border); border-radius:16px; padding:14px; font-family:Consolas, Monaco, monospace; font-size:13px; line-height:1.55; white-space:pre-wrap; }
 .collect-log-line { display:block; }
-.collect-log-success { color:#168A45; font-weight:700; }
-.collect-log-failed { color:#C73552; font-weight:700; }
-.collect-log-skipped { color:#B7791F; font-weight:700; }
-.collect-log-stat { color:#2563EB; font-weight:700; }
+.collect-log-success { color:var(--color-success); font-weight:700; }
+.collect-log-failed { color:var(--color-danger); font-weight:700; }
+.collect-log-skipped { color:var(--color-warning); font-weight:700; }
+.collect-log-stat { color:var(--color-primary); font-weight:700; }
 .collect-log-line strong { font-weight:800; }
 [data-testid="stVerticalBlockBorderWrapper"],
 [data-testid="stVerticalBlockBorderWrapper"] > div,
 [data-testid="stVerticalBlockBorderWrapper"] [data-testid="stVerticalBlock"] {
-    background:#FFFFFF !important;
-    background-color:#FFFFFF !important;
-    border-color:#E5EAF2 !important;
+    background:var(--color-surface) !important;
+    background-color:var(--color-surface) !important;
+    border-color:var(--color-border) !important;
     border-radius:22px !important;
-    box-shadow:0 12px 32px rgba(31,41,55,.05);
+    box-shadow:var(--shadow-sm, 0 12px 32px rgba(31,41,55,.05));
 }
-.collect-info-item { background:#FFFFFF; border:1px solid #E5EAF2; border-radius:14px; padding:12px 14px; }
-.collect-running-text { color:#F59E0B; font-size:14px; font-weight:700; white-space:nowrap; }
-.collect-task-progress { color:#4A90E2; font-size:14px; font-weight:700; white-space:nowrap; }
-.collect-empty { color:#94A3B8; font-size:13px; }
-.zhilian-section-title { display:flex; align-items:baseline; gap:14px; flex-wrap:wrap; margin:14px 0 7px; padding:0 0 6px; border-bottom:2px solid #DDE7F2; color:#172033; font-size:22px; line-height:1.2; font-weight:900; letter-spacing:-.3px; background:transparent; }
-.zhilian-section-note { color:#B7791F; font-size:13px; font-weight:600; letter-spacing:0; }
-.zhilian-status-banner { min-height:84px; box-sizing:border-box; background:#FFFFFF; border:1px solid #EEF2F7; border-radius:12px; padding:10px 14px; display:flex; flex-direction:column; justify-content:center; gap:4px; overflow:hidden; }
+.collect-info-item { background:var(--color-surface); border:1px solid var(--color-border); border-radius:14px; padding:12px 14px; }
+.collect-running-text { color:var(--color-warning); font-size:14px; font-weight:700; white-space:nowrap; }
+.collect-task-progress { color:var(--color-primary); font-size:14px; font-weight:700; white-space:nowrap; }
+.collect-empty { color:var(--color-text-muted); font-size:13px; }
+.zhilian-section-title { display:flex; align-items:baseline; gap:14px; flex-wrap:wrap; margin:14px 0 7px; padding:0 0 6px; border-bottom:2px solid var(--color-border); color:var(--color-text); font-size:22px; line-height:1.2; font-weight:900; letter-spacing:-.3px; background:transparent; }
+.zhilian-section-note { color:var(--color-warning); font-size:13px; font-weight:600; letter-spacing:0; }
+.zhilian-status-banner { min-height:84px; box-sizing:border-box; background:var(--color-surface); border:1px solid var(--color-border); border-radius:12px; padding:10px 14px; display:flex; flex-direction:column; justify-content:center; gap:4px; overflow:hidden; }
 .zhilian-status-banner.one-line { flex-direction:row; align-items:center; justify-content:space-between; gap:8px; min-height:0; height:58px; }
-.zhilian-status-label { font-size:12px; color:#64748B; line-height:1.1; font-weight:600; letter-spacing:.2px; }
-.zhilian-status-value { font-size:20px; font-weight:900; color:#172033; line-height:1.2; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-.zhilian-status-sub { font-size:13px; color:#475569; line-height:1.3; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.zhilian-status-label { font-size:12px; color:var(--color-text-secondary); line-height:1.1; font-weight:600; letter-spacing:.2px; }
+.zhilian-status-value { font-size:20px; font-weight:900; color:var(--color-text); line-height:1.2; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.zhilian-status-sub { font-size:13px; color:var(--color-text-secondary); line-height:1.3; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .zhilian-status-banner-meta { gap:6px; padding:10px 14px; }
 .zhilian-meta-row { display:flex; align-items:baseline; justify-content:space-between; gap:10px; }
-.zhilian-meta-label { font-size:14px; font-weight:800; color:#172033; letter-spacing:.2px; }
-.zhilian-meta-value { font-size:12px; color:#475569; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-.zhilian-status-on { color:#168A45; }
-.zhilian-status-off { color:#94A3B8; }
-.zhilian-status-login-on { color:#16A34A; }
-.zhilian-status-login-off { color:#B91C1C; }
-.zhilian-status-idle { color:#6EE7B7; }
+.zhilian-meta-label { font-size:14px; font-weight:800; color:var(--color-text); letter-spacing:.2px; }
+.zhilian-meta-value { font-size:12px; color:var(--color-text-secondary); font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.zhilian-status-on { color:var(--color-success); }
+.zhilian-status-off { color:var(--color-text-muted); }
+.zhilian-status-login-on { color:var(--color-success); }
+.zhilian-status-login-off { color:var(--color-danger); }
+.zhilian-status-idle { color:var(--color-text-secondary); }
 .zhilian-result-title { display:flex; align-items:center; justify-content:space-between; gap:10px; margin:0 0 8px; min-height:28px; }
-.zhilian-result-title strong { color:#172033; font-size:18px; line-height:1.2; font-weight:900; letter-spacing:-.2px; }
-.zhilian-result-title span { color:#4A90E2; font-size:13px; font-weight:700; line-height:1.25; text-align:right; }
+.zhilian-result-title strong { color:var(--color-text); font-size:18px; line-height:1.2; font-weight:900; letter-spacing:-.2px; }
+.zhilian-result-title span { color:var(--color-primary); font-size:13px; font-weight:700; line-height:1.25; text-align:right; }
 </style>
 """,
     unsafe_allow_html=True,
@@ -452,14 +456,14 @@ def classify_collect_log_line(line: str) -> str:
 def collect_log_line_style(css_class: str) -> str:
     base = "display:block;white-space:pre-wrap;word-break:break-word;margin-bottom:4px;"
     if css_class == "collect-log-success":
-        return base + "color:#168A45!important;font-weight:600!important;"
+        return base + "color:var(--color-success)!important;font-weight:600!important;"
     if css_class == "collect-log-failed":
-        return base + "color:#C73552!important;font-weight:600!important;"
+        return base + "color:var(--color-danger)!important;font-weight:600!important;"
     if css_class == "collect-log-skipped":
-        return base + "color:#B7791F!important;font-weight:600!important;"
+        return base + "color:var(--color-warning)!important;font-weight:600!important;"
     if css_class == "collect-log-stat":
-        return base + "color:#2563EB!important;font-weight:600!important;"
-    return base + "color:#1F2937!important;font-weight:400!important;"
+        return base + "color:var(--color-primary)!important;font-weight:600!important;"
+    return base + "color:var(--color-text)!important;font-weight:400!important;"
 
 
 def _render_log_markup(line: str) -> str:
@@ -476,7 +480,7 @@ def build_collect_log_body(logs: list[str]) -> str:
         style_attr = collect_log_line_style(css_class)
         class_attr = f"collect-log-line {css_class}" if css_class else "collect-log-line"
         html_lines.append(f'<div class="{class_attr}" style="{style_attr}">{_render_log_markup(line)}</div>')
-    return "".join(html_lines) if html_lines else '<div class="collect-empty" style="color:#94A3B8!important;font-size:13px;">暂无任务输出。任务启动后将自动显示最新日志。</div>'
+    return "".join(html_lines) if html_lines else '<div class="collect-empty" style="color:var(--color-text-muted)!important;font-size:13px;">暂无任务输出。任务启动后将自动显示最新日志。</div>'
 
 
 def render_log_html(container=None) -> None:
@@ -489,21 +493,23 @@ def render_live_log_panel(refresh_seconds: float = 1.5) -> None:
     live_runtime = get_runtime_state()
     logs = live_runtime.get("logs") or st.session_state.get("collect_task_logs_zhilian", [])
     body = build_collect_log_body(list(logs))
+    theme_vars = get_theme_css()
     components.html(
         f"""
 <!doctype html>
 <html>
 <head>
 <style>
-body {{ margin:0; background:#fff; color:#1F2937; font:13px/1.55 Consolas, Monaco, monospace; }}
-#collect-log-box {{ height:240px; overflow-y:auto; background:#FFFFFF; color:#1F2937; border:1px solid #E5EAF2; border-radius:16px; padding:14px; white-space:pre-wrap; box-sizing:border-box; }}
+{theme_vars}
+body {{ margin:0; background:var(--color-surface); color:var(--color-text); font:13px/1.55 Consolas, Monaco, monospace; }}
+#collect-log-box {{ height:240px; overflow-y:auto; background:var(--color-surface); color:var(--color-text); border:1px solid var(--color-border); border-radius:16px; padding:14px; white-space:pre-wrap; box-sizing:border-box; }}
 .collect-log-line {{ display:block; }}
-.collect-log-success {{ color:#168A45; font-weight:700; }}
-.collect-log-failed {{ color:#C73552; font-weight:700; }}
-.collect-log-skipped {{ color:#B7791F; font-weight:700; }}
-.collect-log-stat {{ color:#2563EB; font-weight:700; }}
+.collect-log-success {{ color:var(--color-success); font-weight:700; }}
+.collect-log-failed {{ color:var(--color-danger); font-weight:700; }}
+.collect-log-skipped {{ color:var(--color-warning); font-weight:700; }}
+.collect-log-stat {{ color:var(--color-primary); font-weight:700; }}
 .collect-log-line strong {{ font-weight:800; }}
-.collect-empty {{ color:#94A3B8; font-size:13px; }}
+.collect-empty {{ color:var(--color-text-muted); font-size:13px; }}
 </style>
 </head>
 <body>

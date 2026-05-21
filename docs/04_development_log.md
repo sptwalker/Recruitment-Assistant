@@ -1,8 +1,56 @@
 # 开发日志
 
-## 2026-05-20
+## 2026-05-22
 
-### V2.30 BOSS 与 51 采集控制按钮等宽优化
+### V2.50 主题接管深度补全 + WS 桥接自愈 + 采集页 UI 对齐
+
+页面版本保持 `V2.50`（前期已升），本次补齐先前积累但未写入日志的改动 + 本会话新增内容。
+
+**主题系统：原生 Streamlit 组件全面接管**
+
+- `app/styles/components.css`：
+  - 禁用按钮（`div.stButton > button:disabled` 等 3 类）从写死 `var(--gray-300)` 改为 `var(--color-surface-muted)` + `var(--color-text-muted)` + 1px 主题边框 + `opacity:.7` + `cursor:not-allowed`，与系统设置预览区的禁用按钮 demo 完全一致。
+  - `st.number_input` 完整接管：`[data-testid="stNumberInput"]` 容器走 `color-surface` + 主题描边；输入框文字 `color-text` 居中加粗；+/- 步进按钮默认态 `color-primary-soft` + `color-primary` 字色，hover 反转为主色实底白字；disabled 走与禁用按钮一致的灰白态；兜底 `svg { fill:currentColor }` 防 BaseWeb 内置图标颜色逃出主题。
+  - `st.selectbox` 弹层接管：触发器外观 + 下拉箭头随主题；popover portal 出去的 `[role="listbox"]` 用主题面板色 + `shadow-md` 阴影；选项默认 / hover（`color-primary-soft` 底 + 主色字）/ aria-selected（主色实底 + 白字加粗）三态完整。
+
+- `app/components/layout.py`：`APP_VERSION` 从 V2.48 升 V2.50；`page_header()` 增加 `icon: str | None` 参数与 `icon_data_uri()` 缓存函数，支持页面标题左侧渲染 base64 数据 URI 图标。
+- `app/styles/global.css`：新增 `.vibe-page-title-lede` 与 `.vibe-page-icon` 布局规则，配套 page_header 图标位。
+
+**采集页面主题预览区扩展**
+
+- `app/pages/05_平台登录.py` 主题预览区在原有"主按钮 / 次按钮 / 输入框 / 下拉框"基础上新增：
+  - 第三种按钮态 `禁用按钮`（`disabled` 属性），用 `color-surface-muted` 背景演示主题如何处理 disabled。
+  - `每页数量` 旁的 `+/- 数字框` 演示，三态着色与新增 `stNumberInput` 全局接管完全一致。
+  - 预览 iframe 高度从 430 提到 490 容纳新元素，caption 同步更新。
+
+**WebSocket 桥接：启动失败缓存自愈**
+
+- `app/components/bridges.py`（新增文件）：`@st.cache_resource` 会把 `BossWSServer.start()` 失败时产生的 broken bridge 实例永久缓存住，导致 8765 / 8766 端口冲突解除后页面仍报 `[Errno 10048]`。新设计将 `cache_resource` 装饰下沉到 `_build_*_bridge` 内部函数，外层 `get_*_bridge()` 检查 `is_listening / startup_error`，发现失败缓存时主动 `clear()` + 重建一次，问题再发时自愈，不影响正常路径性能。
+- `recruitment_assistant/services/boss_ws_bridge.py`：`BOSS_BRIDGE_VERSION` `1.93.0 → 1.94.0`。
+- `recruitment_assistant/services/qiancheng_ws_bridge.py`：`QIANCHENG_BRIDGE_VERSION` `1.7.0 → 1.8.0`。
+
+**采集页面 UI 细节对齐**
+
+- `app/pages/06_智联采集.py`：`.zhilian-status-idle` 字色从 `var(--color-success-soft)`（被误当字色用的浅绿底色变量，白底上几乎不可读）改为 `var(--color-text-secondary)`，修复"等待启动"文字在白底主题下不可识别问题。
+- `app/pages/08_BOSS采集.py`：
+  - 实时日志 / 候选人列表标题（`.boss-result-title strong`）字号 14px → 18px、`font-weight:700`、`line-height:1.3`、`min-height:26px`，与下方"BOSS直聘历史批次任务列表"标题视觉一致。
+  - `采集模式` selectbox label 加 `padding-left:12px`，与下方下拉控件内边距对齐。
+  - `索要简历` checkbox label 字号 14px → 15px，整体 `padding-top:14px / padding-left:8px` 向右下推移，与右侧 metric banner 水平基线对齐。
+- `app/pages/09_51前程无忧采集.py`：
+  - 顶部 `打开51Job网站 / 重新检测 / 重置日志 / 清除去重` 4 按钮列宽从 `[1.4, 1.6, 1.1, 1.25, 4.65]` 改为 `[1, 1, 1, 1, 4]`，统一加 `use_container_width=True`，按钮本体等宽且间距由 `gap="medium"` 单点管理。
+  - `采集模式` selectbox label 与结果标题字号同步对齐 BOSS 页面规则。
+
+**简历解析鲁棒性提升（先前积累）**
+
+- `recruitment_assistant/parsers/pdf_resume_parser.py`：新增 pymupdf 备选提取通道、`_score_pdf_extraction()` 评分函数与 CJK 私用区乱码检测（嵌入子集字体常把数字 / 拉丁映射到 U+7700-U+77FF），`ParsedResume` 新增 `parsing_warnings` 字段对外暴露提取阶段告警。
+
+**页面图标接入（先前积累）**
+
+- `app/main.py / app/pages/07_简历管理.py / app/pages/10_面试管理.py` 调用新版 `page_header(..., icon=...)` 传入图标路径，页面顶部标题左侧渲染 48×48 圆角图标。
+
+---
+
+
 
 - 页面版本同步升级为 `V2.30`。
 - `BOSS采集` 页面采集与结果栏中 `开始采集`、`暂  停`、`继  续`、`停  止` 按钮统一使用容器宽度。

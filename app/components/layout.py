@@ -1,9 +1,10 @@
 import json
+from base64 import b64encode
 from pathlib import Path
 
 import streamlit as st
 
-APP_VERSION = "V2.48"
+APP_VERSION = "V2.50"
 STYLE_DIR = Path("app/styles")
 STYLE_FILES = ("theme.css", "global.css", "components.css")
 THEME_DIR = STYLE_DIR / "themes"
@@ -119,12 +120,34 @@ def inject_vibe_style(active: str = "首页") -> None:
     st.markdown(_style_block() + _topbar_html() + _sidebar_html(active), unsafe_allow_html=True)
 
 
-def page_header(title: str, subtitle: str = "", action: str | None = None) -> None:
+def page_header(title: str, subtitle: str = "", action: str | None = None, icon: str | None = None) -> None:
     action_html = f'<a class="vibe-accent-btn">{action}</a>' if action else ""
+    icon_uri = icon_data_uri(icon) if icon else ""
+    if icon_uri:
+        lede_html = (
+            f'<div class="vibe-page-title-lede">'
+            f'<img class="vibe-page-icon" src="{icon_uri}" alt="{title}">'
+            f'<div><h1>{title}</h1><p>{subtitle}</p></div>'
+            f'</div>'
+        )
+    else:
+        lede_html = f'<div><h1>{title}</h1><p>{subtitle}</p></div>'
     st.markdown(
-        f'<div class="vibe-page-title"><div><h1>{title}</h1><p>{subtitle}</p></div>{action_html}</div>',
+        f'<div class="vibe-page-title">{lede_html}{action_html}</div>',
         unsafe_allow_html=True,
     )
+
+
+@st.cache_data
+def icon_data_uri(path: str | None) -> str:
+    if not path:
+        return ""
+    icon_path = Path(path)
+    if not icon_path.is_file():
+        return ""
+    suffix = icon_path.suffix.lstrip(".").lower()
+    mime = {"jpg": "jpeg", "jpeg": "jpeg", "png": "png", "svg": "svg+xml", "webp": "webp"}.get(suffix, suffix)
+    return f"data:image/{mime};base64,{b64encode(icon_path.read_bytes()).decode('ascii')}"
 
 
 def toast(message: str, kind: str = "success") -> None:

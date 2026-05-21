@@ -28,6 +28,7 @@ extract_doc_text = resume_parser_module.extract_doc_text
 extract_text_from_docx = resume_parser_module.extract_text_from_docx
 extract_text_from_pdf = resume_parser_module.extract_text_from_pdf
 is_empty_or_corrupted = resume_parser_module.is_empty_or_corrupted
+has_garbled_text = resume_parser_module.has_garbled_text
 
 resume_ai_service_module = importlib.reload(resume_ai_service_module)
 ResumeAIService = resume_ai_service_module.ResumeAIService
@@ -255,32 +256,32 @@ with tabs[0]:
           .resume-log-window {{
             height: 460px;
             overflow-y: auto;
-            background: #ffffff;
-            color: #1f2328;
+            background: var(--color-surface);
+            color: var(--color-text);
             font-family: 'Consolas','Monaco','Microsoft YaHei Mono','Microsoft YaHei',monospace;
             font-size: 13px;
             line-height: 1.55;
             padding: 12px 14px;
             border-radius: 6px;
-            border: 1px solid #d0d7de;
+            border: 1px solid var(--color-border);
             white-space: pre-wrap;
             word-break: break-all;
             user-select: text;            /* 允许选中文字 */
           }}
           .resume-log-window .log-row {{
-            color: #1f2328;
+            color: var(--color-text);
           }}
           .resume-log-window .log-row-error {{
-            color: #d1242f;
+            color: var(--color-danger);
             font-weight: 700;
           }}
           .resume-log-window::-webkit-scrollbar {{ width: 10px; }}
-          .resume-log-window::-webkit-scrollbar-track {{ background: #f6f8fa; }}
+          .resume-log-window::-webkit-scrollbar-track {{ background: var(--color-bg-soft); }}
           .resume-log-window::-webkit-scrollbar-thumb {{
-            background: #c6cdd5;
+            background: var(--color-border-strong, var(--color-border));
             border-radius: 5px;
           }}
-          .resume-log-window::-webkit-scrollbar-thumb:hover {{ background: #8c959f; }}
+          .resume-log-window::-webkit-scrollbar-thumb:hover {{ background: var(--color-text-muted); }}
         </style>
         """
         st.markdown(html, unsafe_allow_html=True)
@@ -498,6 +499,8 @@ with tabs[0]:
                 results["failed_files"]["文本过短"].append(fname)
                 results["fail_count"] += 1
             else:
+                if has_garbled_text(raw_text):
+                    log("           ⚠️ PDF 含解析乱码（嵌入子集字体缺 ToUnicode 映射），邮箱/手机/年龄等数字字段可能识别失败，请人工补录。")
                 log(f"           📄 文本提取成功（{len(raw_text)} 字符），调用 AI 结构化…")
                 # 3) AI 结构化
                 candidate_data = None
@@ -520,6 +523,19 @@ with tabs[0]:
                     results["failed_files"]["AI 返回空结果"].append(fname)
                     results["fail_count"] += 1
                 elif candidate_data:
+                    fname_name, fname_age, fname_edu = infer_candidate_from_filename(fname)
+                    filled = []
+                    if not candidate_data.age and fname_age:
+                        candidate_data.age = fname_age
+                        filled.append(f"年龄={fname_age}")
+                    if not candidate_data.education_level and fname_edu:
+                        candidate_data.education_level = fname_edu
+                        filled.append(f"学历={fname_edu}")
+                    if (not candidate_data.name or candidate_data.name in ("未知", "未识别")) and fname_name:
+                        candidate_data.name = fname_name
+                        filled.append(f"姓名={fname_name}")
+                    if filled:
+                        log(f"           🪪 从文件名补全字段：{' / '.join(filled)}")
                     log(
                         f"           🤖 AI 识别 — 姓名:{candidate_data.name} "
                         f"电话:{candidate_data.phone or '-'} "
@@ -877,22 +893,22 @@ with tabs[1]:
                 div[data-testid="stVerticalBlockBorderWrapper"] button {
                     text-align: left !important;
                     justify-content: flex-start !important;
-                    background: #ffffff !important;
-                    color: #1a1a1a !important;
-                    border: 1px solid #e2e8f0 !important;
+                    background: var(--color-surface) !important;
+                    color: var(--color-text) !important;
+                    border: 1px solid var(--color-border) !important;
                     font-weight: normal !important;
                 }
                 div[data-testid="stVerticalBlockBorderWrapper"] button p {
                     text-align: left !important;
-                    color: #1a1a1a !important;
+                    color: var(--color-text) !important;
                 }
                 div[data-testid="stVerticalBlockBorderWrapper"] button:hover {
-                    background: #f1f5f9 !important;
-                    border-color: #94a3b8 !important;
+                    background: var(--color-hover) !important;
+                    border-color: var(--color-border-strong, var(--color-border)) !important;
                 }
                 div[data-testid="stVerticalBlockBorderWrapper"] button[kind="primary"] {
-                    background: #e0e7ff !important;
-                    border-color: #6366f1 !important;
+                    background: var(--color-primary-soft) !important;
+                    border-color: var(--color-primary) !important;
                     font-weight: 600 !important;
                 }
                 </style>
@@ -1080,20 +1096,20 @@ with tabs[2]:
                             div.st-key-viewbtn_wrap_{pos.position_id} button,
                             div.st-key-viewbtn_wrap_{pos.position_id} button:focus,
                             div.st-key-viewbtn_wrap_{pos.position_id} button:active {{
-                                background-color: #dcfce7 !important;
-                                color: #166534 !important;
-                                border-color: #86efac !important;
+                                background-color: var(--color-success-soft) !important;
+                                color: var(--color-success) !important;
+                                border-color: var(--color-success) !important;
                             }}
                             div.st-key-viewbtn_wrap_{pos.position_id} button p {{
-                                color: #166534 !important;
+                                color: var(--color-success) !important;
                             }}
                             div.st-key-viewbtn_wrap_{pos.position_id} button:hover {{
-                                background-color: #bbf7d0 !important;
-                                border-color: #4ade80 !important;
-                                color: #14532d !important;
+                                background-color: var(--color-success) !important;
+                                border-color: var(--color-success) !important;
+                                color: var(--color-surface) !important;
                             }}
                             div.st-key-viewbtn_wrap_{pos.position_id} button:hover p {{
-                                color: #14532d !important;
+                                color: var(--color-surface) !important;
                             }}
                             </style>""",
                             unsafe_allow_html=True,
@@ -1225,14 +1241,14 @@ with tabs[2]:
                             info_str = f"&nbsp;&nbsp;&nbsp;{'  |  '.join(info_parts)}" if info_parts else ""
                             h_cols[0].markdown(
                                 f"<div style='margin:0; line-height:1.4; padding-top:12px;'>"
-                                f"<span style='font-size:22px; font-weight:700; color:#000;'>{cand.name}</span>"
-                                f"<span style='font-size:14px; color:#333;'>{info_str}</span></div>",
+                                f"<span style='font-size:22px; font-weight:700; color:var(--color-text);'>{cand.name}</span>"
+                                f"<span style='font-size:14px; color:var(--color-text-secondary);'>{info_str}</span></div>",
                                 unsafe_allow_html=True,
                             )
                             color = _score_color(score)
                             h_cols[1].markdown(
                                 f"<div style='text-align:right;'>"
-                                f"<span style='font-size:12px; color:#666;'>匹配度 </span>"
+                                f"<span style='font-size:12px; color:var(--color-text-muted);'>匹配度 </span>"
                                 f"<span style='font-size:32px; font-weight:700; color:{color};'>{score}%</span>"
                                 f"</div>",
                                 unsafe_allow_html=True,
@@ -1245,10 +1261,10 @@ with tabs[2]:
                                     st.session_state["invite_dialog_cid"] = cand.candidate_id
                                     _open_invite_dialog()
 
-                            # AI 评语：深蓝色（紧贴上方）
+                            # AI 评语：主题主色（紧贴上方）
                             if reason:
                                 st.markdown(
-                                    f"<div style='color:#1e3a8a; margin:0;'>"
+                                    f"<div style='color:var(--color-primary); margin:0;'>"
                                     f"💡 <b>AI 评语：</b>{reason}</div>",
                                     unsafe_allow_html=True,
                                 )
@@ -1277,7 +1293,7 @@ with tabs[2]:
                                 contacts.append(f"💬 {cand.wechat}")
                             contact_text = (" | ".join(contacts) if contacts else "无联系方式")
                             st.markdown(
-                                f"<div style='color:#000; font-size:14px; margin:4px 0;'>{contact_text}</div>",
+                                f"<div style='color:var(--color-text); font-size:14px; margin:4px 0;'>{contact_text}</div>",
                                 unsafe_allow_html=True,
                             )
 
@@ -1323,7 +1339,7 @@ with tabs[2]:
                                 with st.container(key=file_btn_key):
                                     file_cols = st.columns([7, 0.6, 0.6, 5])
                                     file_cols[0].markdown(
-                                        f"<div style='color:#000; font-size:13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; padding-top:6px;'>📎 {fp}</div>",
+                                        f"<div style='color:var(--color-text); font-size:13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; padding-top:6px;'>📎 {fp}</div>",
                                         unsafe_allow_html=True,
                                     )
                                     if file_cols[1].button("📄", key=f"mopen_{sel_pos.position_id}_{cand.candidate_id}", help="打开文件"):
@@ -1337,7 +1353,7 @@ with tabs[2]:
                                         except OSError:
                                             pass
                                     file_cols[3].markdown(
-                                        f"<div style='text-align:right; color:#888; font-size:12px; padding-top:8px;'>{src_info}</div>",
+                                        f"<div style='text-align:right; color:var(--color-text-muted); font-size:12px; padding-top:8px;'>{src_info}</div>",
                                         unsafe_allow_html=True,
                                     )
                 else:

@@ -232,6 +232,22 @@ hr,
   margin-bottom: 18px;
 }
 
+.vibe-page-title-lede {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.vibe-page-icon {
+  flex-shrink: 0;
+  width: 48px;
+  height: 48px;
+  border-radius: 14px;
+  background: #EFF6FF;
+  object-fit: cover;
+  display: block;
+}
+
 .vibe-page-title h1 {
   margin: 0;
   color: var(--color-text);

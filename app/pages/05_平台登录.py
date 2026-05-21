@@ -12,15 +12,11 @@ from components.layout import (
     save_current_theme,
 )
 from recruitment_assistant.config.settings import get_settings
-from recruitment_assistant.platforms.zhilian.adapter import ZhilianAdapter
-from recruitment_assistant.schemas.raw_resume import RawResumeCreate
-from recruitment_assistant.services.raw_resume_service import RawResumeService
-from recruitment_assistant.storage.db import create_session
 
 
 st.set_page_config(page_title="系统设置", layout="wide", initial_sidebar_state="collapsed")
 inject_vibe_style("系统设置")
-page_header("系统设置", "管理账号登录态、采集策略、风控参数与通知方式。")
+page_header("系统设置", "配置 AI 大模型与界面主题风格。")
 
 
 @st.dialog("API Key测试")
@@ -70,93 +66,10 @@ def open_ai_api_key_test_dialog():
         st.code(str(exc))
 
 
-tabs = st.tabs(["账号", "采集", "风控", "通知", "AI模型", "主题风格"])
+tabs = st.tabs(["AI模型", "主题风格"])
 
 
 with tabs[0]:
-    st.markdown('<div class="vibe-card"><h3>账号设置</h3>', unsafe_allow_html=True)
-    platform_options = {
-        "智联招聘": {"adapter": ZhilianAdapter, "snapshot_url": "https://rd5.zhaopin.com/"},
-    }
-    platform_name = st.selectbox("登录平台", list(platform_options.keys()), index=0, key="login_platform_name")
-    account_name = st.text_input("账号标识", value="default", help="仅用于区分本地登录态文件，不需要填写真实密码。")
-    adapters = {name: meta["adapter"](account_name=account_name or "default") for name, meta in platform_options.items()}
-    adapter = adapters[platform_name]
-    status_cols = st.columns(len(adapters))
-    for index, (name, item_adapter) in enumerate(adapters.items()):
-        item_user_data_dir = getattr(item_adapter, "user_data_dir", item_adapter.state_path.with_name(f"{item_adapter.state_path.stem}_profile"))
-        item_login_status_key = f"{item_adapter.platform_code}_login_status_{account_name or 'default'}"
-        item_artifact_saved = item_adapter.state_path.exists() or item_user_data_dir.exists()
-        item_status = st.session_state.get(item_login_status_key) or ("已保存，待检测" if item_artifact_saved else "未保存")
-        status_cols[index].metric(f"{name}登录态", item_status)
-    c1, c2 = st.columns(2)
-    user_data_dir = getattr(adapter, "user_data_dir", adapter.state_path.with_name(f"{adapter.state_path.stem}_profile"))
-    c1.code(f"当前平台：{platform_name}\n登录态文件：{adapter.state_path}\n浏览器档案：{user_data_dir}")
-    login_status_key = f"{adapter.platform_code}_login_status_{account_name or 'default'}"
-    login_status = st.session_state.get(login_status_key)
-    login_artifact_saved = adapter.state_path.exists() or user_data_dir.exists()
-    c2.metric("当前平台登录态", login_status or ("已保存，待检测" if login_artifact_saved else "未保存"))
-    if st.button("检测是否已登录"):
-        with st.spinner("正在打开无头浏览器检测登录态..."):
-            is_logged_in = adapter.is_logged_in()
-        st.session_state[login_status_key] = "已登录" if is_logged_in else "未登录或已失效"
-        st.success("已登录") if is_logged_in else st.error("未登录或登录态已失效")
-        st.rerun()
-    wait_seconds = st.number_input("等待人工登录秒数", min_value=30, max_value=900, value=180, step=30)
-    if st.button(f"打开{platform_name}登录并保存登录态"):
-        with st.spinner(f"请在弹出的{platform_name}页面完成人工登录，系统会自动保存登录态..."):
-            state_path = adapter.login_manually(wait_seconds=int(wait_seconds), keep_open=False)
-            is_logged_in = adapter.is_logged_in()
-        st.session_state[login_status_key] = "已登录" if is_logged_in else "已保存，待验证"
-        st.session_state[f"{adapter.platform_code}_login_state_updated_at"] = time.time()
-        st.success(f"登录态已保存：{state_path}\n浏览器档案：{user_data_dir}")
-        st.rerun()
-    st.info("BOSS 采集已迁移到独立的 Chrome 扩展页面，请从左侧进入“BOSS采集”。")
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    st.markdown('<div class="vibe-card"><h3>开发工具</h3>', unsafe_allow_html=True)
-    snapshot_url = st.text_input("快照 URL", value=platform_options[platform_name]["snapshot_url"])
-    snapshot_wait_seconds = st.number_input("快照等待秒数", min_value=5, max_value=120, value=30, step=5)
-    if st.button(f"{platform_name}页面快照保存"):
-        if not adapter.state_path.exists():
-            st.error(f"登录态不存在，请先完成{platform_name}登录。")
-        elif not hasattr(adapter, "capture_current_page"):
-            st.warning(f"{platform_name}暂未提供页面快照工具。")
-        else:
-            with st.spinner(f"正在打开{platform_name}页面并保存 HTML 快照..."):
-                data = adapter.capture_current_page(target_url=snapshot_url or None, wait_seconds=int(snapshot_wait_seconds))
-                with create_session() as session:
-                    raw_resume = RawResumeService(session).create_raw_resume(RawResumeCreate(**data))
-            st.success(f"快照已保存 raw_resume_id={raw_resume.id}")
-            st.code(data["raw_html_path"])
-    st.markdown('</div>', unsafe_allow_html=True)
-
-with tabs[1]:
-    st.markdown('<div class="vibe-card"><h3>采集设置</h3>', unsafe_allow_html=True)
-    c1, c2 = st.columns(2)
-    c1.number_input("单次采集上限", min_value=1, max_value=200, value=50)
-    c2.selectbox("默认采集频率", ["手动", "每小时", "每天", "每周"])
-    st.checkbox("自动去重", value=True)
-    st.checkbox("下载后自动解析", value=True)
-    st.markdown('</div>', unsafe_allow_html=True)
-
-with tabs[2]:
-    st.markdown('<div class="vibe-card"><h3>风控设置</h3>', unsafe_allow_html=True)
-    c1, c2 = st.columns(2)
-    c1.slider("最小点击间隔（秒）", 1, 30, 5)
-    c2.slider("最大点击间隔（秒）", 5, 120, 30)
-    st.checkbox("启用随机等待", value=True)
-    st.checkbox("异常时自动暂停任务", value=True)
-    st.markdown('</div>', unsafe_allow_html=True)
-
-with tabs[3]:
-    st.markdown('<div class="vibe-card"><h3>通知设置</h3>', unsafe_allow_html=True)
-    st.text_input("通知邮箱")
-    st.text_input("Webhook 地址")
-    st.multiselect("通知事件", ["任务完成", "任务失败", "登录态失效", "导出完成"], default=["任务完成", "登录态失效"])
-    st.markdown('</div>', unsafe_allow_html=True)
-
-with tabs[4]:
     st.markdown('<div class="vibe-card"><h3>AI 大模型配置</h3>', unsafe_allow_html=True)
     st.caption("用于简历结构化解析、岗位匹配等 AI 功能。支持 DeepSeek / 通义千问 / OpenAI 等兼容 OpenAI 格式的 API。")
     from pathlib import Path
@@ -210,7 +123,7 @@ with tabs[4]:
         st.success("AI 配置已保存到 .env 文件，配置缓存已刷新；请重新进入简历管理后再执行自动解析入库。")
     st.markdown('</div>', unsafe_allow_html=True)
 
-with tabs[5]:
+with tabs[1]:
     st.markdown('<div class="vibe-card"><h3>主题风格</h3>', unsafe_allow_html=True)
     themes = list_theme_options()
     if not themes:
@@ -236,7 +149,7 @@ with tabs[5]:
             st.rerun()
         if save_col.button("统一保存设置", key="save_all_settings_theme_tab"):
             st.success("设置已保存。")
-        st.caption(theme_descriptions.get(selected_theme_id) or "选择主题后可在下方快速预览标题、正文、按钮、输入框、Banner、下拉框与进度条。")
+        st.caption(theme_descriptions.get(selected_theme_id) or "选择主题后可在下方快速预览标题、正文、按钮（主/次/禁用）、输入框、下拉框、+/- 数字框、Banner 与进度条。")
         preview_css = get_theme_css(selected_theme_id)
         components.html(
             f"""
@@ -252,9 +165,16 @@ body {{ margin: 0; font-family: var(--font-family-base, sans-serif); background:
 .theme-preview-title {{ margin: 0 0 8px; font-size: 20px; color: var(--color-text); }}
 .theme-preview-text {{ margin: 0 0 16px; line-height: 1.7; color: var(--color-text-secondary); }}
 .theme-preview-actions {{ display: flex; gap: 10px; flex-wrap: wrap; margin: 12px 0 18px; }}
-.theme-preview-btn {{ border: 0; border-radius: var(--radius-md); padding: 10px 16px; background: var(--color-primary); color: #fff; font-weight: 700; box-shadow: var(--shadow-xs); }}
+.theme-preview-btn {{ border: 0; border-radius: var(--radius-md); padding: 10px 16px; background: var(--color-primary); color: #fff; font-weight: 700; box-shadow: var(--shadow-xs); cursor: pointer; }}
 .theme-preview-btn.secondary {{ background: var(--color-primary-soft); color: var(--color-primary); border: 1px solid var(--color-border); }}
+.theme-preview-btn:disabled, .theme-preview-btn.disabled {{ background: var(--color-surface-muted, var(--color-bg-soft)); color: var(--color-text-muted); border: 1px solid var(--color-border); box-shadow: none; cursor: not-allowed; opacity: .7; }}
 .theme-preview-input, .theme-preview-select {{ width: 100%; box-sizing: border-box; border: 1px solid var(--color-border); border-radius: var(--radius-md); padding: 11px 12px; margin-bottom: 12px; background: var(--color-surface); color: var(--color-text); outline: none; }}
+.theme-preview-stepper-row {{ display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }}
+.theme-preview-stepper-label {{ color: var(--color-text-secondary); font-size: 13px; font-weight: 600; min-width: 56px; }}
+.theme-preview-stepper {{ display: inline-flex; align-items: stretch; border: 1px solid var(--color-border); border-radius: var(--radius-md); overflow: hidden; background: var(--color-surface); }}
+.theme-preview-stepper button {{ border: 0; background: var(--color-primary-soft); color: var(--color-primary); width: 36px; font-size: 18px; font-weight: 800; cursor: pointer; transition: background .15s ease, color .15s ease; }}
+.theme-preview-stepper button:hover {{ background: var(--color-primary); color: #fff; }}
+.theme-preview-stepper input {{ width: 64px; text-align: center; border: 0; border-left: 1px solid var(--color-border); border-right: 1px solid var(--color-border); background: var(--color-surface); color: var(--color-text); outline: none; padding: 8px 0; font-weight: 700; font-size: 14px; }}
 .theme-preview-progress {{ height: 12px; background: var(--color-primary-soft); border-radius: 999px; overflow: hidden; margin-top: 8px; }}
 .theme-preview-progress span {{ display: block; width: 68%; height: 100%; background: linear-gradient(90deg, var(--color-primary), var(--color-accent)); }}
 .theme-preview-tags {{ display: flex; gap: 8px; flex-wrap: wrap; }}
@@ -273,9 +193,18 @@ body {{ margin: 0; font-family: var(--font-family-base, sans-serif); background:
       <div class="theme-preview-actions">
         <button class="theme-preview-btn">主按钮</button>
         <button class="theme-preview-btn secondary">次按钮</button>
+        <button class="theme-preview-btn" disabled>禁用按钮</button>
       </div>
       <input class="theme-preview-input" value="候选人搜索输入框" />
       <select class="theme-preview-select"><option>下拉选择：全部岗位</option></select>
+      <div class="theme-preview-stepper-row">
+        <span class="theme-preview-stepper-label">每页数量</span>
+        <div class="theme-preview-stepper">
+          <button type="button">−</button>
+          <input value="20" readonly />
+          <button type="button">+</button>
+        </div>
+      </div>
     </div>
     <div class="theme-preview-card">
       <h3 class="theme-preview-title">任务进度</h3>
@@ -287,7 +216,7 @@ body {{ margin: 0; font-family: var(--font-family-base, sans-serif); background:
   </div>
 </div>
 """,
-            height=430,
+            height=490,
         )
     st.markdown('</div>', unsafe_allow_html=True)
 

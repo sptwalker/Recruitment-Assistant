@@ -7,16 +7,19 @@ from datetime import datetime
 import streamlit as st
 import streamlit.components.v1 as components
 
-from components.layout import inject_vibe_style, page_header
+from components.bridges import get_boss_bridge
+from components.layout import get_theme_css, inject_vibe_style, page_header
 from recruitment_assistant.config.settings import get_settings
-from recruitment_assistant.services.boss_ws_bridge import BossWSBridge
 from recruitment_assistant.services.crawl_task_service import BossCandidateRecordService, CrawlTaskService
-from recruitment_assistant.services.ws_server import BossWSServer
 from recruitment_assistant.storage.db import create_session
 
 st.set_page_config(page_title="BOSS采集", layout="wide", initial_sidebar_state="collapsed")
 inject_vibe_style("BOSS直聘采集")
-page_header("BOSS直聘采集", "通过 Chrome 扩展在页面内自动采集附件简历，完全绕过反检测。")
+page_header(
+    "BOSS直聘采集",
+    "通过 Chrome 扩展在页面内自动采集附件简历，完全绕过反检测。",
+    icon="icon/BOSS直聘.jpeg",
+)
 
 st.markdown(
     """
@@ -24,51 +27,54 @@ st.markdown(
 .vibe-page-title { background:transparent !important; border:0 !important; box-shadow:none !important; padding:0 !important; margin:0 0 12px !important; }
 .vibe-page-title h1 { font-size:30px !important; line-height:1.04 !important; font-weight:900 !important; letter-spacing:-.8px !important; }
 .vibe-page-title p { font-size:13px !important; margin-top:4px !important; }
-.boss-section-title { display:flex; align-items:baseline; gap:14px; flex-wrap:wrap; margin:14px 0 7px; padding:0 0 6px; border-bottom:2px solid #DDE7F2; color:#172033; font-size:22px; line-height:1.2; font-weight:900; letter-spacing:-.3px; background:transparent; }
-.boss-section-note { color:#B7791F; font-size:13px; font-weight:600; letter-spacing:0; }
-[data-testid="stVerticalBlockBorderWrapper"] { background:#FFFFFF !important; border:1px solid #E5EAF2 !important; border-radius:14px !important; box-shadow:none !important; }
+.boss-section-title { display:flex; align-items:baseline; gap:14px; flex-wrap:wrap; margin:14px 0 7px; padding:0 0 6px; border-bottom:2px solid var(--color-border); color:var(--color-text); font-size:22px; line-height:1.2; font-weight:900; letter-spacing:-.3px; background:transparent; }
+.boss-section-note { color:var(--color-warning); font-size:13px; font-weight:600; letter-spacing:0; }
+[data-testid="stVerticalBlockBorderWrapper"] { background:var(--color-surface) !important; border:1px solid var(--color-border) !important; border-radius:14px !important; box-shadow:none !important; }
 [data-testid="stVerticalBlockBorderWrapper"] [data-testid="stVerticalBlock"] { gap:.45rem !important; }
-[data-testid="stMetric"] { background:#FFFFFF; border:1px solid #EEF2F7; border-radius:12px; padding:7px 9px; }
-[data-testid="stMetricLabel"] { font-size:11px !important; color:#64748B !important; }
+[data-testid="stMetric"] { background:var(--color-surface); border:1px solid var(--color-border); border-radius:12px; padding:7px 9px; }
+[data-testid="stMetricLabel"] { font-size:11px !important; color:var(--color-text-secondary) !important; }
 [data-testid="stMetricValue"] { font-size:16px !important; line-height:1.18 !important; }
 [data-testid="stMetricDelta"] { font-size:11px !important; }
 .boss-info-text, .boss-info-text span { font-size:12px; line-height:1.45; }
-.boss-status-banner { min-height:58px; height:58px; box-sizing:border-box; background:#FFFFFF; border:1px solid #EEF2F7; border-radius:12px; padding:8px 10px; display:flex; flex-direction:column; justify-content:center; gap:3px; overflow:hidden; }
+.boss-status-banner { min-height:58px; height:58px; box-sizing:border-box; background:var(--color-surface); border:1px solid var(--color-border); border-radius:12px; padding:8px 10px; display:flex; flex-direction:column; justify-content:center; gap:3px; overflow:hidden; }
 .boss-status-banner.one-line { flex-direction:row; align-items:center; justify-content:space-between; gap:8px; }
-.boss-status-label { font-size:11px; color:#64748B; line-height:1; white-space:nowrap; }
-.boss-status-value { font-size:16px; font-weight:800; color:#172033; line-height:1.1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-.boss-status-sub { font-size:11px; color:#64748B; line-height:1.1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.boss-status-label { font-size:11px; color:var(--color-text-secondary); line-height:1; white-space:nowrap; }
+.boss-status-value { font-size:16px; font-weight:800; color:var(--color-text); line-height:1.1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.boss-status-sub { font-size:11px; color:var(--color-text-secondary); line-height:1.1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .boss-status-pair { display:flex; flex-direction:column; gap:5px; }
 .boss-status-pair div { white-space:nowrap; }
 .stButton > button, .stLinkButton > a { min-height:32px !important; padding:6px 12px !important; font-size:12px !important; border-radius:10px !important; white-space:nowrap !important; width:100% !important; }
-.boss-status-on { color:#168A45; font-weight:700; font-size:12px; }
-.boss-status-off { color:#94A3B8; font-size:12px; }
-.boss-path { display:block; clear:both; font-family:Consolas,monospace; font-size:12px; color:#475569; background:#F8FAFC; border:1px solid #E5EAF2; border-radius:10px; padding:8px 10px; word-break:break-all; margin-top:8px; }
+.boss-status-on { color:var(--color-success); font-weight:700; font-size:12px; }
+.boss-status-off { color:var(--color-text-muted); font-size:12px; }
+.boss-path { display:block; clear:both; font-family:Consolas,monospace; font-size:12px; color:var(--color-text-secondary); background:var(--color-bg-soft); border:1px solid var(--color-border); border-radius:10px; padding:8px 10px; word-break:break-all; margin-top:8px; }
 .boss-checklist { margin:0 0 0 18px; padding:0; }
 .boss-checklist li { margin:4px 0; line-height:1.38; font-size:12px; }
-.boss-log-box { height:300px; overflow-y:auto; background:#fff; border:1px solid #E5EAF2; border-radius:12px; padding:9px 10px; font-family:Consolas,monospace; font-size:12px; line-height:1.42; white-space:pre-wrap; }
+.boss-log-box { height:300px; overflow-y:auto; background:var(--color-surface); border:1px solid var(--color-border); border-radius:12px; padding:9px 10px; font-family:Consolas,monospace; font-size:12px; line-height:1.42; white-space:pre-wrap; color:var(--color-text); }
 .boss-auto-scroll-frame { width:100%; height:316px; border:0; display:block; }
-.boss-candidate-box { height:300px; overflow-y:auto; background:#fff; border:1px solid #E5EAF2; border-radius:12px; padding:0; font-size:12px; }
+.boss-candidate-box { height:300px; overflow-y:auto; background:var(--color-surface); border:1px solid var(--color-border); border-radius:12px; padding:0; font-size:12px; }
 .boss-candidate-table { width:100%; border-collapse:collapse; table-layout:fixed; }
-.boss-candidate-table th { position:sticky; top:0; z-index:1; background:#F8FAFC; color:#475569; font-size:12px; text-align:left; padding:8px 7px; border-bottom:1px solid #E5EAF2; }
-.boss-candidate-table td { color:#1F2937; padding:7px; border-bottom:1px solid #EEF2F7; vertical-align:top; word-break:break-all; }
+.boss-candidate-table th { position:sticky; top:0; z-index:1; background:var(--color-bg-soft); color:var(--color-text-secondary); font-size:12px; text-align:left; padding:8px 7px; border-bottom:1px solid var(--color-border); }
+.boss-candidate-table td { color:var(--color-text); padding:7px; border-bottom:1px solid var(--color-border); vertical-align:top; word-break:break-all; }
 .boss-candidate-table tr:last-child td { border-bottom:0; }
-.boss-candidate-status-downloaded { color:#168A45; font-weight:800; white-space:nowrap; }
-.boss-candidate-status-skipped { color:#B7791F; font-weight:800; white-space:nowrap; }
-.boss-empty-box { height:300px; overflow-y:auto; background:#fff; border:1px solid #E5EAF2; border-radius:12px; padding:9px 10px; color:#94A3B8; font-size:12px; }
-.boss-log-highlight { color:#E85D9E; font-weight:900; font-size:14px; }
-.boss-log-info { color:#1F2937; font-size:13px; }
-.boss-log-success { color:#168A45; font-weight:700; font-size:13px; }
-.boss-log-error { color:#C73552; font-weight:700; font-size:13px; }
-.boss-log-skipped { color:#B7791F; font-weight:700; font-size:13px; }
-.boss-log-stat { color:#2563EB; font-weight:700; font-size:13px; }
+.boss-candidate-status-downloaded { color:var(--color-success); font-weight:800; white-space:nowrap; }
+.boss-candidate-status-skipped { color:var(--color-warning); font-weight:800; white-space:nowrap; }
+.boss-empty-box { height:300px; overflow-y:auto; background:var(--color-surface); border:1px solid var(--color-border); border-radius:12px; padding:9px 10px; color:var(--color-text-muted); font-size:12px; }
+.boss-log-highlight { color:var(--color-accent); font-weight:900; font-size:14px; }
+.boss-log-info { color:var(--color-text); font-size:13px; }
+.boss-log-success { color:var(--color-success); font-weight:700; font-size:13px; }
+.boss-log-error { color:var(--color-danger); font-weight:700; font-size:13px; }
+.boss-log-skipped { color:var(--color-warning); font-weight:700; font-size:13px; }
+.boss-log-stat { color:var(--color-primary); font-weight:700; font-size:13px; }
 .plain-section-title { display:flex; align-items:center; justify-content:space-between; gap:12px; margin:18px 0 10px; }
-.plain-section-title h3 { margin:0; font-size:18px; line-height:1.3; color:#1F2937; }
-.collect-panel-stat { color:#4A90E2; font-size:14px; font-weight:700; white-space:nowrap; }
-.boss-result-title { display:flex; align-items:center; justify-content:space-between; gap:10px; margin:0 0 8px; min-height:22px; }
-.boss-result-title strong { color:#172033; font-size:14px; line-height:1.2; }
-.boss-result-title span { color:#4A90E2; font-size:12px; font-weight:700; line-height:1.25; text-align:right; }
+.plain-section-title h3 { margin:0; font-size:18px; line-height:1.3; color:var(--color-text); }
+.collect-panel-stat { color:var(--color-primary); font-size:14px; font-weight:700; white-space:nowrap; }
+.boss-result-title { display:flex; align-items:center; justify-content:space-between; gap:10px; margin:0 0 8px; min-height:26px; }
+.boss-result-title strong { color:var(--color-text); font-size:18px; line-height:1.3; font-weight:700; }
+.boss-result-title span { color:var(--color-primary); font-size:12px; font-weight:700; line-height:1.25; text-align:right; }
 [data-testid="stCaptionContainer"] { font-size:12px !important; }
+[data-testid="stSelectbox"] label, [data-testid="stSelectbox"] [data-testid="stWidgetLabel"] { padding-left:12px !important; }
+[data-testid="stCheckbox"] { padding-top:14px !important; padding-left:8px !important; }
+[data-testid="stCheckbox"] label, [data-testid="stCheckbox"] label p { font-size:15px !important; }
 </style>
 """,
     unsafe_allow_html=True,
@@ -238,25 +244,27 @@ def build_candidate_summary(runtime_state: dict) -> str:
 
 
 def render_auto_scroll_html(body_html: str, anchor: str, height: int = 316) -> None:
+    theme_vars = get_theme_css()
     components.html(
         f"""
 <style>
-html, body {{ margin:0; padding:0; background:transparent; font-family:Arial, 'Microsoft YaHei', sans-serif; font-size:12px; overflow:hidden; }}
-.boss-log-box {{ height:300px; overflow-y:auto; background:#fff; border:1px solid #E5EAF2; border-radius:12px; padding:9px 10px; font-family:Consolas, 'Microsoft YaHei', monospace; font-size:12px; line-height:1.42; white-space:pre-wrap; box-sizing:border-box; }}
-.boss-candidate-box {{ height:300px; overflow-y:auto; background:#fff; border:1px solid #E5EAF2; border-radius:12px; padding:0; font-size:12px; box-sizing:border-box; }}
+{theme_vars}
+html, body {{ margin:0; padding:0; background:transparent; font-family:Arial, 'Microsoft YaHei', sans-serif; font-size:12px; overflow:hidden; color:var(--color-text); }}
+.boss-log-box {{ height:300px; overflow-y:auto; background:var(--color-surface); border:1px solid var(--color-border); border-radius:12px; padding:9px 10px; font-family:Consolas, 'Microsoft YaHei', monospace; font-size:12px; line-height:1.42; white-space:pre-wrap; box-sizing:border-box; color:var(--color-text); }}
+.boss-candidate-box {{ height:300px; overflow-y:auto; background:var(--color-surface); border:1px solid var(--color-border); border-radius:12px; padding:0; font-size:12px; box-sizing:border-box; }}
 .boss-candidate-table {{ width:100%; border-collapse:collapse; table-layout:fixed; font-size:12px; }}
-.boss-candidate-table th {{ position:sticky; top:0; z-index:1; background:#F8FAFC; color:#475569; font-size:12px; text-align:left; padding:8px 7px; border-bottom:1px solid #E5EAF2; }}
-.boss-candidate-table td {{ color:#1F2937; padding:7px; border-bottom:1px solid #EEF2F7; vertical-align:top; word-break:break-all; font-size:12px; line-height:1.35; }}
+.boss-candidate-table th {{ position:sticky; top:0; z-index:1; background:var(--color-bg-soft); color:var(--color-text-secondary); font-size:12px; text-align:left; padding:8px 7px; border-bottom:1px solid var(--color-border); }}
+.boss-candidate-table td {{ color:var(--color-text); padding:7px; border-bottom:1px solid var(--color-border); vertical-align:top; word-break:break-all; font-size:12px; line-height:1.35; }}
 .boss-candidate-table tr:last-child td {{ border-bottom:0; }}
-.boss-candidate-status-downloaded {{ color:#168A45; font-weight:800; white-space:nowrap; }}
-.boss-candidate-status-skipped {{ color:#B7791F; font-weight:800; white-space:nowrap; }}
-.boss-empty-box {{ height:300px; overflow-y:auto; background:#fff; border:1px solid #E5EAF2; border-radius:12px; padding:9px 10px; color:#94A3B8; font-size:12px; box-sizing:border-box; }}
-.boss-log-highlight {{ color:#E85D9E; font-weight:900; font-size:12px; }}
-.boss-log-info {{ color:#1F2937; font-size:12px; }}
-.boss-log-success {{ color:#168A45; font-weight:700; font-size:12px; }}
-.boss-log-error {{ color:#C73552; font-weight:700; font-size:12px; }}
-.boss-log-skipped {{ color:#B7791F; font-weight:700; font-size:12px; }}
-.boss-log-stat {{ color:#2563EB; font-weight:700; font-size:12px; }}
+.boss-candidate-status-downloaded {{ color:var(--color-success); font-weight:800; white-space:nowrap; }}
+.boss-candidate-status-skipped {{ color:var(--color-warning); font-weight:800; white-space:nowrap; }}
+.boss-empty-box {{ height:300px; overflow-y:auto; background:var(--color-surface); border:1px solid var(--color-border); border-radius:12px; padding:9px 10px; color:var(--color-text-muted); font-size:12px; box-sizing:border-box; }}
+.boss-log-highlight {{ color:var(--color-accent); font-weight:900; font-size:12px; }}
+.boss-log-info {{ color:var(--color-text); font-size:12px; }}
+.boss-log-success {{ color:var(--color-success); font-weight:700; font-size:12px; }}
+.boss-log-error {{ color:var(--color-danger); font-weight:700; font-size:12px; }}
+.boss-log-skipped {{ color:var(--color-warning); font-weight:700; font-size:12px; }}
+.boss-log-stat {{ color:var(--color-primary); font-weight:700; font-size:12px; }}
 </style>
 <div id="{anchor}-wrap">{body_html}</div>
 <script>
@@ -280,14 +288,7 @@ setTimeout(scrollBossResultToBottom, 200);
     )
 
 
-@st.cache_resource
-def get_bridge() -> BossWSBridge:
-    server = BossWSServer()
-    server.start()
-    return BossWSBridge(server)
-
-
-bridge = get_bridge()
+bridge = get_boss_bridge()
 runtime = bridge.runtime_state
 ws_connected = bridge.ws_server.is_extension_connected
 is_running = runtime.get("running", False)

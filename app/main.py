@@ -6,7 +6,8 @@ from pathlib import Path
 import streamlit as st
 from sqlalchemy import case, func, select
 
-from components.layout import inject_vibe_style, page_header
+from components.bridges import get_boss_bridge, get_qiancheng_bridge
+from components.layout import icon_data_uri, inject_vibe_style
 from recruitment_assistant.config.settings import get_settings
 from recruitment_assistant.storage.db import create_session
 from recruitment_assistant.storage.models import CrawlTask
@@ -22,7 +23,6 @@ from recruitment_assistant.storage.resume_models import (
 settings = get_settings()
 st.set_page_config(page_title="简历智采助手", layout="wide", initial_sidebar_state="collapsed")
 inject_vibe_style("首页")
-page_header("首页", "用仪表盘统一查看三大招聘平台采集入口、简历沉淀与面试推进。")
 
 
 if "show_new_task_dialog" not in st.session_state:
@@ -204,8 +204,8 @@ def zhilian_login_status() -> str:
     return st.session_state.get("zhilian_login_status_default", "待登录")
 
 
-def session_login_status(platform_code: str) -> str:
-    return st.session_state.get(f"{platform_code}_login_status_default", "进入页面检测")
+def extension_status(connected: bool) -> tuple[str, str]:
+    return ("已连接", "ok") if connected else ("待连接", "muted")
 
 
 def status_class(text: str) -> str:
@@ -222,6 +222,8 @@ def platform_card_html(platform: dict, data: dict) -> str:
     collect_total = data["collect_totals"].get(code, 0)
     resume_total = data["platform_resume_counts"].get(code, 0)
     run_text = "运行中" if running else "待启动"
+    icon_uri = icon_data_uri(platform["icon"])
+    icon_inner = f'<img src="{icon_uri}" alt="{platform["name"]}">' if icon_uri else platform["name"][:1]
     return f"""
 <div class="home-platform-card">
   <div class="home-platform-head">
@@ -229,10 +231,10 @@ def platform_card_html(platform: dict, data: dict) -> str:
       <div class="home-platform-kicker">{platform['kicker']}</div>
       <h3>{platform['name']}</h3>
     </div>
-    <div class="home-platform-icon">{platform['icon']}</div>
+    <div class="home-platform-icon">{icon_inner}</div>
   </div>
   <div class="home-status-grid">
-    <div><span>登录状态</span><b class="home-status-{status_class(platform['login_status'])}">{platform['login_status']}</b></div>
+    <div><span>{platform['status_label']}</span><b class="home-status-{platform['status_class']}">{platform['status_text']}</b></div>
     <div><span>运行状态</span><b class="home-status-{status_class(run_text)}">{run_text}</b></div>
   </div>
   <div class="home-card-data">
@@ -265,67 +267,78 @@ def stat_row_html(title: str, subtitle: str, items: list[tuple[str, str, str]]) 
 
 
 home_data = load_home_dashboard_data()
+boss_ext_text, boss_ext_class = extension_status(get_boss_bridge().ws_server.is_extension_connected)
+qiancheng_ext_text, qiancheng_ext_class = extension_status(get_qiancheng_bridge().ws_server.is_extension_connected)
+zhilian_login_text = zhilian_login_status()
 platforms = [
     {
         "code": "zhilian",
         "name": "智联招聘",
         "kicker": "主动搜索 / 已投递",
-        "icon": "Z",
+        "icon": "icon/智联招聘.jpeg",
         "href": "/智联采集",
-        "login_status": zhilian_login_status(),
+        "status_label": "登录状态",
+        "status_text": zhilian_login_text,
+        "status_class": status_class(zhilian_login_text),
     },
     {
         "code": "boss",
         "name": "BOSS直聘",
         "kicker": "Chrome 扩展采集",
-        "icon": "B",
+        "icon": "icon/BOSS直聘.jpeg",
         "href": "/BOSS采集",
-        "login_status": session_login_status("boss"),
+        "status_label": "扩展连接",
+        "status_text": boss_ext_text,
+        "status_class": boss_ext_class,
     },
     {
         "code": "qiancheng",
         "name": "前程无忧",
         "kicker": "51job 附件简历",
-        "icon": "51",
+        "icon": "icon/前程无忧.jpeg",
         "href": "/51前程无忧采集",
-        "login_status": session_login_status("qiancheng"),
+        "status_label": "扩展连接",
+        "status_text": qiancheng_ext_text,
+        "status_class": qiancheng_ext_class,
     },
 ]
 
 dashboard_css = """
 <style>
 .vibe-page-title { margin-bottom:14px !important; }
-.home-dashboard-shell { max-width:1180px; margin:0 auto 24px; padding:26px; background:rgba(255,255,255,.86); border:1px solid #E5EAF2; border-radius:28px; box-shadow:0 24px 80px rgba(15,23,42,.10); }
+.home-dashboard-shell { max-width:1180px; margin:0 auto 24px; padding:26px; background:var(--color-surface); border:1px solid var(--color-border); border-radius:28px; box-shadow:var(--shadow-md, 0 24px 80px rgba(15,23,42,.10)); }
 .home-dashboard-title { display:flex; justify-content:space-between; align-items:flex-end; gap:16px; margin-bottom:18px; }
-.home-dashboard-title h2 { margin:0; color:#172033; font-size:24px; font-weight:900; letter-spacing:-.4px; }
-.home-dashboard-title p { margin:5px 0 0; color:#64748B; font-size:13px; }
-.home-refresh-note { color:#64748B; font-size:12px; white-space:nowrap; }
+.home-dashboard-title h2 { margin:0; color:var(--color-text); font-size:24px; font-weight:900; letter-spacing:-.4px; }
+.home-dashboard-title p { margin:5px 0 0; color:var(--color-text-secondary); font-size:13px; }
+.home-refresh-note { color:var(--color-text-secondary); font-size:12px; white-space:nowrap; }
 .home-platform-grid { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:12px; }
-.home-platform-card { min-height:292px; padding:20px; background:#FFFFFF; border:1px solid #E5EAF2; border-radius:22px; box-shadow:0 12px 34px rgba(15,23,42,.07); box-sizing:border-box; }
-.home-platform-head { display:flex; justify-content:space-between; gap:14px; align-items:flex-start; padding-bottom:14px; border-bottom:1px solid #EEF2F7; }
-.home-platform-kicker { color:#64748B; font-size:12px; font-weight:700; }
-.home-platform-head h3 { margin:5px 0 0; color:#172033; font-size:22px; font-weight:900; }
-.home-platform-icon { display:grid; place-items:center; width:46px; height:46px; color:#2563EB; font-size:18px; font-weight:900; background:#EFF6FF; border-radius:16px; }
+.home-platform-card { min-height:292px; padding:20px; background:var(--color-surface); border:1px solid var(--color-border); border-radius:22px; box-shadow:var(--shadow-sm, 0 12px 34px rgba(15,23,42,.07)); box-sizing:border-box; }
+.home-platform-head { display:flex; justify-content:space-between; gap:14px; align-items:flex-start; padding-bottom:14px; border-bottom:1px solid var(--color-border); }
+.home-platform-kicker { color:var(--color-text-secondary); font-size:12px; font-weight:700; }
+.home-platform-head h3 { margin:5px 0 0; color:var(--color-text); font-size:22px; font-weight:900; }
+.home-platform-icon { display:grid; place-items:center; overflow:hidden; width:46px; height:46px; color:var(--color-primary); font-size:18px; font-weight:900; background:var(--color-primary-soft); border-radius:16px; }
+.home-platform-icon img { width:100%; height:100%; object-fit:cover; display:block; }
 .home-status-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin:16px 0; }
-.home-status-grid div { padding:10px 11px; background:#F8FAFC; border:1px solid #EEF2F7; border-radius:14px; }
-.home-status-grid span, .home-card-data span, .home-stat-cell span { display:block; color:#64748B; font-size:12px; line-height:1.2; }
-.home-status-grid b { display:block; margin-top:5px; font-size:14px; }
-.home-status-ok { color:#168A45; }
-.home-status-warn { color:#B7791F; }
-.home-status-err { color:#C73552; }
+.home-status-grid div { padding:10px 11px; background:var(--color-bg-soft); border:1px solid var(--color-border); border-radius:14px; }
+.home-status-grid span, .home-card-data span, .home-stat-cell span { display:block; color:var(--color-text-secondary); font-size:12px; line-height:1.2; }
+.home-status-grid b { display:block; margin-top:5px; font-size:14px; color:var(--color-text); }
+.home-status-ok { color:var(--color-success) !important; }
+.home-status-warn { color:var(--color-warning) !important; }
+.home-status-err { color:var(--color-danger) !important; }
+.home-status-muted { color:var(--color-text-muted) !important; }
 .home-card-data { display:grid; grid-template-columns:repeat(3, 1fr); gap:10px; margin-bottom:16px; }
-.home-card-data div { padding:11px; background:#FFFFFF; border:1px solid #EEF2F7; border-radius:14px; text-align:center; }
-.home-card-data strong { display:block; margin-top:5px; color:#172033; font-size:20px; font-weight:900; }
+.home-card-data div { padding:11px; background:var(--color-surface); border:1px solid var(--color-border); border-radius:14px; text-align:center; }
+.home-card-data strong { display:block; margin-top:5px; color:var(--color-text); font-size:20px; font-weight:900; }
 .home-card-actions { display:flex; gap:10px; }
 .home-card-actions a, .home-card-actions a:link, .home-card-actions a:visited, .home-card-actions a:hover, .home-card-actions a:active { flex:1; justify-content:center; text-decoration:none !important; }
-.home-stat-panel { display:grid; grid-template-columns:180px 1fr; gap:18px; margin-top:18px; padding:18px; background:#FFFFFF; border:1px solid #E5EAF2; border-radius:22px; box-shadow:0 10px 28px rgba(15,23,42,.055); }
+.home-stat-panel { display:grid; grid-template-columns:180px 1fr; gap:18px; margin-top:18px; padding:18px; background:var(--color-surface); border:1px solid var(--color-border); border-radius:22px; box-shadow:var(--shadow-sm, 0 10px 28px rgba(15,23,42,.055)); }
 .home-stat-title { display:flex; flex-direction:column; justify-content:center; }
-.home-stat-title h3 { margin:0; color:#172033; font-size:19px; font-weight:900; }
-.home-stat-title p { margin:6px 0 0; color:#64748B; font-size:12px; line-height:1.45; }
+.home-stat-title h3 { margin:0; color:var(--color-text); font-size:19px; font-weight:900; }
+.home-stat-title p { margin:6px 0 0; color:var(--color-text-secondary); font-size:12px; line-height:1.45; }
 .home-stat-grid { display:grid; grid-template-columns:repeat(6, minmax(0, 1fr)); gap:10px; }
-.home-stat-cell { padding:13px 10px; text-align:center; background:#F8FAFC; border:1px solid #EEF2F7; border-radius:16px; box-sizing:border-box; }
-.home-stat-cell strong { display:block; margin-top:6px; color:#172033; font-size:24px; line-height:1.05; font-weight:900; }
-.home-stat-cell em { display:block; margin-top:5px; color:#94A3B8; font-size:11px; font-style:normal; }
+.home-stat-cell { padding:13px 10px; text-align:center; background:var(--color-bg-soft); border:1px solid var(--color-border); border-radius:16px; box-sizing:border-box; }
+.home-stat-cell strong { display:block; margin-top:6px; color:var(--color-text); font-size:24px; line-height:1.05; font-weight:900; }
+.home-stat-cell em { display:block; margin-top:5px; color:var(--color-text-muted); font-size:11px; font-style:normal; }
 @media (max-width: 980px) { .home-dashboard-shell { padding:18px; } .home-platform-grid, .home-stat-panel { grid-template-columns:1fr; } .home-stat-grid { grid-template-columns:repeat(2, 1fr); } .home-dashboard-title { align-items:flex-start; flex-direction:column; } }
 </style>
 """

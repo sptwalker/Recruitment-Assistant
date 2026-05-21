@@ -43,6 +43,21 @@ ROUND_LABELS = ["一面", "二面", "三面", "四面", "五面"]
 FILTERS = ["待面试", "第一轮面试", "第二轮面试", "第三轮以上面试", "已取消"]
 
 
+_CONCLUSION_COLORS = {
+    "通过": "#16a34a",
+    "待定": "#d97706",
+    "淘汰": "#dc2626",
+}
+
+
+def _conclusion_html(value: str | None) -> str:
+    text = value or "-"
+    color = _CONCLUSION_COLORS.get(text)
+    if not color:
+        return text
+    return f"<span style='color:{color}; font-weight:700'>{text}</span>"
+
+
 def _fmt_date(d) -> str:
     if not d:
         return ""
@@ -135,17 +150,17 @@ def _open_eval_dialog():
             <style>
             div[data-testid="stDialog"] div[role="dialog"] { max-width: 1040px; }
             .eval-page { padding: 2px 4px 0; }
-            .eval-name { font-size: 32px; font-weight: 900; color: #111; margin-bottom: 24px; }
-            .eval-basic { font-size: 15px; color: #111; margin-bottom: 30px; }
+            .eval-name { font-size: 32px; font-weight: 900; color: var(--color-text); margin-bottom: 24px; }
+            .eval-basic { font-size: 15px; color: var(--color-text); margin-bottom: 30px; }
             .eval-current { display:flex; align-items:baseline; justify-content:center; gap:12px; margin-top:44px; }
             .eval-current span { font-size:14px; font-weight:700; }
-            .eval-current b { font-size:42px; line-height:1; font-weight:500; color:#111; }
-            .eval-divider { height:1px; background:#d9d9d9; margin:0 0 22px; }
+            .eval-current b { font-size:42px; line-height:1; font-weight:500; color:var(--color-text); }
+            .eval-divider { height:1px; background:var(--color-border); margin:0 0 22px; }
             .eval-history-title { text-align:center; font-size:22px; font-weight:800; margin:0 0 28px; }
-            .eval-history-item { margin:0 0 58px 34px; color:#111; }
+            .eval-history-item { margin:0 0 58px 34px; color:var(--color-text); }
             .eval-history-round { font-size:24px; font-style:italic; font-weight:900; margin-bottom:14px; }
             .eval-history-line { font-size:15px; line-height:1.45; white-space:pre-wrap; }
-            .eval-empty-history { color:#94a3b8; text-align:center; margin-top:40px; }
+            .eval-empty-history { color:var(--color-text-muted); text-align:center; margin-top:40px; }
             </style>
             """,
             unsafe_allow_html=True,
@@ -215,7 +230,7 @@ def _open_eval_dialog():
                     f"<div class='eval-history-line'>时  间：{time_label}<br>"
                     f"方  式：{mode_label}<br>"
                     f"面试官：{ev.interviewer or '-'}<br>"
-                    f"结  论：{ev.conclusion or '-'}</div>"
+                    f"结  论：{_conclusion_html(ev.conclusion)}</div>"
                     f"</div>",
                     unsafe_allow_html=True,
                 )
@@ -249,7 +264,8 @@ def _open_eval_history_dialog():
             with st.container(border=True):
                 st.markdown(
                     f"**{ev.interview_round or '-'}** | 面试官：{ev.interviewer or '-'} | "
-                    f"评分：{ev.score or '-'}/5 | 结论：**{ev.conclusion or '-'}**"
+                    f"评分：{ev.score or '-'}/5 | 结论：{_conclusion_html(ev.conclusion)}",
+                    unsafe_allow_html=True,
                 )
                 if ev.notes:
                     st.caption(ev.notes)
@@ -296,8 +312,8 @@ def _open_abandon_dialog():
 st.markdown(
     """
     <style>
-    .interview-filter-note { color:#64748b; font-size:13px; margin-top:-6px; margin-bottom:10px; }
-    .interview-file-path { color:#111827; font-size:13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; padding-top:7px; }
+    .interview-filter-note { color:var(--color-text-secondary); font-size:13px; margin-top:-6px; margin-bottom:10px; }
+    .interview-file-path { color:var(--color-text); font-size:13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; padding-top:7px; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -395,14 +411,14 @@ try:
                 info_str = f"&nbsp;&nbsp;&nbsp;{'  |  '.join(info_parts)}" if info_parts else ""
                 h_cols[0].markdown(
                     f"<div style='margin:0; line-height:1.4; padding-top:10px;'>"
-                    f"<span style='font-size:22px; font-weight:700; color:#000;'>{cand.name}</span>"
-                    f"<span style='font-size:14px; color:#333;'>{info_str}</span></div>",
+                    f"<span style='font-size:22px; font-weight:700; color:var(--color-text);'>{cand.name}</span>"
+                    f"<span style='font-size:14px; color:var(--color-text-secondary);'>{info_str}</span></div>",
                     unsafe_allow_html=True,
                 )
                 h_cols[1].markdown(
                     f"<div style='text-align:right;'>"
-                    f"<span style='font-size:12px; color:#666;'>面试进度 </span>"
-                    f"<span style='font-size:32px; font-weight:700; color:#2563eb;'>{progress}</span>"
+                    f"<span style='font-size:12px; color:var(--color-text-muted);'>面试进度 </span>"
+                    f"<span style='font-size:32px; font-weight:700; color:var(--color-primary);'>{progress}</span>"
                     f"</div>",
                     unsafe_allow_html=True,
                 )
@@ -432,7 +448,7 @@ try:
                     contacts.append(f"📧 {cand.email}")
                 if cand.wechat:
                     contacts.append(f"💬 {cand.wechat}")
-                st.markdown(f"<div style='color:#000; font-size:14px; margin:4px 0;'>{' | '.join(contacts) if contacts else '无联系方式'}</div>", unsafe_allow_html=True)
+                st.markdown(f"<div style='color:var(--color-text); font-size:14px; margin:4px 0;'>{' | '.join(contacts) if contacts else '无联系方式'}</div>", unsafe_allow_html=True)
                 meta = [f"发起：{inv.create_time.strftime('%Y-%m-%d %H:%M') if inv.create_time else '-'}"]
                 if inv.notes:
                     meta.append(f"备注：{inv.notes}")

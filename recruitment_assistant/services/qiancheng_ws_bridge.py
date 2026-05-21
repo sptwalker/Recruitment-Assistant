@@ -25,7 +25,7 @@ from recruitment_assistant.utils.hash_utils import text_hash
 from recruitment_assistant.utils.snapshot_utils import safe_filename
 
 
-QIANCHENG_BRIDGE_VERSION = "1.7.0"
+QIANCHENG_BRIDGE_VERSION = "1.8.0"
 QIANCHENG_EXTENSION_EXPECTED_VERSION = "1.86.0"
 QIANCHENG_CONTENT_SCRIPT_EXPECTED_VERSION = "1.86.0"
 

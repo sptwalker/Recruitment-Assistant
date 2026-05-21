@@ -5,8 +5,9 @@ Tab 2: 简历库浏览（搜索 / 详情 / 删除 / 屏蔽 / 面试邀约）
 Tab 3: 招聘岗位录入/匹配（录入岗位 → AI 匹配候选人）
 """
 
+import importlib
 import os
-import time
+import re
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -15,18 +16,25 @@ import streamlit as st
 
 from components.layout import inject_vibe_style, page_header
 from recruitment_assistant.config.settings import get_settings
-from recruitment_assistant.parsers.pdf_resume_parser import (
-    extract_text_from_docx,
-    extract_text_from_pdf,
-    is_empty_or_corrupted,
-)
-from recruitment_assistant.schemas.resume_archive import CandidateCreate, ResumeSourceCreate
-from recruitment_assistant.services.resume_ai_service import ResumeAIService, normalize_platform
+import recruitment_assistant.parsers.pdf_resume_parser as resume_parser_module
+from recruitment_assistant.schemas.resume_archive import ResumeSourceCreate
+import recruitment_assistant.services.resume_ai_service as resume_ai_service_module
 from recruitment_assistant.services.resume_archive_service import ResumeArchiveService
 from recruitment_assistant.storage.resume_db import create_resume_session, init_resume_database
 from recruitment_assistant.storage.resume_models import JobPosition
 
+resume_parser_module = importlib.reload(resume_parser_module)
+extract_doc_text = resume_parser_module.extract_doc_text
+extract_text_from_docx = resume_parser_module.extract_text_from_docx
+extract_text_from_pdf = resume_parser_module.extract_text_from_pdf
+is_empty_or_corrupted = resume_parser_module.is_empty_or_corrupted
+
+resume_ai_service_module = importlib.reload(resume_ai_service_module)
+ResumeAIService = resume_ai_service_module.ResumeAIService
+normalize_platform = resume_ai_service_module.normalize_platform
+
 init_resume_database()
+get_settings.cache_clear()
 settings = get_settings()
 
 st.set_page_config(page_title="简历管理", layout="wide", initial_sidebar_state="collapsed")
@@ -35,15 +43,15 @@ page_header("简历分析管理", "自动解析入库、浏览管理、岗位匹
 
 
 @st.cache_resource
-def get_ai_service() -> ResumeAIService:
+def get_ai_service(api_key: str, base_url: str, model: str) -> ResumeAIService:
     return ResumeAIService(
-        api_key=settings.ai_api_key,
-        base_url=settings.ai_base_url,
-        model=settings.ai_model,
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
     )
 
 
-ai_service = get_ai_service()
+ai_service = get_ai_service(settings.ai_api_key, settings.ai_base_url, settings.ai_model)
 
 RESUME_DIRS = {
     "BOSS直聘": settings.attachment_dir / "boss",
@@ -75,9 +83,59 @@ def extract_text(path: Path) -> str:
     suffix = path.suffix.lower()
     if suffix == ".pdf":
         return extract_text_from_pdf(path)
-    elif suffix in (".docx", ".doc"):
+    elif suffix == ".docx":
         return extract_text_from_docx(path)
+    elif suffix == ".doc":
+        return extract_doc_text(path)
     return ""
+
+
+def should_skip_empty_or_corrupted(path: Path) -> bool:
+    """页面侧最终判定：老 .doc 优先用当前进程内重载后的提取器检测，避免旧缓存误判。"""
+    if path.suffix.lower() == ".doc":
+        try:
+            return len(extract_doc_text(path).strip()) < 50
+        except Exception:
+            return True
+    return is_empty_or_corrupted(path)
+
+
+def infer_candidate_from_filename(file_name: str) -> tuple[str | None, int | None, str | None]:
+    """从标准附件名中提取姓名/年龄/学历，用于 AI 调用前预去重。"""
+    stem = Path(file_name).stem
+    parts = [part.strip() for part in re.split(r"[-_｜|]", stem) if part.strip()]
+    name = parts[0] if parts else None
+    age = None
+    education_level = None
+    for part in parts[1:5]:
+        age_match = re.search(r"(\d{1,2})\s*岁", part)
+        if age_match:
+            age = int(age_match.group(1))
+        if part in {"高中", "中专", "大专", "专科", "本科", "硕士", "研究生", "博士"}:
+            education_level = "硕士" if part == "研究生" else ("大专" if part == "专科" else part)
+    if name and not re.search(r"[\u4e00-\u9fffA-Za-z]", name):
+        name = None
+    return name, age, education_level
+
+
+def filter_duplicate_files_before_ai(files: list[dict]) -> tuple[list[dict], list[str]]:
+    """在调用 AI 前用文件名里的姓名/年龄/学历先查库去重，减少 AI 流量消耗。"""
+    if not files:
+        return [], []
+    kept: list[dict] = []
+    skipped: list[str] = []
+    session = create_resume_session()
+    try:
+        svc = ResumeArchiveService(session)
+        for file_info in files:
+            name, age, education_level = infer_candidate_from_filename(file_info["name"])
+            if name and svc.is_duplicate(name=name, age=age, education_level=education_level):
+                skipped.append(f"{name}（{file_info['name']}）")
+            else:
+                kept.append(file_info)
+    finally:
+        session.close()
+    return kept, skipped
 
 
 # ==================== 3 Tab 页面 ====================
@@ -156,7 +214,7 @@ with tabs[0]:
             ).isoformat()
             lines.append(f"  ⏰ 当前日期过滤：≥ {since_repr}（可在按钮行调整）")
             if ai_service.is_configured:
-                lines.append("  👉 点击下方「开始自动解析入库」按钮启动任务")
+                lines.append("  👉 点击下方「自动解析入库」按钮启动任务")
             else:
                 lines.append("  ⚠️ AI 未配置，「开始」按钮已禁用")
         lines.append("")
@@ -171,15 +229,28 @@ with tabs[0]:
     def render_log_window() -> None:
         # 只保留最后 500 行展示，避免 DOM 过大
         recent = st.session_state.parse_log_lines[-500:]
-        # column-reverse + 倒序数组 → 最新行渲染在底部，scrollbar 默认贴底
+        # 按追加顺序渲染：旧信息在上，新信息继续向下输出
+        def _log_row_class(line: str) -> str:
+            if any(token in line for token in ("❌", "⚠️", "失败", "跳过", "异常", "损坏", "过短")):
+                return "log-row log-row-error"
+            return "log-row"
+
         escaped_rows = "".join(
-            f"<div class='log-row'>{_html.escape(line) or '&nbsp;'}</div>"
-            for line in reversed(recent)
+            f"<div class='{_log_row_class(line)}'>{_html.escape(line) or '&nbsp;'}</div>"
+            for line in recent
         )
         html = f"""
-        <div class='resume-log-window'>
+        <div id='resume-log-window' class='resume-log-window'>
           {escaped_rows}
         </div>
+        <script>
+          setTimeout(() => {{
+            const logWindow = document.getElementById('resume-log-window');
+            if (logWindow) {{
+              logWindow.scrollTop = logWindow.scrollHeight;
+            }}
+          }}, 0);
+        </script>
         <style>
           .resume-log-window {{
             height: 460px;
@@ -195,11 +266,13 @@ with tabs[0]:
             white-space: pre-wrap;
             word-break: break-all;
             user-select: text;            /* 允许选中文字 */
-            display: flex;
-            flex-direction: column-reverse; /* 最新行贴底显示 */
           }}
           .resume-log-window .log-row {{
             color: #1f2328;
+          }}
+          .resume-log-window .log-row-error {{
+            color: #d1242f;
+            font-weight: 700;
           }}
           .resume-log-window::-webkit-scrollbar {{ width: 10px; }}
           .resume-log-window::-webkit-scrollbar-track {{ background: #f6f8fa; }}
@@ -238,8 +311,26 @@ with tabs[0]:
             f"<div style='{_label_style}'>请选择最远整理日期</div>",
             unsafe_allow_html=True,
         )
-        # 把 date_input 塞进左半子列，宽度缩到 picker 列的一半
-        _picker_sub_cols = st.columns([1, 1])
+        st.markdown(
+            """
+            <style>
+            div[data-testid="stDateInput"] input[aria-label="请选择最远整理日期"] {
+                min-width: 190px !important;
+                width: 190px !important;
+                font-size: 17px !important;
+                font-weight: 700 !important;
+                padding: 10px 12px !important;
+            }
+            div[data-testid="stDateInput"] div[data-baseweb="input"] {
+                min-width: 190px !important;
+                width: 190px !important;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+        # 放宽 date_input 子列，让日期控件显示更宽
+        _picker_sub_cols = st.columns([1.35, 0.65])
         with _picker_sub_cols[0]:
             since = st.date_input(
                 "请选择最远整理日期",
@@ -254,7 +345,7 @@ with tabs[0]:
 
     if is_idle:
         start_btn = btn_cols[1].button(
-            "🚀 开始自动解析入库",
+            "🚀 自动解析入库",
             type="primary",
             disabled=(not ai_service.is_configured) or (not all_files),
             key="parse_start_btn",
@@ -299,14 +390,15 @@ with tabs[0]:
             f for f in all_files
             if datetime.fromtimestamp(f["path"].stat().st_mtime) >= since_dt
         ]
+        filtered_files, pre_skip_files = filter_duplicate_files_before_ai(filtered_files)
         st.session_state.parse_queue = filtered_files
         st.session_state.parse_index = 0
         st.session_state.parse_results = {
             "success_count": 0,
-            "skip_count": 0,
+            "skip_count": len(pre_skip_files),
             "fail_count": 0,
             "success_files": [],
-            "skip_files": [],
+            "skip_files": pre_skip_files,
             "failed_files": {
                 "空白/损坏": [],
                 "文本过短": [],
@@ -319,7 +411,8 @@ with tabs[0]:
         st.session_state.parse_log_lines.append("─" * 60)
         st.session_state.parse_log_lines.append(f"[{ts}] 🚀 解析任务开始")
         st.session_state.parse_log_lines.append(f"  日期过滤：≥ {st.session_state.parse_since_date.isoformat()}")
-        st.session_state.parse_log_lines.append(f"  待处理简历：{len(filtered_files)} 份（原始扫描 {len(all_files)} 份）")
+        st.session_state.parse_log_lines.append(f"  AI 调用前预去重跳过：{len(pre_skip_files)} 份")
+        st.session_state.parse_log_lines.append(f"  待 AI 处理简历：{len(filtered_files)} 份（原始扫描 {len(all_files)} 份）")
         st.session_state.parse_log_lines.append("─" * 60)
         st.rerun()
 
@@ -393,7 +486,7 @@ with tabs[0]:
         log(f"[{idx+1}/{len(queue)}] 🔍 处理：{fname}（{platform}）")
 
         # 1) 空白/损坏检测
-        if is_empty_or_corrupted(path):
+        if should_skip_empty_or_corrupted(path):
             log("           ⚠️ 跳过 — 文件空白或损坏")
             results["failed_files"]["空白/损坏"].append(fname)
             results["fail_count"] += 1
@@ -410,7 +503,7 @@ with tabs[0]:
                 candidate_data = None
                 ai_failed = False
                 try:
-                    candidate_data = ai_service.parse_resume_text(raw_text)
+                    candidate_data = ai_service.parse_resume_text(raw_text, source_name=fname)
                 except Exception as exc:
                     # pydantic ValidationError 是多行的，首行只是计数（"1 validation error for ..."）,
                     # 后续行才有 字段路径 / 实际值 / 错误类型，必须一并打到日志里才能定位 bug

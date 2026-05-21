@@ -11,6 +11,7 @@ from components.layout import (
     page_header,
     save_current_theme,
 )
+from recruitment_assistant.config.settings import get_settings
 from recruitment_assistant.platforms.zhilian.adapter import ZhilianAdapter
 from recruitment_assistant.schemas.raw_resume import RawResumeCreate
 from recruitment_assistant.services.raw_resume_service import RawResumeService
@@ -20,6 +21,54 @@ from recruitment_assistant.storage.db import create_session
 st.set_page_config(page_title="系统设置", layout="wide", initial_sidebar_state="collapsed")
 inject_vibe_style("系统设置")
 page_header("系统设置", "管理账号登录态、采集策略、风控参数与通知方式。")
+
+
+@st.dialog("API Key测试")
+def open_ai_api_key_test_dialog():
+    config = st.session_state.get("ai_api_test_config") or {}
+    api_key = (config.get("api_key") or "").strip()
+    base_url = (config.get("base_url") or "").strip()
+    model = (config.get("model") or "").strip()
+
+    st.markdown("### AI API 接口检测")
+    st.write(f"API Base URL：`{base_url or '-'}`")
+    st.write(f"模型名称：`{model or '-'}`")
+
+    if not api_key:
+        st.error("API Key 为空，请先输入 API Key。")
+        return
+    if not base_url:
+        st.error("API Base URL 为空，请先填写接口地址。")
+        return
+    if not model:
+        st.error("模型名称为空，请先填写模型名称。")
+        return
+
+    try:
+        from openai import OpenAI
+
+        started_at = time.perf_counter()
+        with st.spinner("正在调用 AI API 进行连通性检测..."):
+            client = OpenAI(api_key=api_key, base_url=base_url)
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": "你是接口连通性检测助手，只回复 OK。"},
+                    {"role": "user", "content": "请回复 OK，用于测试 API Key 是否可用。"},
+                ],
+                temperature=0,
+                max_tokens=8,
+                timeout=20,
+            )
+        elapsed = time.perf_counter() - started_at
+        content = (resp.choices[0].message.content or "").strip()
+        st.success("AI API 接口正常，API Key 可用。")
+        st.write(f"响应耗时：`{elapsed:.2f}s`")
+        st.write(f"接口返回：`{content or '空响应'}`")
+    except Exception as exc:
+        st.error("AI API 接口检测失败，当前 API Key 或接口配置不可用。")
+        st.code(str(exc))
+
 
 tabs = st.tabs(["账号", "采集", "风控", "通知", "AI模型", "主题风格"])
 
@@ -122,8 +171,12 @@ with tabs[4]:
     current_url = _get_env_value("AI_BASE_URL") or "https://api.deepseek.com/v1"
     current_model = _get_env_value("AI_MODEL") or "deepseek-chat"
 
-    ai_api_key = st.text_input("API Key", value=current_key, type="password", key="ai_api_key_input",
-                               help="DeepSeek / 通义千问 / OpenAI 的 API Key")
+    api_key_col, api_test_col = st.columns([0.78, 0.22])
+    with api_key_col:
+        ai_api_key = st.text_input("API Key", value=current_key, type="password", key="ai_api_key_input",
+                                   help="DeepSeek / 通义千问 / OpenAI 的 API Key")
+    api_test_col.markdown("<div style='height: 28px'></div>", unsafe_allow_html=True)
+    test_ai_api_clicked = api_test_col.button("API检测", key="test_ai_api_key", use_container_width=True)
     presets = {
         "DeepSeek": ("https://api.deepseek.com/v1", "deepseek-chat"),
         "通义千问": ("https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen-plus"),
@@ -135,6 +188,13 @@ with tabs[4]:
     preset_url, preset_model = presets[preset_choice]
     ai_base_url = st.text_input("API Base URL", value=preset_url, key="ai_base_url_input")
     ai_model = st.text_input("模型名称", value=preset_model, key="ai_model_input")
+    if test_ai_api_clicked:
+        st.session_state["ai_api_test_config"] = {
+            "api_key": ai_api_key,
+            "base_url": ai_base_url,
+            "model": ai_model,
+        }
+        open_ai_api_key_test_dialog()
 
     if st.button("💾 保存 AI 配置", key="save_ai_config"):
         new_env = {"AI_API_KEY": ai_api_key, "AI_BASE_URL": ai_base_url, "AI_MODEL": ai_model}
@@ -146,7 +206,8 @@ with tabs[4]:
                     existing[k.strip()] = v.strip()
         existing.update(new_env)
         env_path.write_text("\n".join(f"{k}={v}" for k, v in existing.items()) + "\n", encoding="utf-8")
-        st.success("AI 配置已保存到 .env 文件。重启 Streamlit 后生效。")
+        get_settings.cache_clear()
+        st.success("AI 配置已保存到 .env 文件，配置缓存已刷新；请重新进入简历管理后再执行自动解析入库。")
     st.markdown('</div>', unsafe_allow_html=True)
 
 with tabs[5]:

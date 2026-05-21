@@ -89,6 +89,38 @@ def _unwrap_candidate_envelope(data: dict) -> dict:
     return data
 
 
+def _guess_name_from_source(source_name: str | None) -> str | None:
+    """从附件文件名中兜底提取候选人姓名，如：李晓博-32岁-本科-BOSS直聘-xxx.pdf。"""
+    if not source_name:
+        return None
+    name = source_name.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    name = re.sub(r"\.(pdf|docx?|PDF|DOCX?)$", "", name).strip()
+    for sep in ("-", "_", " ", "（", "("):
+        if sep in name:
+            name = name.split(sep, 1)[0].strip()
+            break
+    if not name or name.lower() in {"resume", "cv", "简历"}:
+        return None
+    if re.search(r"[\u4e00-\u9fffA-Za-z]", name):
+        return name[:32]
+    return None
+
+
+def _ensure_candidate_name(data: dict, source_name: str | None = None) -> dict:
+    """确保 CandidateCreate 必填 name 为有效字符串，避免 AI 返回 null 造成整份简历失败。"""
+    if not isinstance(data, dict):
+        return data
+    name = data.get("name")
+    if isinstance(name, str) and name.strip():
+        data["name"] = name.strip()
+        return data
+    fallback_name = _guess_name_from_source(source_name) or "未知候选人"
+    data["name"] = fallback_name
+    logger.warning("AI 未返回有效姓名，已使用兜底姓名：{}", fallback_name)
+    return data
+
+
+
 _SYSTEM_PROMPT_TEMPLATE = """你是一个专业的简历解析助手。把下列简历纯文本结构化为标准 JSON 对象。
 
 # 输出结构
@@ -116,7 +148,7 @@ JSON 顶层就是一个候选人对象，**不要**再嵌套 `candidates` 之类
 # 顶层字段表
 
 ## 候选人主信息（直接放在顶层，不要嵌套）
-- name (str, 必填)：姓名。中文名/英文名/单字名都要识别。
+- name (str, 必填)：姓名。中文名/英文名/单字名都要识别。name 绝不能返回 null；如果简历正文没有姓名，优先从附件文件名/文本开头提取；仍无法识别时返回 "未知候选人"。
 - gender (str)：性别，只能是 "男" / "女"。从姓名/称谓/简历头部识别。
 - age (int)：年龄。识别优先级：(1) 简历明确写"XX岁"取值 (2) 只写出生日期 → 用 {current_year} 减去出生年得到 (3) 简历只写工作年限或毕业年 → 不要硬猜，留 null。
 - birth_date (str|null)：出生日期 YYYY-MM-DD，可只到年/月。
@@ -174,7 +206,7 @@ JSON 顶层就是一个候选人对象，**不要**再嵌套 `candidates` 之类
 # 通用规则
 
 1. 输出**严格 JSON 对象**（不是数组），不要 markdown 代码块、不要解释文字。
-2. 任何字段无法识别就返回 null，不要编造。
+2. 除 name 外，任何字段无法识别就返回 null，不要编造；name 必须返回有效字符串。
 3. 日期统一 YYYY-MM-DD，缺月份用 -01 补齐，"至今/在职" → null。
 4. 手机号、邮箱、微信若简历有多个，取主要一个。
 5. 数组字段（educations / work_experiences 等）若简历完全没有该信息就返回空数组 []，不是 null。
@@ -204,7 +236,7 @@ class ResumeAIService:
     def is_configured(self) -> bool:
         return bool(self.api_key)
 
-    def parse_resume_text(self, raw_text: str) -> CandidateCreate | None:
+    def parse_resume_text(self, raw_text: str, source_name: str | None = None) -> CandidateCreate | None:
         """调 LLM 将纯文本简历结构化为 CandidateCreate。"""
         if not self.is_configured:
             raise RuntimeError("AI API Key 未配置，请在 .env 文件中设置 AI_API_KEY")
@@ -215,7 +247,7 @@ class ResumeAIService:
                 model=self.model,
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": f"请解析以下简历：\n\n{raw_text[:MAX_RESUME_TEXT_CHARS]}"},
+                    {"role": "user", "content": f"附件文件名：{source_name or '-'}\n\n请解析以下简历：\n\n{raw_text[:MAX_RESUME_TEXT_CHARS]}"},
                 ],
                 temperature=0.1,
                 timeout=60,
@@ -230,6 +262,7 @@ class ResumeAIService:
             content = content.strip()
             data = json.loads(content)
             data = _unwrap_candidate_envelope(data)
+            data = _ensure_candidate_name(data, source_name)
             return CandidateCreate(**data)
         except json.JSONDecodeError as exc:
             logger.warning("AI 返回内容非合法 JSON：{}", exc)

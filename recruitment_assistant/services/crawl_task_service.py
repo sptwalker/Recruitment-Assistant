@@ -121,6 +121,11 @@ class BossCandidateRecordService:
         stmt = select(BossCandidateRecord.candidate_signature).where(BossCandidateRecord.platform_code == platform_code)
         return {str(signature) for signature in self.session.execute(stmt).scalars() if signature}
 
+    def count_records(self, platform_code: str = "boss") -> int:
+        self.ensure_table()
+        stmt = select(func.count(BossCandidateRecord.id)).where(BossCandidateRecord.platform_code == platform_code)
+        return int(self.session.scalar(stmt) or 0)
+
     def clear_records(self, platform_code: str = "boss") -> int:
         self.ensure_table()
         result = self.session.execute(delete(BossCandidateRecord).where(BossCandidateRecord.platform_code == platform_code))

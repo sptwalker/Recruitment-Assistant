@@ -5,15 +5,23 @@ from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
+from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 
 from components.layout import inject_vibe_style, page_header
 from recruitment_assistant.config.settings import get_settings
 from recruitment_assistant.services.resume_ai_service import ResumeAIService
 from recruitment_assistant.services.resume_archive_service import ResumeArchiveService
 from recruitment_assistant.storage.resume_db import create_resume_session, init_resume_database
-from recruitment_assistant.storage.resume_models import JobPosition
+from recruitment_assistant.storage.resume_models import Candidate, InterviewEvaluation, JobPosition
 
-init_resume_database()
+
+@st.cache_resource
+def ensure_resume_database_initialized() -> None:
+    init_resume_database()
+
+
+ensure_resume_database_initialized()
 settings = get_settings()
 
 st.set_page_config(page_title="面试管理", layout="wide", initial_sidebar_state="collapsed")
@@ -22,15 +30,15 @@ page_header("面试管理", "集中跟进待面试、面试轮次、评价记录
 
 
 @st.cache_resource
-def get_ai_service() -> ResumeAIService:
+def get_ai_service(api_key: str, base_url: str, model: str) -> ResumeAIService:
     return ResumeAIService(
-        api_key=settings.ai_api_key,
-        base_url=settings.ai_base_url,
-        model=settings.ai_model,
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
     )
 
 
-ai_service = get_ai_service()
+ai_service = get_ai_service(settings.ai_api_key, settings.ai_base_url, settings.ai_model)
 ROUND_LABELS = ["一面", "二面", "三面", "四面", "五面"]
 FILTERS = ["待面试", "第一轮面试", "第二轮面试", "第三轮以上面试", "已取消"]
 
@@ -103,7 +111,7 @@ def _open_eval_dialog():
     session = create_resume_session()
     svc = ResumeArchiveService(session)
     try:
-        inv = next((item for item in svc.list_invitations(status=None) if item.invitation_id == inv_id), None)
+        inv = svc.get_invitation(inv_id)
         if not inv:
             st.error("面试邀约不存在")
             return
@@ -224,7 +232,7 @@ def _open_eval_history_dialog():
     session = create_resume_session()
     svc = ResumeArchiveService(session)
     try:
-        inv = next((item for item in svc.list_invitations(status=None) if item.invitation_id == inv_id), None)
+        inv = svc.get_invitation(inv_id)
         if not inv:
             st.error("面试邀约不存在")
             return
@@ -262,7 +270,7 @@ def _open_abandon_dialog():
     session = create_resume_session()
     svc = ResumeArchiveService(session)
     try:
-        inv = next((item for item in svc.list_invitations(status=None) if item.invitation_id == inv_id), None)
+        inv = svc.get_invitation(inv_id)
         if not inv:
             st.error("面试邀约不存在")
             return
@@ -299,13 +307,36 @@ session = create_resume_session()
 svc = ResumeArchiveService(session)
 try:
     all_invitations = svc.list_invitations(status=None)
-    positions_map = {p.position_id: p for p in svc.list_positions()}
+    positions_map = {p.position_id: p for p in session.scalars(select(JobPosition)).all()}
+    candidate_ids = sorted({inv.candidate_id for inv in all_invitations if inv.candidate_id})
+    candidates_map = {}
+    evals_map = {}
+    if candidate_ids:
+        candidates = session.scalars(
+            select(Candidate)
+            .where(Candidate.candidate_id.in_(candidate_ids))
+            .options(
+                selectinload(Candidate.educations),
+                selectinload(Candidate.work_experiences),
+                selectinload(Candidate.skills),
+                selectinload(Candidate.resume_source),
+            )
+        ).all()
+        candidates_map = {cand.candidate_id: cand for cand in candidates}
+        eval_rows = session.scalars(
+            select(InterviewEvaluation)
+            .where(InterviewEvaluation.candidate_id.in_(candidate_ids))
+            .order_by(InterviewEvaluation.eval_id.desc())
+        ).all()
+        for ev in eval_rows:
+            evals_map.setdefault(ev.candidate_id, []).append(ev)
+
     rows = []
     for inv in all_invitations:
-        cand = svc.get_candidate(inv.candidate_id)
+        cand = candidates_map.get(inv.candidate_id)
         if not cand:
             continue
-        evals = svc.list_interview_evals(cand.candidate_id)
+        evals = evals_map.get(cand.candidate_id, [])
         eval_count = len(evals)
         rows.append({
             "inv": inv,

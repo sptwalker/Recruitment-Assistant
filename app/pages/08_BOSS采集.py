@@ -10,7 +10,7 @@ import streamlit.components.v1 as components
 from components.layout import inject_vibe_style, page_header
 from recruitment_assistant.config.settings import get_settings
 from recruitment_assistant.services.boss_ws_bridge import BossWSBridge
-from recruitment_assistant.services.crawl_task_service import CrawlTaskService
+from recruitment_assistant.services.crawl_task_service import BossCandidateRecordService, CrawlTaskService
 from recruitment_assistant.services.ws_server import BossWSServer
 from recruitment_assistant.storage.db import create_session
 
@@ -122,7 +122,8 @@ def translate_boss_detail(value: str) -> str:
     return mapping.get(value, value)
 
 
-def render_boss_history_task_table() -> None:
+@st.cache_data(ttl=30)
+def load_boss_history_rows() -> tuple[list[dict], int, int]:
     status_mapping = {
         "running": "运行中",
         "success": "成功",
@@ -130,11 +131,37 @@ def render_boss_history_task_table() -> None:
         "failed": "失败",
         "pending": "待开始",
     }
+    with create_session() as session:
+        task_service = CrawlTaskService(session)
+        task_rows = task_service.list_tasks(limit=50, platform_code="boss")
+        success_task_count, success_resume_count = task_service.success_summary(platform_code="boss")
+        rows = [
+            {
+                "批次ID": row.id,
+                "时间": row.started_at.strftime("%Y-%m-%d %H:%M:%S") if row.started_at else "",
+                "目标网站": "BOSS直聘",
+                "目标数量": row.planned_count or 0,
+                "获取数量": row.success_count,
+                "跳过数量": row.failed_count,
+                "耗时": f"{int((row.finished_at - row.started_at).total_seconds())}秒" if row.started_at and row.finished_at else "运行中",
+                "状态": status_mapping.get(row.status, row.status),
+                "任务名称": row.task_name,
+                "错误信息": (row.error_message or "")[:80],
+            }
+            for row in task_rows
+        ]
+        return rows, success_task_count, success_resume_count
+
+
+@st.cache_data(ttl=30)
+def load_boss_dedup_record_count() -> int:
+    with create_session() as session:
+        return BossCandidateRecordService(session).count_records("boss")
+
+
+def render_boss_history_task_table() -> None:
     try:
-        with create_session() as session:
-            task_service = CrawlTaskService(session)
-            task_rows = task_service.list_tasks(limit=50, platform_code="boss")
-            success_task_count, success_resume_count = task_service.success_summary(platform_code="boss")
+        task_rows, success_task_count, success_resume_count = load_boss_history_rows()
     except Exception as exc:
         st.warning(f"历史批次任务读取失败：{exc}")
         task_rows = []
@@ -149,21 +176,7 @@ def render_boss_history_task_table() -> None:
         unsafe_allow_html=True,
     )
     st.dataframe(
-        [
-            {
-                "批次ID": row.id,
-                "时间": row.started_at.strftime("%Y-%m-%d %H:%M:%S") if row.started_at else "",
-                "目标网站": "BOSS直聘",
-                "目标数量": row.planned_count or 0,
-                "获取数量": row.success_count,
-                "跳过数量": row.failed_count,
-                "耗时": f"{int((row.finished_at - row.started_at).total_seconds())}秒" if row.started_at and row.finished_at else "运行中",
-                "状态": status_mapping.get(row.status, row.status),
-                "任务名称": row.task_name,
-                "错误信息": (row.error_message or "")[:80],
-            }
-            for row in task_rows
-        ],
+        task_rows,
         use_container_width=True,
         hide_index=True,
     )
@@ -349,7 +362,7 @@ with st.container(border=True):
         collect_minutes = 0
     request_resume_if_missing = top_cols[2].checkbox("索要简历", value=False)
     try:
-        current_dedup_total = len(bridge._load_boss_candidate_keys())
+        current_dedup_total = load_boss_dedup_record_count()
     except Exception:
         current_dedup_total = 0
     top_cols[3].metric("当前去重记录数", current_dedup_total)
@@ -403,9 +416,12 @@ with st.container(border=True):
                 at = html.escape(entry.get("at", ""))
                 css_class = classify_boss_log(raw_msg, level)
                 log_html += f'<div class="{css_class}">[{at}] {msg}</div>'
-            render_auto_scroll_html(f'<div class="boss-log-box">{log_html}</div>', "boss-log-bottom")
+            if is_running:
+                render_auto_scroll_html(f'<div class="boss-log-box">{log_html}</div>', "boss-log-bottom")
+            else:
+                st.markdown(f'<div class="boss-log-box">{log_html}</div>', unsafe_allow_html=True)
         else:
-            render_auto_scroll_html('<div class="boss-empty-box">等待采集开始...</div>', "boss-log-bottom")
+            st.markdown('<div class="boss-empty-box">等待采集开始...</div>', unsafe_allow_html=True)
 
     with result_cols[1]:
         render_result_title("候选人列表", build_candidate_summary(runtime))
@@ -433,9 +449,12 @@ with st.container(border=True):
                 "<thead><tr><th>姓名</th><th>年龄</th><th>学历</th><th>状态</th><th>详情</th><th>时间</th></tr></thead>"
                 f"<tbody>{candidate_rows}</tbody></table></div>"
             )
-            render_auto_scroll_html(table_html, "boss-candidate-bottom")
+            if is_running:
+                render_auto_scroll_html(table_html, "boss-candidate-bottom")
+            else:
+                st.markdown(table_html, unsafe_allow_html=True)
         else:
-            render_auto_scroll_html('<div class="boss-empty-box">暂无候选人。采集后会自动出现在这里。</div>', "boss-candidate-bottom")
+            st.markdown('<div class="boss-empty-box">暂无候选人。采集后会自动出现在这里。</div>', unsafe_allow_html=True)
 
 # --- History Tasks ---
 if not is_running:

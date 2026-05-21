@@ -24,8 +24,14 @@ from recruitment_assistant.storage.resume_db import init_resume_database
 from recruitment_assistant.storage.models import RawResume
 from recruitment_assistant.utils.hash_utils import text_hash
 
-init_database()
-init_resume_database()
+
+@st.cache_resource
+def ensure_collect_databases_initialized() -> None:
+    init_database()
+    init_resume_database()
+
+
+ensure_collect_databases_initialized()
 
 settings = get_settings()
 st.set_page_config(page_title="采集任务", layout="wide", initial_sidebar_state="collapsed")
@@ -565,12 +571,30 @@ if hasattr(st, "fragment"):
 else:
     render_auto_status_and_candidates_panel = render_live_status_and_candidates_panel
 
+@st.cache_data(ttl=30)
+def load_history_task_rows(platform_code: str | None = None) -> tuple[list[dict], int, int]:
+    with create_session() as session:
+        task_service = CrawlTaskService(session)
+        task_rows = task_service.list_tasks(limit=50, platform_code=platform_code)
+        success_task_count, success_resume_count = task_service.success_summary(platform_code=platform_code)
+        rows = [
+            {
+                "批次ID": row.id,
+                "时间": row.started_at,
+                "目标网站": {"zhilian": "智联招聘", "boss": "BOSS直聘"}.get(row.platform_code, row.platform_code),
+                "目标数量": row.planned_count,
+                "获取数量": row.success_count,
+                "耗时": f"{int((row.finished_at - row.started_at).total_seconds())}秒" if row.started_at and row.finished_at else "运行中",
+                "状态": row.status,
+            }
+            for row in task_rows
+        ]
+        return rows, success_task_count, success_resume_count
+
+
 def render_history_task_table(platform_code: str | None = None, platform_name: str | None = None) -> None:
     try:
-        with create_session() as session:
-            task_service = CrawlTaskService(session)
-            task_rows = task_service.list_tasks(limit=50, platform_code=platform_code)
-            success_task_count, success_resume_count = task_service.success_summary(platform_code=platform_code)
+        task_rows, success_task_count, success_resume_count = load_history_task_rows(platform_code)
     except Exception as exc:
         st.warning(f"历史批次任务读取失败：{exc}")
         task_rows = []
@@ -587,18 +611,7 @@ def render_history_task_table(platform_code: str | None = None, platform_name: s
         unsafe_allow_html=True,
     )
     st.dataframe(
-        [
-            {
-                "批次ID": row.id,
-                "时间": row.started_at,
-                "目标网站": {"zhilian": "智联招聘", "boss": "BOSS直聘"}.get(row.platform_code, row.platform_code),
-                "目标数量": row.planned_count,
-                "获取数量": row.success_count,
-                "耗时": f"{int((row.finished_at - row.started_at).total_seconds())}秒" if row.started_at and row.finished_at else "运行中",
-                "状态": row.status,
-            }
-            for row in task_rows
-        ],
+        task_rows,
         use_container_width=True,
         hide_index=True,
     )
@@ -718,6 +731,11 @@ def build_profile_weak_lookup_keys(platform_code: str = "zhilian") -> set[str]:
 
 def get_profile_dedup_count(platform_code: str = "zhilian") -> int:
     return len(build_profile_lookup_keys(platform_code))
+
+
+@st.cache_data(ttl=30)
+def get_profile_dedup_count_cached(platform_code: str = "zhilian") -> int:
+    return get_profile_dedup_count(platform_code)
 
 
 def upsert_profile_dedup_record(session, row: dict, profile_key: str, raw_resume_id: int, task_id: int | None = None) -> None:
@@ -970,7 +988,7 @@ def render_task_editor(task_config: dict, login_states: dict[str, bool], disable
     )
     request_resume_if_missing = request_resume_label == "索要"
     try:
-        dedup_total = get_profile_dedup_count("zhilian")
+        dedup_total = get_profile_dedup_count_cached("zhilian")
     except Exception:
         dedup_total = 0
     row[4].metric("去重数据库记录数", dedup_total)

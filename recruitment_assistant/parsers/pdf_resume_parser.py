@@ -614,18 +614,24 @@ def extract_text_from_docx(path: str | Path) -> str:
 
 
 def is_empty_or_corrupted(path: str | Path) -> bool:
-    """检测文件是否为空白或损坏（无法解析 / 文本少于 50 字符）。"""
+    """检测文件是否真实损坏或空文件；可打开但无法提取文本的扫描件不判为损坏。"""
     path = Path(path)
     if not path.exists() or path.stat().st_size < 100:
         return True
     suffix = path.suffix.lower()
     try:
         if suffix == ".pdf":
-            text = extract_text_from_pdf(path)
-        elif suffix in (".docx", ".doc"):
+            from pypdf import PdfReader
+            reader = PdfReader(str(path))
+            return len(reader.pages) == 0
+        elif suffix == ".docx":
             text = extract_text_from_docx(path)
+            return len(text.strip()) < 50
+        elif suffix == ".doc":
+            text = extract_doc_text(path)
+            return len(text.strip()) < 50
         else:
             return True
-        return len(text.strip()) < 50
     except Exception:
         return True
+

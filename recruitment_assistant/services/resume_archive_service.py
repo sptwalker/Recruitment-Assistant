@@ -283,6 +283,9 @@ class ResumeArchiveService:
         self.session.refresh(inv)
         return inv
 
+    def get_invitation(self, invitation_id: int) -> InterviewInvitation | None:
+        return self.session.get(InterviewInvitation, invitation_id)
+
     def list_invitations(self, status: str | None = "pending") -> list[InterviewInvitation]:
         """默认只列 pending；status=None 表示全部。"""
         stmt = select(InterviewInvitation)

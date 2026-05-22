@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 from collections import Counter
+from concurrent.futures import Future
 from datetime import datetime
 from hashlib import sha256
 from pathlib import Path
@@ -46,7 +47,7 @@ class ZhilianWSBridge:
         self._saved_resume_hash_signatures: dict[str, str] = {}
         self._collect_timer: threading.Timer | None = None
         self._watchdog: WatchdogState = WatchdogState()
-        self._watchdog_task = None  # asyncio future returned by run_coroutine_threadsafe
+        self._watchdog_task: "Future[None] | None" = None  # concurrent.futures.Future from run_coroutine_threadsafe
         self._watchdog_poll_interval: float = 5.0
 
         self.runtime_state: dict[str, Any] = {
@@ -1425,9 +1426,10 @@ class ZhilianWSBridge:
         if loop is None:
             self._log("warning", "看门狗未启动：ws_server 事件循环未就绪")
             return
+        # 总是刷新全局起点：避免 start_collect 被重复调用时残留旧时间戳触发误判
+        self._watchdog.global_last_event_at = datetime.now()
         if self._watchdog_task is not None and not self._watchdog_task.done():
             return
-        self._watchdog.global_last_event_at = datetime.now()
 
         bridge = self
 
@@ -1496,9 +1498,13 @@ class ZhilianWSBridge:
         log_file = self.runtime_state.get("log_file", "")
         if not log_file:
             return
+        script_path = Path("scripts/analyze_test_run.py")
+        if not script_path.exists():
+            self._write_event_log("analyze_test_run_skipped", {"reason": "script_not_found", "expected_path": str(script_path)})
+            return
         try:
             subprocess.Popen(
-                [sys.executable, "scripts/analyze_test_run.py", log_file],
+                [sys.executable, str(script_path), log_file],
                 cwd=str(Path.cwd()),
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,

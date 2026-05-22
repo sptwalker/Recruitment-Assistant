@@ -94,6 +94,7 @@ class ZhilianWSBridge:
         self._seen_skip_records.clear()
         self._recent_ui_log_keys.clear()
         self._saved_resume_hash_signatures.clear()
+        self._stop_watchdog_loop()
         self._watchdog.reset()
         self.runtime_state.update({
             "running": False,

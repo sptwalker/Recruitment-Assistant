@@ -978,12 +978,26 @@ class BossWSBridge:
                 self.get_run_summary()
                 self._on_task_finished(final_status)
             case "error":
+                diag = data.get("diag")
+                diag_suffix = ""
+                if diag:
+                    containers = diag.get("containers", [])
+                    candidates = diag.get("candidates", [])
+                    diag_suffix = f"；诊断: 容器匹配={containers}，候选人匹配={candidates}，沟通中标签={diag.get('chattingTab')}"
                 if self.runtime_state.get("running"):
                     self._finish_crawl_task("failed", error_message=str(data.get("message", "未知错误")))
                 self.runtime_state["running"] = False
                 self.runtime_state["paused"] = False
-                self._log("error", f"扩展错误: {data.get('message', '未知错误')}")
+                self._log("error", f"扩展错误: {data.get('message', '未知错误')}{diag_suffix}")
                 self._on_task_finished("failed")
+            case "boss_diag":
+                step = data.get("step", "")
+                if step == "chatting_tab":
+                    self._log("info", f"诊断: 沟通中标签点击结果={data.get('result')}；URL={data.get('url', '')}")
+                elif step == "retry_scan":
+                    self._log("info", f"诊断: 重试扫描 #{data.get('retry')}，找到候选人={data.get('found', 0)}")
+                else:
+                    self._log("info", f"诊断: {data}")
             case "resume_persist_confirmed":
                 sig = data.get("candidate_signature", "未知")
                 strategy = data.get("strategy") or "?"

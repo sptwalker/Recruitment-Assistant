@@ -345,7 +345,7 @@ with st.container(border=True):
         st.rerun()
     clear_message = st.session_state.get("boss_dedup_clear_message")
     if clear_message:
-        st.caption(clear_message)
+        action_cols[4].caption(clear_message)
     summary = st.session_state.get("boss_run_summary")
     if summary:
         st.code(json.dumps(summary, ensure_ascii=False, indent=2), language="json")

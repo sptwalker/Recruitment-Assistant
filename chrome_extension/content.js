@@ -1728,8 +1728,10 @@
       pushRoot(preview.root.closest?.("[role='dialog'], [class*='dialog'], [class*='modal'], [class*='preview'], [class*='viewer'], [class*='pdf'], [class*='resume'], [class*='attachment'], [class*='drawer'], [class*='popup'], [class*='pop'], [class*='layer']"));
     }
     for (const root of getPreviewRoots()) pushRoot(root);
+    // Also search the full document for high-confidence selectors like resume-btn-file
+    pushRoot(document.body);
     const matches = [];
-    const selector = "[class*='attachment-resume-btns'] svg, [class*='attachment-resume-btns'] use, [class*='resume-footer'] svg, [class*='resume-footer'] use, [class*='resume-detail'] [class*='boss-svg'], [class*='resume-detail'] [class*='svg-icon'], span.card-btn, [class*='card-btn']";
+    const selector = "[class*='attachment-resume-btns'] svg, [class*='attachment-resume-btns'] use, [class*='resume-footer'] svg, [class*='resume-footer'] use, [class*='resume-detail'] [class*='boss-svg'], [class*='resume-detail'] [class*='svg-icon'], span.card-btn, [class*='card-btn'], [class*='resume-btn-file'], a[class*='resume-btn-file']";
     for (const root of roots) {
       const nodes = root.matches?.(selector) ? [root, ...root.querySelectorAll(selector)] : Array.from(root.querySelectorAll?.(selector) || []);
       for (const el of nodes) {
@@ -1747,9 +1749,11 @@
         const inPreviewRoot = preview?.root && preview.root.contains(clickable);
         const isHtmlPopupDownload = /card-btn/i.test(descriptor) && /附件简历|下载/.test(descriptor) && (inPopupContainer || inPreviewRoot);
         const isPreviewRootDownload = inPreviewRoot && /下载|download|附件简历/.test(combined) && !/关闭|close|取消|返回/i.test(combined);
-        if (!isXlinkDownload && !isHtmlPopupDownload && !isPreviewRootDownload && !isBossSvgDownloadDescriptor(descriptor)) continue;
+        const isResumeBtnFile = /resume-btn-file/i.test(clickable.className || "") && /附件简历|下载|download/i.test(combined);
+        if (!isXlinkDownload && !isHtmlPopupDownload && !isPreviewRootDownload && !isResumeBtnFile && !isBossSvgDownloadDescriptor(descriptor)) continue;
         if (/关闭|close|取消|返回|back|delete|trash|更多|more|打印|print|zoom|放大|缩小|rotate|旋转|×|✕|esc/i.test(combined)) continue;
         let score = 40;
+        if (isResumeBtnFile) score += 35;
         if (isHtmlPopupDownload) score += 30;
         if (isPreviewRootDownload) score += 20;
         if (clickable.closest?.("[class*='attachment-resume-btns']")) score += 22;
@@ -2244,6 +2248,27 @@
     emit({ type: "learned_download_click_used", data: { candidate_id: candidateId, candidate_signature: signature, ...getElementSnapshot(target) } });
     const downloadRequestId = makeDownloadRequestId(candidateId, signature);
     emit({ type: "download_intent", data: { candidate_id: candidateId, candidate_signature: signature, candidate_info: info, expected_filename: `${signature}.pdf`, download_request_id: downloadRequestId } });
+
+    // If target is an <a> with a download-like href, use direct download API instead of simulated click
+    const anchorEl = target.closest?.("a[href]") || (target.tagName === "A" && target.href ? target : null);
+    const anchorHref = anchorEl?.href || "";
+    if (anchorHref && /^https?:\/\//i.test(anchorHref) && /download|docdownload|attachment|resume/i.test(anchorHref)) {
+      emit({ type: "learned_download_using_direct_url", data: { candidate_id: candidateId, candidate_signature: signature, url: anchorHref } });
+      const resultPromise = waitForDownloadResult(downloadRequestId, 20000);
+      const started = await downloadDirectUrl({ candidate_id: candidateId, candidate_signature: signature, candidate_info: info, expected_filename: `${signature}.pdf`, url: anchorHref, download_request_id: downloadRequestId });
+      if (!started.ok) {
+        emit({ type: "learned_download_direct_url_failed", data: { candidate_id: candidateId, candidate_signature: signature, reason: started.reason || "start_failed" } });
+        return false;
+      }
+      const downloadResult = await resultPromise;
+      if (downloadResult.ok) {
+        const accepted = await finalizeDownloadWithPersistAck(candidateId, signature, downloadRequestId, "learned_click_direct_url");
+        return accepted;
+      }
+      emit({ type: "learned_download_click_download_failed", data: { candidate_id: candidateId, candidate_signature: signature, reason: downloadResult.reason || "direct_url_download_failed" } });
+      return false;
+    }
+
     const resultPromise = waitForDownloadResult(downloadRequestId);
     const vueUrl = tryVueDirectDownload(target);
     if (!vueUrl) clickElementReliably(target);
@@ -2345,6 +2370,22 @@
       }
     }
     emit({ type: "dom_text_download_url_not_found", data: { candidate_id: candidateId, candidate_signature: signature, anchor_count: anchors.length, vue_element_count: Array.from(allEls).filter((e) => e.__vue__).length } });
+    // Fallback: search outside preview root for resume-btn-file links (BOSS places download button in toolbar area)
+    const globalResumeBtnLinks = document.querySelectorAll("a[class*='resume-btn-file'][href]");
+    for (const a of globalResumeBtnLinks) {
+      const href = a.href || a.getAttribute("href") || "";
+      if (href && urlPattern.test(href) && /^https?:\/\//i.test(href) && isVisible(a)) {
+        emit({ type: "dom_text_download_url_found", data: { candidate_id: candidateId, candidate_signature: signature, url: href, source: "resume_btn_file_global" } });
+        const downloadRequestId = makeDownloadRequestId(candidateId, signature);
+        emit({ type: "download_intent", data: { candidate_id: candidateId, candidate_signature: signature, candidate_info: info, expected_filename: `${signature}.pdf`, download_request_id: downloadRequestId } });
+        const resultPromise = waitForDownloadResult(downloadRequestId, 20000);
+        const started = await downloadDirectUrl({ candidate_id: candidateId, candidate_signature: signature, candidate_info: info, expected_filename: `${signature}.pdf`, url: href, download_request_id: downloadRequestId });
+        if (!started.ok) { emit({ type: "dom_text_direct_download_failed", data: { candidate_id: candidateId, candidate_signature: signature, reason: started.reason || "start_failed" } }); return false; }
+        const downloadResult = await resultPromise;
+        if (downloadResult.ok) { await finalizeDownloadWithPersistAck(candidateId, signature, downloadRequestId, "dom_text_resume_btn_file"); return true; }
+        return false;
+      }
+    }
     return false;
   }
 
@@ -3508,10 +3549,32 @@
 
     emit({ type: "page_ready", data: { url: location.href } });
 
-    await clickBossChattingTab();
+    const chattingTabResult = await clickBossChattingTab();
+    emit({ type: "boss_diag", data: { step: "chatting_tab", result: chattingTabResult, url: location.href } });
+
     let items = getCandidateItems();
     if (items.length === 0) {
-      emit({ type: "error", data: { message: "未找到候选人列表", stage: "scan" } });
+      // Retry: wait for DOM to render after tab click
+      for (let retry = 0; retry < 3 && items.length === 0; retry++) {
+        await sleep(1500);
+        items = getCandidateItems();
+        emit({ type: "boss_diag", data: { step: "retry_scan", retry: retry + 1, found: items.length } });
+      }
+    }
+    if (items.length === 0) {
+      const diagContainers = LIST_CONTAINER_SELECTORS.map(s => ({
+        selector: s,
+        count: document.querySelectorAll(s).length,
+      })).filter(x => x.count > 0);
+      const diagCandidates = CANDIDATE_SELECTORS.map(s => ({
+        selector: s,
+        count: document.querySelectorAll(s).length,
+      })).filter(x => x.count > 0);
+      emit({ type: "error", data: {
+        message: "未找到候选人列表",
+        stage: "scan",
+        diag: { containers: diagContainers, candidates: diagCandidates, chattingTab: chattingTabResult },
+      } });
       state = "idle";
       return;
     }

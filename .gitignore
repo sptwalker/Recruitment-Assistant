@@ -24,3 +24,8 @@ env/
 *.log
 .DS_Store
 Thumbs.db
+
+# Build artifacts
+/dist/
+build/*.zip
+build/get-pip.py

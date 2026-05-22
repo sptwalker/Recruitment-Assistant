@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  const CONTENT_SCRIPT_VERSION = "1.86.0";
+  const CONTENT_SCRIPT_VERSION = "1.87.0";
 
   // 平台注册表：每个平台的 hostname、WS 端口、文本标记、localStorage key 一站式声明。
   // 这是从单平台升级到多平台的核心入口——新加平台只需在此对象增加一条配置。
@@ -3969,6 +3969,31 @@
         pendingPersistAcks.clear();
         if (pauseResolve) { pauseResolve(); pauseResolve = null; }
         break;
+      case "skip_current_candidate": {
+        const data = msg.data || {};
+        const targetCid = data.candidate_id || "";
+        const reason = data.reason || "watchdog";
+        emit({
+          type: "watchdog_skip_received",
+          data: { candidate_id: targetCid, reason, run_id: activeRunId, content_script_version: CONTENT_SCRIPT_VERSION },
+        });
+        // 让所有 pending await 立刻解开，collectLoop 的当前迭代会自然走到下一个候选人
+        pendingDownloadWaiters.forEach((resolve) => resolve({ ok: false, reason: "watchdog_skip" }));
+        pendingDownloadWaiters.clear();
+        pendingPersistAcks.forEach((resolve) => resolve({ ok: false, status: "watchdog_skip" }));
+        pendingPersistAcks.clear();
+        // 主动 emit candidate_skipped，桥端 WatchdogState 凭此把该 cid 标记为终态
+        emit({
+          type: "candidate_skipped",
+          data: {
+            candidate_id: targetCid,
+            candidate_signature: "",
+            reason: "watchdog_timeout",
+            watchdog_reason: reason,
+          },
+        });
+        break;
+      }
       case "download_completed":
       case "download_failed": {
         const data = msg.data || {};

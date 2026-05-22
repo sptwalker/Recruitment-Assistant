@@ -117,6 +117,9 @@ function handleServerCommand(platform, msg) {
     case "resume_persist_ack":
       sendToContentScript(platform, { type: "resume_persist_ack", data: msg.data || {}, run_id: platform.activeRunId });
       break;
+    case "skip_current_candidate":
+      sendToContentScript(platform, { type: "skip_current_candidate", data: msg.data || {}, run_id: platform.activeRunId });
+      break;
   }
 }
 
@@ -130,7 +133,7 @@ async function ensureContentScript(tabId) {
 }
 
 function shouldTargetSingleTab(msg) {
-  return ["start_collect", "pause_collect", "resume_collect", "stop_collect", "reset_content_script", "resume_persist_ack"].includes(msg?.type);
+  return ["start_collect", "pause_collect", "resume_collect", "stop_collect", "reset_content_script", "resume_persist_ack", "skip_current_candidate"].includes(msg?.type);
 }
 
 function pickActiveTab(candidateTabs) {

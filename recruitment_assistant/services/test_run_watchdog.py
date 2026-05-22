@@ -41,6 +41,7 @@ class MisrouteDetector:
 
     @property
     def states(self) -> dict[str, CandidateState]:
+        """供测试 / 巡检读取用；调用方应视为只读，请勿直接 .clear() / 删除条目。"""
         return self._state
 
     def on_event(self, event_type: str, candidate_id: str, payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -62,10 +63,8 @@ class MisrouteDetector:
             st.learned_used = True
         elif event_type == "resume_persist_confirmed":
             st.persisted = True
-            st.terminal = True
-        elif event_type in CANDIDATE_TERMINAL_EVENTS:
-            st.terminal = True
         elif event_type == "manual_download_learning_required":
+            # 每次 learning_required 都 emit；重复触发是 misroute 加重信号，不去重
             sig = payload.get("candidate_signature", "")
             if st.persisted:
                 out.append({
@@ -81,6 +80,9 @@ class MisrouteDetector:
                     "candidate_signature": sig,
                     "note": "learnedClick 已用却又弹学习模式（学习成果未生效）",
                 })
+
+        if event_type in CANDIDATE_TERMINAL_EVENTS:
+            st.terminal = True
         return out
 
 

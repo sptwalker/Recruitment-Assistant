@@ -58,6 +58,17 @@ def test_candidate_clicked_resets_state_for_same_cid():
     assert out == []
 
 
+def test_repeated_learning_required_emits_each_time():
+    """每次 manual_download_learning_required 都 emit；重复触发是加重信号。"""
+    detector = MisrouteDetector()
+    detector.on_event("candidate_clicked", "C_REPEAT", {})
+    detector.on_event("resume_persist_confirmed", "C_REPEAT", {})
+    first = detector.on_event("manual_download_learning_required", "C_REPEAT", {})
+    second = detector.on_event("manual_download_learning_required", "C_REPEAT", {})
+    assert len(first) == 1 and first[0]["kind"] == "A2"
+    assert len(second) == 1 and second[0]["kind"] == "A2"
+
+
 def test_constants_match_spec():
     assert CANDIDATE_TIMEOUT_SECONDS == 120
     assert GLOBAL_TIMEOUT_SECONDS == 300
@@ -119,3 +130,33 @@ def test_heartbeat_does_not_reset_global_watchdog():
     state.on_event("heartbeat", "", {})
     # global_last_event_at 不应该被心跳刷新
     assert state.global_last_event_at == base
+
+
+def test_candidate_skipped_marks_terminal():
+    state = WatchdogState(candidate_timeout=60)
+    state.on_event("candidate_clicked", "C_SKIP", {})
+    state.on_event("candidate_skipped", "C_SKIP", {})
+    later = state.detector.states["C_SKIP"].last_event_at + timedelta(seconds=120)
+    assert state.check_candidates(now=later) == []
+
+
+def test_resume_request_success_marks_terminal():
+    state = WatchdogState(candidate_timeout=60)
+    state.on_event("candidate_clicked", "C_REQ", {})
+    state.on_event("resume_request_success", "C_REQ", {})
+    later = state.detector.states["C_REQ"].last_event_at + timedelta(seconds=120)
+    assert state.check_candidates(now=later) == []
+
+
+def test_reset_clears_state_and_global_timer():
+    state = WatchdogState(candidate_timeout=60, global_timeout=300)
+    state.on_event("candidate_clicked", "C_R", {})
+    state.on_event("collect_started", "", {})
+    assert state.global_last_event_at is not None
+    assert "C_R" in state.detector.states
+    state.reset()
+    assert state.global_last_event_at is None
+    assert state.detector.states == {}
+    # 新 detector，旧引用应失效
+    assert state.check_global() is None
+    assert state.check_candidates() == []

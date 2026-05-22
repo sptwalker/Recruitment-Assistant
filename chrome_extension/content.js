@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  const CONTENT_SCRIPT_VERSION = "1.87.0";
+  const CONTENT_SCRIPT_VERSION = "1.88.0";
 
   // 平台注册表：每个平台的 hostname、WS 端口、文本标记、localStorage key 一站式声明。
   // 这是从单平台升级到多平台的核心入口——新加平台只需在此对象增加一条配置。
@@ -42,7 +42,7 @@
     },
     zhilian: {
       code: "zhilian",
-      hostnames: ["rd5.zhaopin.com"],
+      hostnames: ["rd5.zhaopin.com", "rd6.zhaopin.com"],
       ws_url: "ws://127.0.0.1:8767",
       auth_markers: ["沟通中", "联系人", "职位管理", "人才推荐", "查看附件简历"],
       page_markers: ["智联招聘", "zhaopin", "招聘", "沟通", "候选人"],

@@ -1,9 +1,13 @@
 """Bridge between WebSocket events and Boss business logic."""
 
+import asyncio
 import json
 import shutil
+import subprocess
+import sys
 import threading
 from collections import Counter
+from concurrent.futures import Future
 from datetime import datetime
 from hashlib import sha256
 from pathlib import Path
@@ -19,10 +23,12 @@ from recruitment_assistant.storage.models import CrawlTask
 from recruitment_assistant.utils.hash_utils import text_hash
 from recruitment_assistant.utils.snapshot_utils import safe_filename
 
+from recruitment_assistant.services.test_run_watchdog import WatchdogState
 
-BOSS_BRIDGE_VERSION = "1.94.0"
-BOSS_EXTENSION_EXPECTED_VERSION = "1.86.0"
-BOSS_CONTENT_SCRIPT_EXPECTED_VERSION = "1.86.0"
+
+BOSS_BRIDGE_VERSION = "1.95.0"
+BOSS_EXTENSION_EXPECTED_VERSION = "1.87.0"
+BOSS_CONTENT_SCRIPT_EXPECTED_VERSION = "1.87.0"
 
 
 class BossWSBridge:
@@ -35,6 +41,9 @@ class BossWSBridge:
         self._recent_ui_log_keys: dict[str, float] = {}
         self._saved_resume_hash_signatures: dict[str, str] = {}
         self._collect_timer: threading.Timer | None = None
+        self._watchdog: WatchdogState = WatchdogState()
+        self._watchdog_task: "Future[None] | None" = None  # concurrent.futures.Future from run_coroutine_threadsafe
+        self._watchdog_poll_interval: float = 5.0
 
         self.runtime_state: dict[str, Any] = {
             "running": False,
@@ -80,6 +89,7 @@ class BossWSBridge:
         self._seen_skip_records.clear()
         self._recent_ui_log_keys.clear()
         self._saved_resume_hash_signatures.clear()
+        self._watchdog.reset()
         self.runtime_state.update({
             "running": False,
             "paused": False,
@@ -247,6 +257,7 @@ class BossWSBridge:
     def _on_task_finished(self, status: str) -> None:
         """采集任务收尾钩子：关闭弹窗、对账 Chrome 下载目录、输出本轮指标。"""
         self._cancel_collect_timer()
+        self._stop_watchdog_loop()
         run_id = self.runtime_state.get("run_id", "")
 
         # 1) 通知扩展关闭所有简历预览弹窗（扩展端 1.67.0 暂不识别此指令，待后续放开扩展限制时落地）
@@ -438,6 +449,7 @@ class BossWSBridge:
         self._create_crawl_task(config)
         self._log_task_initialization(config, collect_mode, collect_minutes)
         command = {"type": "start_collect", "config": config, "run_id": self.runtime_state.get("run_id", "")}
+        self._start_watchdog_loop()
         self.ws_server.send_command(command)
         self._write_event_log("command_sent", command)
         self._log("info", f"BOSS 下载前去重数据已下发: key={len(config['boss_candidate_keys'])} 条；签名={len(config['boss_candidate_signatures'])} 条")
@@ -501,6 +513,7 @@ class BossWSBridge:
         self.ws_server.send_command(command)
         self._write_event_log("command_sent", command)
         self._log("info", "停止指令已下发")
+        self._stop_watchdog_loop()
 
     def probe_page(self) -> None:
         command = {"type": "probe_page", "run_id": self.runtime_state.get("run_id", "")}
@@ -579,6 +592,12 @@ class BossWSBridge:
         }
         if event_type not in noisy_events:
             self._write_event_log("extension_event", {"type": event_type, "data": data})
+
+        candidate_id = str(data.get("candidate_id") or "")
+        misroute_events = self._watchdog.on_event(event_type, candidate_id, data)
+        for me in misroute_events:
+            self._log("error", f"⚠️ 学习模式误进 [{me['kind']}]：{me.get('candidate_signature', '?')} — {me['note']}")
+            self._write_event_log("learning_misroute_detected", me)
 
         match event_type:
             case "boss_content_script_collect_started":
@@ -977,6 +996,7 @@ class BossWSBridge:
                         self._log("info", f"采集结束：{reason_text}；共下载 {total} 份简历；本次新增去重 {self.runtime_state.get('dedup_record_count', 0)} 位")
                 self.get_run_summary()
                 self._on_task_finished(final_status)
+                self._spawn_analyze_test_run()
             case "error":
                 diag = data.get("diag")
                 diag_suffix = ""
@@ -1382,3 +1402,96 @@ class BossWSBridge:
                 f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
         except Exception as exc:
             logger.warning("写入 Boss Extension 测试日志失败: {}", exc)
+
+    def _start_watchdog_loop(self) -> None:
+        """在 ws_server 的 asyncio loop 上启动看门狗巡检任务。"""
+        loop = self.ws_server.event_loop
+        if loop is None:
+            self._log("warning", "看门狗未启动：ws_server 事件循环未就绪")
+            return
+        # 总是刷新全局起点：避免 start_collect 被重复调用时残留旧时间戳触发误判
+        self._watchdog.global_last_event_at = datetime.now()
+        if self._watchdog_task is not None and not self._watchdog_task.done():
+            return
+
+        bridge = self
+
+        async def _watch():
+            try:
+                while bridge.runtime_state.get("running"):
+                    await asyncio.sleep(bridge._watchdog_poll_interval)
+                    bridge._poll_watchdog()
+            except asyncio.CancelledError:
+                pass
+
+        try:
+            self._watchdog_task = asyncio.run_coroutine_threadsafe(_watch(), loop)
+            self._write_event_log("watchdog_started", {
+                "candidate_timeout_s": self._watchdog.candidate_timeout,
+                "global_timeout_s": self._watchdog.global_timeout,
+            })
+        except Exception as exc:
+            self._log("warning", f"看门狗启动失败: {exc}")
+            self._watchdog_task = None
+
+    def _stop_watchdog_loop(self) -> None:
+        task = self._watchdog_task
+        if task is not None:
+            try:
+                task.cancel()
+            except Exception:
+                pass
+        self._watchdog_task = None
+
+    def _poll_watchdog(self) -> None:
+        # 候选人级超时
+        for to in self._watchdog.check_candidates():
+            self._log(
+                "highlight",
+                f"⚠️ 看门狗：候选人 {to.candidate_id} 已 {to.elapsed_seconds:.0f}s 无事件"
+                f"（最后事件 {to.last_event_type}），强制跳过",
+            )
+            self._write_event_log("watchdog_candidate_timeout", {
+                "candidate_id": to.candidate_id,
+                "last_event_type": to.last_event_type,
+                "elapsed_seconds": round(to.elapsed_seconds, 1),
+            })
+            command = {
+                "type": "skip_current_candidate",
+                "data": {"candidate_id": to.candidate_id, "reason": "watchdog"},
+                "run_id": self.runtime_state.get("run_id", ""),
+            }
+            try:
+                self.ws_server.send_command(command)
+            except Exception as exc:
+                self._log("warning", f"看门狗 skip 指令下发失败: {exc}")
+        # 全局级超时
+        idle = self._watchdog.check_global()
+        if idle is not None:
+            self._log("error", f"⚠️ 看门狗：全局 {idle:.0f}s 无事件，已强制终止采集")
+            self._write_event_log("watchdog_global_idle_timeout", {"elapsed_seconds": round(idle, 1)})
+            try:
+                self._finish_crawl_task("failed", error_message="global_idle_timeout")
+            except Exception as exc:
+                self._log("warning", f"看门狗终止采集失败: {exc}")
+            self.runtime_state["running"] = False
+            self._stop_watchdog_loop()
+
+    def _spawn_analyze_test_run(self) -> None:
+        log_file = self.runtime_state.get("log_file", "")
+        if not log_file:
+            return
+        script_path = Path("scripts/analyze_test_run.py")
+        if not script_path.exists():
+            self._write_event_log("analyze_test_run_skipped", {"reason": "script_not_found", "expected_path": str(script_path)})
+            return
+        try:
+            subprocess.Popen(
+                [sys.executable, str(script_path), log_file],
+                cwd=str(Path.cwd()),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            self._write_event_log("analyze_test_run_spawned", {"log_file": log_file})
+        except Exception as exc:
+            self._log("warning", f"启动 analyze_test_run.py 失败: {exc}")

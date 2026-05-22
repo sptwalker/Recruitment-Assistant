@@ -1,4 +1,5 @@
 import time
+from pathlib import Path
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -10,6 +11,12 @@ from components.layout import (
     list_theme_options,
     page_header,
     save_current_theme,
+)
+from components.theme_preview import (
+    COMPONENT_LABELS,
+    COMPONENT_VARIABLE_MAP,
+    build_preview_html,
+    parse_theme_variables,
 )
 from recruitment_assistant.config.settings import get_settings
 
@@ -66,29 +73,79 @@ def open_ai_api_key_test_dialog():
         st.code(str(exc))
 
 
+@st.dialog("保存自定义主题")
+def open_save_theme_dialog():
+    overrides = st.session_state.get("theme_overrides", {})
+    if not overrides:
+        st.info("未修改任何配色变量，无需保存。")
+        return
+
+    themes = list_theme_options()
+    theme_names = {t["id"]: t["name"] for t in themes}
+    current_id = st.session_state.get("theme_style_select", get_current_theme_id())
+    current_name = theme_names.get(current_id, current_id)
+
+    save_mode = st.radio("保存方式", ["覆盖当前主题", "另存为新主题"], key="save_mode_radio")
+
+    if save_mode == "另存为新主题":
+        new_name = st.text_input("新主题名称", value=f"{current_name} (自定义)", key="new_theme_name")
+        new_id = st.text_input("主题ID (英文小写)", value=f"custom_{int(time.time())}", key="new_theme_id")
+    else:
+        new_name = current_name
+        new_id = current_id
+
+    if st.button("确认保存", type="primary", key="confirm_save_theme"):
+        base_css_path = Path(f"app/styles/themes/{current_id}.css")
+        if base_css_path.exists():
+            base_vars = parse_theme_variables(base_css_path.read_text(encoding="utf-8"))
+        else:
+            base_vars = {}
+        merged = {**base_vars, **overrides}
+        lines = [
+            "/*",
+            f"theme-id: {new_id}",
+            f"theme-name: {new_name}",
+            f"theme-description: 基于 {current_name} 自定义的主题。",
+            "*/",
+            ":root {",
+        ]
+        for var, val in merged.items():
+            lines.append(f"  {var}: {val};")
+        lines.append("}")
+        out_path = Path(f"app/styles/themes/{new_id}.css")
+        out_path.write_text("\n".join(lines), encoding="utf-8")
+        save_current_theme(new_id)
+        st.session_state.pop("theme_overrides", None)
+        st.success(f"主题「{new_name}」已保存并应用。")
+        time.sleep(0.8)
+        st.rerun()
+
+
 tabs = st.tabs(["AI模型", "主题风格"])
 
 
 with tabs[0]:
-    st.markdown('<div class="vibe-card"><h3>AI 大模型配置</h3>', unsafe_allow_html=True)
     st.caption("用于简历结构化解析、岗位匹配等 AI 功能。支持 DeepSeek / 通义千问 / OpenAI 等兼容 OpenAI 格式的 API。")
-    from pathlib import Path
     env_path = Path(".env")
     env_lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
+
     def _get_env_value(key: str) -> str:
         for line in env_lines:
             if line.strip().startswith(f"{key}="):
                 return line.split("=", 1)[1].strip().strip('"').strip("'")
         return ""
+
     current_key = _get_env_value("AI_API_KEY")
     current_url = _get_env_value("AI_BASE_URL") or "https://api.deepseek.com/v1"
     current_model = _get_env_value("AI_MODEL") or "deepseek-chat"
 
     api_key_col, api_test_col = st.columns([0.78, 0.22])
     with api_key_col:
-        ai_api_key = st.text_input("API Key", value=current_key, type="password", key="ai_api_key_input",
-                                   help="DeepSeek / 通义千问 / OpenAI 的 API Key")
-    api_test_col.markdown("<div style='height: 28px'></div>", unsafe_allow_html=True)
+        ai_api_key = st.text_input(
+            "API Key", value=current_key, type="password", key="ai_api_key_input",
+            help="DeepSeek / 通义千问 / OpenAI 的 API Key",
+        )
+    api_test_col.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
     test_ai_api_clicked = api_test_col.button("API检测", key="test_ai_api_key", use_container_width=True)
     presets = {
         "DeepSeek": ("https://api.deepseek.com/v1", "deepseek-chat"),
@@ -96,20 +153,18 @@ with tabs[0]:
         "OpenAI": ("https://api.openai.com/v1", "gpt-4o-mini"),
         "自定义": (current_url, current_model),
     }
-    preset_choice = st.selectbox("预设模型", list(presets.keys()), key="ai_preset",
-                                 index=0 if "deepseek" in current_url else (1 if "dashscope" in current_url else (2 if "openai" in current_url else 3)))
+    preset_choice = st.selectbox(
+        "预设模型", list(presets.keys()), key="ai_preset",
+        index=0 if "deepseek" in current_url else (1 if "dashscope" in current_url else (2 if "openai" in current_url else 3)),
+    )
     preset_url, preset_model = presets[preset_choice]
     ai_base_url = st.text_input("API Base URL", value=preset_url, key="ai_base_url_input")
     ai_model = st.text_input("模型名称", value=preset_model, key="ai_model_input")
     if test_ai_api_clicked:
-        st.session_state["ai_api_test_config"] = {
-            "api_key": ai_api_key,
-            "base_url": ai_base_url,
-            "model": ai_model,
-        }
+        st.session_state["ai_api_test_config"] = {"api_key": ai_api_key, "base_url": ai_base_url, "model": ai_model}
         open_ai_api_key_test_dialog()
 
-    if st.button("💾 保存 AI 配置", key="save_ai_config"):
+    if st.button("保存 AI 配置", key="save_ai_config"):
         new_env = {"AI_API_KEY": ai_api_key, "AI_BASE_URL": ai_base_url, "AI_MODEL": ai_model}
         existing = {}
         if env_path.exists():
@@ -120,105 +175,74 @@ with tabs[0]:
         existing.update(new_env)
         env_path.write_text("\n".join(f"{k}={v}" for k, v in existing.items()) + "\n", encoding="utf-8")
         get_settings.cache_clear()
-        st.success("AI 配置已保存到 .env 文件，配置缓存已刷新；请重新进入简历管理后再执行自动解析入库。")
-    st.markdown('</div>', unsafe_allow_html=True)
+        st.success("AI 配置已保存，配置缓存已刷新。")
+
 
 with tabs[1]:
-    st.markdown('<div class="vibe-card"><h3>主题风格</h3>', unsafe_allow_html=True)
     themes = list_theme_options()
     if not themes:
         st.warning("未检测到主题样式文件，请检查 app/styles/themes 目录。")
     else:
         current_theme_id = get_current_theme_id()
-        theme_ids = [theme["id"] for theme in themes]
-        theme_names = {theme["id"]: theme["name"] for theme in themes}
-        theme_descriptions = {theme["id"]: theme.get("description", "") for theme in themes}
-        select_col, action_col, save_col, spacer_col = st.columns([0.28, 0.16, 0.16, 0.40])
+        theme_ids = [t["id"] for t in themes]
+        theme_names = {t["id"]: t["name"] for t in themes}
+        theme_descriptions = {t["id"]: t.get("description", "") for t in themes}
+
+        select_col, action_col, save_col = st.columns(3)
         selected_theme_id = select_col.selectbox(
-            "预设主题风格",
-            theme_ids,
+            "预设主题风格", theme_ids,
             index=theme_ids.index(current_theme_id) if current_theme_id in theme_ids else 0,
-            format_func=lambda theme_id: theme_names.get(theme_id, theme_id),
+            format_func=lambda tid: theme_names.get(tid, tid),
             key="theme_style_select",
         )
-        action_col.markdown("<div style='height: 28px'></div>", unsafe_allow_html=True)
-        save_col.markdown("<div style='height: 28px'></div>", unsafe_allow_html=True)
-        if action_col.button("应用主题", type="primary", key="apply_theme_style"):
+        action_col.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+        save_col.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+        if action_col.button("应用主题", type="primary", key="apply_theme_style", use_container_width=True):
             save_current_theme(selected_theme_id)
             st.success(f"已应用主题：{theme_names.get(selected_theme_id, selected_theme_id)}")
             st.rerun()
-        if save_col.button("统一保存设置", key="save_all_settings_theme_tab"):
-            st.success("设置已保存。")
-        st.caption(theme_descriptions.get(selected_theme_id) or "选择主题后可在下方快速预览标题、正文、按钮（主/次/禁用）、输入框、下拉框、+/- 数字框、Banner 与进度条。")
+        if save_col.button("保存自定义主题", key="save_custom_theme", use_container_width=True):
+            open_save_theme_dialog()
+
+        st.caption(theme_descriptions.get(selected_theme_id) or "选择主题后可在下方预览效果，点击组件可编辑配色。")
+
+        overrides = st.session_state.get("theme_overrides", {})
         preview_css = get_theme_css(selected_theme_id)
-        components.html(
-            f"""
-<style>
-{preview_css}
-body {{ margin: 0; font-family: var(--font-family-base, sans-serif); background: transparent; color: var(--color-text); }}
-.theme-preview {{ background: var(--color-bg); border: 1px solid var(--color-border); border-radius: var(--radius-xl); padding: 22px; box-shadow: var(--shadow-md); }}
-.theme-preview-banner {{ padding: 24px; border-radius: var(--radius-lg); background: linear-gradient(135deg, var(--color-primary), var(--color-secondary)); color: #fff; margin-bottom: 18px; }}
-.theme-preview-banner h2 {{ margin: 0 0 8px; font-size: 24px; }}
-.theme-preview-banner p {{ margin: 0; opacity: .9; }}
-.theme-preview-grid {{ display: grid; grid-template-columns: 1.2fr .8fr; gap: 16px; }}
-.theme-preview-card {{ background: var(--color-surface); border: 1px solid var(--color-border); border-radius: var(--radius-lg); padding: 18px; box-shadow: var(--shadow-sm); }}
-.theme-preview-title {{ margin: 0 0 8px; font-size: 20px; color: var(--color-text); }}
-.theme-preview-text {{ margin: 0 0 16px; line-height: 1.7; color: var(--color-text-secondary); }}
-.theme-preview-actions {{ display: flex; gap: 10px; flex-wrap: wrap; margin: 12px 0 18px; }}
-.theme-preview-btn {{ border: 0; border-radius: var(--radius-md); padding: 10px 16px; background: var(--color-primary); color: #fff; font-weight: 700; box-shadow: var(--shadow-xs); cursor: pointer; }}
-.theme-preview-btn.secondary {{ background: var(--color-primary-soft); color: var(--color-primary); border: 1px solid var(--color-border); }}
-.theme-preview-btn:disabled, .theme-preview-btn.disabled {{ background: var(--color-surface-muted, var(--color-bg-soft)); color: var(--color-text-muted); border: 1px solid var(--color-border); box-shadow: none; cursor: not-allowed; opacity: .7; }}
-.theme-preview-input, .theme-preview-select {{ width: 100%; box-sizing: border-box; border: 1px solid var(--color-border); border-radius: var(--radius-md); padding: 11px 12px; margin-bottom: 12px; background: var(--color-surface); color: var(--color-text); outline: none; }}
-.theme-preview-stepper-row {{ display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }}
-.theme-preview-stepper-label {{ color: var(--color-text-secondary); font-size: 13px; font-weight: 600; min-width: 56px; }}
-.theme-preview-stepper {{ display: inline-flex; align-items: stretch; border: 1px solid var(--color-border); border-radius: var(--radius-md); overflow: hidden; background: var(--color-surface); }}
-.theme-preview-stepper button {{ border: 0; background: var(--color-primary-soft); color: var(--color-primary); width: 36px; font-size: 18px; font-weight: 800; cursor: pointer; transition: background .15s ease, color .15s ease; }}
-.theme-preview-stepper button:hover {{ background: var(--color-primary); color: #fff; }}
-.theme-preview-stepper input {{ width: 64px; text-align: center; border: 0; border-left: 1px solid var(--color-border); border-right: 1px solid var(--color-border); background: var(--color-surface); color: var(--color-text); outline: none; padding: 8px 0; font-weight: 700; font-size: 14px; }}
-.theme-preview-progress {{ height: 12px; background: var(--color-primary-soft); border-radius: 999px; overflow: hidden; margin-top: 8px; }}
-.theme-preview-progress span {{ display: block; width: 68%; height: 100%; background: linear-gradient(90deg, var(--color-primary), var(--color-accent)); }}
-.theme-preview-tags {{ display: flex; gap: 8px; flex-wrap: wrap; }}
-.theme-preview-tag {{ padding: 7px 10px; border-radius: 999px; background: var(--color-primary-soft); color: var(--color-primary); font-size: 12px; font-weight: 700; }}
-@media (max-width: 720px) {{ .theme-preview-grid {{ grid-template-columns: 1fr; }} }}
-</style>
-<div class="theme-preview">
-  <div class="theme-preview-banner">
-    <h2>{theme_names.get(selected_theme_id, selected_theme_id)}</h2>
-    <p>{theme_descriptions.get(selected_theme_id, "主题预览")}</p>
-  </div>
-  <div class="theme-preview-grid">
-    <div class="theme-preview-card">
-      <h3 class="theme-preview-title">招聘数据工作台</h3>
-      <p class="theme-preview-text">统一管理候选人采集、简历解析、面试跟进与数据导出，快速感受当前主题在真实业务元素中的展示效果。</p>
-      <div class="theme-preview-actions">
-        <button class="theme-preview-btn">主按钮</button>
-        <button class="theme-preview-btn secondary">次按钮</button>
-        <button class="theme-preview-btn" disabled>禁用按钮</button>
-      </div>
-      <input class="theme-preview-input" value="候选人搜索输入框" />
-      <select class="theme-preview-select"><option>下拉选择：全部岗位</option></select>
-      <div class="theme-preview-stepper-row">
-        <span class="theme-preview-stepper-label">每页数量</span>
-        <div class="theme-preview-stepper">
-          <button type="button">−</button>
-          <input value="20" readonly />
-          <button type="button">+</button>
-        </div>
-      </div>
-    </div>
-    <div class="theme-preview-card">
-      <h3 class="theme-preview-title">任务进度</h3>
-      <p class="theme-preview-text">当前采集任务完成度 68%</p>
-      <div class="theme-preview-progress"><span></span></div>
-      <div style="height:14px"></div>
-      <div class="theme-preview-tags"><span class="theme-preview-tag">成功</span><span class="theme-preview-tag">待处理</span><span class="theme-preview-tag">高优先级</span></div>
-    </div>
-  </div>
-</div>
-""",
-            height=490,
+        preview_html = build_preview_html(
+            preview_css,
+            theme_names.get(selected_theme_id, selected_theme_id),
+            theme_descriptions.get(selected_theme_id, "主题预览"),
+            overrides=overrides or None,
         )
-    st.markdown('</div>', unsafe_allow_html=True)
+        components.html(preview_html, height=720)
 
+        st.divider()
+        selected_comp = st.selectbox(
+            "编辑组件配色", list(COMPONENT_LABELS.keys()),
+            format_func=lambda k: COMPONENT_LABELS[k],
+            key="edit_component_select",
+        )
 
+        variables = COMPONENT_VARIABLE_MAP[selected_comp]
+        current_vars = parse_theme_variables(preview_css)
+        if "theme_overrides" not in st.session_state:
+            st.session_state["theme_overrides"] = {}
 
+        cols = st.columns(len(variables))
+        for i, (var_name, label) in enumerate(variables):
+            with cols[i]:
+                current_val = st.session_state["theme_overrides"].get(var_name, current_vars.get(var_name, "#000000"))
+                if current_val.startswith("#") or current_val.startswith("rgb"):
+                    hex_val = current_val if current_val.startswith("#") else "#000000"
+                    if len(hex_val) == 4:
+                        hex_val = f"#{hex_val[1]*2}{hex_val[2]*2}{hex_val[3]*2}"
+                    new_val = st.color_picker(label, value=hex_val, key=f"cp_{selected_comp}_{var_name}")
+                    if new_val != hex_val:
+                        st.session_state["theme_overrides"][var_name] = new_val
+                else:
+                    new_val = st.text_input(label, value=current_val, key=f"ti_{selected_comp}_{var_name}")
+                    if new_val != current_val:
+                        st.session_state["theme_overrides"][var_name] = new_val
+
+        if st.session_state.get("theme_overrides"):
+            st.caption(f"已修改 {len(st.session_state['theme_overrides'])} 个变量，预览已实时更新。点击「保存自定义主题」持久化。")

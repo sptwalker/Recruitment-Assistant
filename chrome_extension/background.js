@@ -19,6 +19,15 @@ const PLATFORM_REGISTRY = {
     extra_path_regex: /./, // 阶段 1 宽匹配，阶段 2 学习后收窄
     download_dir_name: "51前程无忧",
   },
+  zhilian: {
+    code: "zhilian",
+    name: "智联招聘",
+    ws_url: "ws://127.0.0.1:8767",
+    tab_url_pattern: "https://rd5.zhaopin.com/*",
+    tab_url_regex: /^https:\/\/rd5\.zhaopin\.com\//,
+    extra_path_regex: /./,
+    download_dir_name: "智联招聘",
+  },
 };
 
 const EXTENSION_VERSION = (typeof chrome !== "undefined" && chrome.runtime && typeof chrome.runtime.getManifest === "function")

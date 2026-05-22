@@ -306,3 +306,154 @@ class QianchengWSServer:
                 await websocket.send(json.dumps(command, ensure_ascii=False))
             except Exception:
                 break
+
+
+class ZhilianWSServer:
+    """智联招聘（rd5.zhaopin.com）专用 WS 服务，监听 8767。
+
+    结构与 BossWSServer / QianchengWSServer 一致，单连接模式。
+    """
+
+    def __init__(self, host: str = "127.0.0.1", port: int = 8767):
+        self.host = host
+        self.port = port
+        self.extension_ws = None
+        self.on_event: Callable[[dict], None] | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._thread: threading.Thread | None = None
+        self._server = None
+        self._command_queue: asyncio.Queue | None = None
+        self._startup_error: str = ""
+        self._connection_seq = 0
+        self.last_connected_at: str = ""
+        self.last_disconnected_at: str = ""
+        self.last_disconnect_reason: str = ""
+
+    @property
+    def is_listening(self) -> bool:
+        return self._server is not None and self._thread is not None and self._thread.is_alive()
+
+    @property
+    def startup_error(self) -> str:
+        return self._startup_error
+
+    @property
+    def is_extension_connected(self) -> bool:
+        return self.extension_ws is not None and not getattr(self.extension_ws, "closed", False)
+
+    @property
+    def connection_snapshot(self) -> dict:
+        return {
+            "connected": self.is_extension_connected,
+            "last_connected_at": self.last_connected_at,
+            "last_disconnected_at": self.last_disconnected_at,
+            "last_disconnect_reason": self.last_disconnect_reason,
+        }
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._startup_error = ""
+        self._server = None
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+        deadline = threading.Event()
+        for _ in range(50):
+            if self.is_listening or self._startup_error:
+                break
+            deadline.wait(0.1)
+        if self._startup_error:
+            logger.error("Zhilian WS 服务启动失败: {}", self._startup_error)
+        elif self.is_listening:
+            logger.info("Zhilian WS 服务已启动: ws://{}:{}", self.host, self.port)
+        else:
+            self._startup_error = "启动超时：未能确认端口监听"
+            logger.error("Zhilian WS 服务启动失败: {}", self._startup_error)
+
+    def stop(self) -> None:
+        if self._loop and self._loop.is_running():
+            self._loop.call_soon_threadsafe(self._shutdown_event.set)
+        if self._thread:
+            self._thread.join(timeout=5)
+            self._thread = None
+        self._loop = None
+        self.extension_ws = None
+        logger.info("Zhilian WS 服务已停止")
+
+    def send_command(self, command: dict) -> None:
+        if not self.is_extension_connected:
+            logger.warning("Zhilian 扩展未连接，无法发送指令: {}", command.get("type"))
+            return
+        if self._loop and self._command_queue:
+            self._loop.call_soon_threadsafe(self._command_queue.put_nowait, command)
+
+    def _run_loop(self) -> None:
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        self._command_queue = asyncio.Queue()
+        self._shutdown_event = asyncio.Event()
+        try:
+            self._loop.run_until_complete(self._serve())
+        except Exception as exc:
+            self._startup_error = str(exc)
+            logger.exception("Zhilian WS 服务线程异常")
+        finally:
+            self._server = None
+
+    async def _serve(self) -> None:
+        import websockets
+
+        async with websockets.serve(self._handler, self.host, self.port) as server:
+            self._server = server
+            await self._shutdown_event.wait()
+
+    async def _handler(self, websocket) -> None:
+        if self.extension_ws is not None and not getattr(self.extension_ws, "closed", False):
+            try:
+                await self.extension_ws.close(code=1000, reason="replaced_by_new_connection")
+            except Exception:
+                pass
+        self.extension_ws = websocket
+        self._connection_seq += 1
+        connection_id = self._connection_seq
+        self.last_connected_at = datetime.now().isoformat(timespec="seconds")
+        self.last_disconnect_reason = ""
+        logger.info("Zhilian 扩展已连接 #{}", connection_id)
+
+        send_task = asyncio.create_task(self._send_loop(websocket))
+        disconnect_reason = "normal_close"
+        try:
+            async for message in websocket:
+                try:
+                    event = json.loads(message)
+                    if self.on_event:
+                        self.on_event(event)
+                except json.JSONDecodeError:
+                    logger.warning("Zhilian 收到无效 JSON: {}", message[:100])
+        except Exception as exc:
+            disconnect_reason = str(exc)
+            logger.info("Zhilian 扩展连接断开 #{}: {}", connection_id, exc)
+        finally:
+            send_task.cancel()
+            if self.extension_ws is websocket:
+                self.extension_ws = None
+                self.last_disconnected_at = datetime.now().isoformat(timespec="seconds")
+                self.last_disconnect_reason = disconnect_reason
+                logger.info("Zhilian 扩展已断开 #{}", connection_id)
+                if self.on_event:
+                    self.on_event({
+                        "type": "extension_disconnected",
+                        "data": {
+                            "connection_id": connection_id,
+                            "reason": disconnect_reason,
+                            "at": self.last_disconnected_at,
+                        },
+                    })
+
+    async def _send_loop(self, websocket) -> None:
+        while True:
+            command = await self._command_queue.get()
+            try:
+                await websocket.send(json.dumps(command, ensure_ascii=False))
+            except Exception:
+                break

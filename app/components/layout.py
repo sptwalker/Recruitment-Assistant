@@ -4,7 +4,7 @@ from pathlib import Path
 
 import streamlit as st
 
-APP_VERSION = "V2.50"
+APP_VERSION = "V3.00"
 STYLE_DIR = Path("app/styles")
 STYLE_FILES = ("theme.css", "global.css", "components.css")
 THEME_DIR = STYLE_DIR / "themes"

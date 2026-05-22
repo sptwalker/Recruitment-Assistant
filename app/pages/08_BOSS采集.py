@@ -18,7 +18,7 @@ inject_vibe_style("BOSS直聘采集")
 page_header(
     "BOSS直聘采集",
     "通过 Chrome 扩展在页面内自动采集附件简历，完全绕过反检测。",
-    icon="icon/BOSS直聘.jpeg",
+    icon="icon/boss直聘.png",
 )
 
 st.markdown(

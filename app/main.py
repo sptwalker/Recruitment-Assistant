@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 from datetime import datetime, time
-from pathlib import Path
 
 import streamlit as st
-from sqlalchemy import case, func, select
+from sqlalchemy import func, select
 
-from components.bridges import get_boss_bridge, get_qiancheng_bridge
+from components.bridges import get_boss_bridge, get_qiancheng_bridge, get_zhilian_bridge
 from components.layout import icon_data_uri, inject_vibe_style
 from recruitment_assistant.config.settings import get_settings
 from recruitment_assistant.storage.db import create_session
@@ -56,32 +55,8 @@ def new_task_dialog() -> None:
         "账号标识": account_name or "default",
         "间隔秒": "5-15" if speed_mode.startswith("快速") else "10-45",
     }
-    from recruitment_assistant.platforms.zhilian.adapter import ZhilianAdapter
 
-    adapter = ZhilianAdapter(account_name=task_config["账号标识"])
-    login_artifact_saved = adapter.state_path.exists() or getattr(adapter, "user_data_dir", adapter.state_path.with_name(f"{adapter.state_path.stem}_profile")).exists()
-    has_login_state = bool(login_artifact_saved)
-
-    button_label = "已登录开始任务" if has_login_state else "请登录开始任务"
-
-    if st.button(button_label, type="primary"):
-        st.session_state.pending_collect_task = {
-            **task_config,
-            "任务状态": "等待启动",
-        }
-        st.session_state.auto_start_collect_task = True
-        st.session_state.collect_task_logs = []
-        st.session_state.collect_candidates = []
-        st.session_state.collect_runtime_state = {
-            "running": False,
-            "paused": False,
-            "stopped": False,
-            "logs": [],
-            "candidates": [],
-            "skipped_count": 0,
-            "task_config": st.session_state.pending_collect_task,
-            "thread": None,
-        }
+    if st.button("开始采集", type="primary"):
         st.session_state.show_new_task_dialog = False
         st.switch_page("pages/06_智联采集.py")
 
@@ -195,19 +170,6 @@ def load_home_dashboard_data() -> dict:
     return data
 
 
-@st.cache_data(ttl=120)
-def zhilian_login_status() -> str:
-    state_path = Path("data/browser_state/zhilian_default.json")
-    profile_dir = Path("data/browser_state/zhilian_default_profile")
-    if state_path.exists() or profile_dir.exists():
-        return "已保存登录态"
-    return st.session_state.get("zhilian_login_status_default", "待登录")
-
-
-def extension_status(connected: bool) -> tuple[str, str]:
-    return ("已连接", "ok") if connected else ("待连接", "muted")
-
-
 def status_class(text: str) -> str:
     if "已" in text or "连接" in text or "运行" in text:
         return "ok"
@@ -243,8 +205,9 @@ def platform_card_html(platform: dict, data: dict) -> str:
     <div><span>运行批次</span><strong>{fmt_count(running)}</strong></div>
   </div>
   <div class="home-card-actions">
-    <a class="vibe-outline-btn" href="/平台登录" target="_self">打开目录</a>
+    <a class="vibe-outline-btn" href="{platform['site_url']}" target="_blank">打开页面</a>
     <a class="vibe-primary-btn" href="{platform['href']}" target="_self">进入采集</a>
+    <a class="vibe-outline-btn" href="/简历管理" target="_self">简历目录</a>
   </div>
 </div>
 """
@@ -267,39 +230,51 @@ def stat_row_html(title: str, subtitle: str, items: list[tuple[str, str, str]]) 
 
 
 home_data = load_home_dashboard_data()
-boss_ext_text, boss_ext_class = extension_status(get_boss_bridge().ws_server.is_extension_connected)
-qiancheng_ext_text, qiancheng_ext_class = extension_status(get_qiancheng_bridge().ws_server.is_extension_connected)
-zhilian_login_text = zhilian_login_status()
+boss_bridge = get_boss_bridge()
+qiancheng_bridge = get_qiancheng_bridge()
+zhilian_bridge = get_zhilian_bridge()
+
+boss_ext_connected = boss_bridge.ws_server.is_extension_connected
+qiancheng_ext_connected = qiancheng_bridge.ws_server.is_extension_connected
+zhilian_ext_connected = zhilian_bridge.ws_server.is_extension_connected
+
+boss_page_ready = boss_bridge.runtime_state.get("page_ready", False)
+qiancheng_page_ready = qiancheng_bridge.runtime_state.get("page_ready", False)
+zhilian_page_ready = zhilian_bridge.runtime_state.get("page_ready", False)
+
 platforms = [
     {
         "code": "zhilian",
         "name": "智联招聘",
-        "kicker": "主动搜索 / 已投递",
-        "icon": "icon/智联招聘.jpeg",
+        "kicker": "Chrome 扩展采集",
+        "icon": "icon/智联招聘.jpg",
         "href": "/智联采集",
-        "status_label": "登录状态",
-        "status_text": zhilian_login_text,
-        "status_class": status_class(zhilian_login_text),
+        "site_url": "https://rd5.zhaopin.com/",
+        "status_label": "页面状态",
+        "status_text": "已就绪" if zhilian_page_ready else "待打开",
+        "status_class": "ok" if zhilian_page_ready else "muted",
     },
     {
         "code": "boss",
         "name": "BOSS直聘",
         "kicker": "Chrome 扩展采集",
-        "icon": "icon/BOSS直聘.jpeg",
+        "icon": "icon/boss直聘.png",
         "href": "/BOSS采集",
-        "status_label": "扩展连接",
-        "status_text": boss_ext_text,
-        "status_class": boss_ext_class,
+        "site_url": "https://www.zhipin.com/",
+        "status_label": "页面状态",
+        "status_text": "已就绪" if boss_page_ready else "待打开",
+        "status_class": "ok" if boss_page_ready else "muted",
     },
     {
         "code": "qiancheng",
         "name": "前程无忧",
         "kicker": "51job 附件简历",
-        "icon": "icon/前程无忧.jpeg",
+        "icon": "icon/前程无忧.jpg",
         "href": "/51前程无忧采集",
-        "status_label": "扩展连接",
-        "status_text": qiancheng_ext_text,
-        "status_class": qiancheng_ext_class,
+        "site_url": "https://ehire.51job.com/",
+        "status_label": "页面状态",
+        "status_text": "已就绪" if qiancheng_page_ready else "待打开",
+        "status_class": "ok" if qiancheng_page_ready else "muted",
     },
 ]
 
@@ -311,6 +286,10 @@ dashboard_css = """
 .home-dashboard-title h2 { margin:0; color:var(--color-text); font-size:24px; font-weight:900; letter-spacing:-.4px; }
 .home-dashboard-title p { margin:5px 0 0; color:var(--color-text-secondary); font-size:13px; }
 .home-refresh-note { color:var(--color-text-secondary); font-size:12px; white-space:nowrap; }
+.home-ext-bar { display:flex; align-items:center; gap:14px; font-size:13px; color:var(--color-text-secondary); white-space:nowrap; }
+.home-ext-dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:4px; }
+.home-ext-on { background:var(--color-success); }
+.home-ext-off { background:var(--color-text-muted); }
 .home-platform-grid { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:12px; }
 .home-platform-card { min-height:292px; padding:20px; background:var(--color-surface); border:1px solid var(--color-border); border-radius:22px; box-shadow:var(--shadow-sm, 0 12px 34px rgba(15,23,42,.07)); box-sizing:border-box; }
 .home-platform-head { display:flex; justify-content:space-between; gap:14px; align-items:flex-start; padding-bottom:14px; border-bottom:1px solid var(--color-border); }
@@ -351,6 +330,15 @@ collect_total = sum(int(value or 0) for value in collect_totals.values())
 archive_rate = round(resume_total / collect_total * 100) if collect_total else 0
 interviews = home_data["interviews"]
 
+ext_bar_html = (
+    '<div class="home-ext-bar">'
+    f'<span class="home-ext-dot home-ext-{"on" if zhilian_ext_connected else "off"}"></span>智联'
+    f'<span class="home-ext-dot home-ext-{"on" if boss_ext_connected else "off"}"></span>BOSS'
+    f'<span class="home-ext-dot home-ext-{"on" if qiancheng_ext_connected else "off"}"></span>前程'
+    f'<span class="home-refresh-note">缓存 30s · 上限 {settings.crawler_max_resumes_per_task}</span>'
+    '</div>'
+)
+
 platform_cards = "".join(platform_card_html(platform, home_data) for platform in platforms)
 resume_stats = stat_row_html(
     "简历库总数",
@@ -385,7 +373,7 @@ st.markdown(
       <h2>招聘采集工作台</h2>
       <p>参考三平台入口 + 简历库 + 面试进度的总览结构，关键操作集中在同一屏完成。</p>
     </div>
-    <div class="home-refresh-note">数据缓存 30 秒 · 单次采集上限 {settings.crawler_max_resumes_per_task}</div>
+    {ext_bar_html}
   </div>
   <div class="home-platform-grid">{platform_cards}</div>
   {resume_stats}

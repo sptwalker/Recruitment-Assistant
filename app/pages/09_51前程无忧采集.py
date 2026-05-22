@@ -18,7 +18,7 @@ inject_vibe_style("51前程无忧采集")
 page_header(
     "51前程无忧采集",
     "通过 Chrome 扩展在 ehire 页面内自动采集附件简历，完全绕过反检测。",
-    icon="icon/前程无忧.jpeg",
+    icon="icon/前程无忧.jpg",
 )
 
 st.markdown(

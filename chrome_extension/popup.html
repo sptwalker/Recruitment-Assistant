@@ -3,28 +3,58 @@
 <head>
   <meta charset="utf-8">
   <style>
-    body { width: 280px; padding: 16px; font-family: -apple-system, sans-serif; font-size: 13px; color: #333; }
-    h3 { margin: 0 0 12px; font-size: 15px; color: #4A90E2; }
-    .status { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
-    .dot { width: 8px; height: 8px; border-radius: 50%; }
+    body { width: 300px; padding: 16px; font-family: -apple-system, sans-serif; font-size: 13px; color: #333; }
+    h3 { margin: 0 0 14px; font-size: 15px; color: #4A90E2; }
+    .platform { margin-bottom: 12px; padding: 10px; background: #f8f9fa; border-radius: 8px; }
+    .platform-name { font-weight: 600; margin-bottom: 6px; font-size: 13px; }
+    .status { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; font-size: 12px; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
     .dot.on { background: #52c41a; }
     .dot.off { background: #ccc; }
-    .info { color: #666; font-size: 12px; margin-top: 12px; padding-top: 12px; border-top: 1px solid #eee; }
+    .info { color: #666; font-size: 11px; margin-top: 12px; padding-top: 10px; border-top: 1px solid #eee; }
   </style>
 </head>
 <body>
-  <h3>Boss直聘采集助手</h3>
-  <div class="status">
-    <span class="dot" id="wsDot"></span>
-    <span id="wsStatus">检测中...</span>
+  <h3>招聘平台采集助手</h3>
+
+  <div class="platform" id="boss-section">
+    <div class="platform-name">BOSS直聘</div>
+    <div class="status">
+      <span class="dot" id="boss-wsDot"></span>
+      <span id="boss-wsStatus">检测中...</span>
+    </div>
+    <div class="status">
+      <span class="dot" id="boss-pageDot"></span>
+      <span id="boss-pageStatus">-</span>
+    </div>
   </div>
-  <div class="status">
-    <span class="dot" id="pageDot"></span>
-    <span id="pageStatus">-</span>
+
+  <div class="platform" id="qiancheng-section">
+    <div class="platform-name">51前程无忧</div>
+    <div class="status">
+      <span class="dot" id="qiancheng-wsDot"></span>
+      <span id="qiancheng-wsStatus">检测中...</span>
+    </div>
+    <div class="status">
+      <span class="dot" id="qiancheng-pageDot"></span>
+      <span id="qiancheng-pageStatus">-</span>
+    </div>
   </div>
+
+  <div class="platform" id="zhilian-section">
+    <div class="platform-name">智联招聘</div>
+    <div class="status">
+      <span class="dot" id="zhilian-wsDot"></span>
+      <span id="zhilian-wsStatus">检测中...</span>
+    </div>
+    <div class="status">
+      <span class="dot" id="zhilian-pageDot"></span>
+      <span id="zhilian-pageStatus">-</span>
+    </div>
+  </div>
+
   <div class="info">
-    采集控制请在 Streamlit 面板操作<br>
-    (08_BOSS采集 页面)
+    采集控制请在 Streamlit 面板操作
   </div>
   <script src="popup.js"></script>
 </body>

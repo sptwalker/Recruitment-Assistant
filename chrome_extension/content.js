@@ -40,6 +40,19 @@
         learned_close_preview: "qiancheng_close_preview_selector",
       },
     },
+    zhilian: {
+      code: "zhilian",
+      hostnames: ["rd5.zhaopin.com"],
+      ws_url: "ws://127.0.0.1:8767",
+      auth_markers: ["沟通中", "联系人", "职位管理", "人才推荐", "查看附件简历"],
+      page_markers: ["智联招聘", "zhaopin", "招聘", "沟通", "候选人"],
+      resume_view_text: ["查看附件简历", "查看简历附件", "下载附件简历"],
+      resume_requested_text: ["已向对方要附件简历", "已要附件简历", "附件简历索要中"],
+      storage_keys: {
+        learning_stage: "zhilian_resume_learning_stage",
+        learned_click: "zhilian_resume_download_learned_click",
+      },
+    },
   };
 
   function detectPlatform() {
@@ -3009,6 +3022,467 @@
     }
   }
 
+  // ============================================================
+  // Zhilian (智联招聘 rd5.zhaopin.com) 采集辅助函数 + 主循环
+  // ============================================================
+  // rd5.zhaopin.com 使用泛化 CSS class，因此依赖视口坐标区分左右面板：
+  //   左侧候选人列表面板：x ~170-440
+  //   右侧详情/聊天面板：x ≥ 420
+  // ============================================================
+
+  function zhilianIsVisible(el) {
+    const rect = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none" && style.opacity !== "0";
+  }
+
+  function getZhilianCandidateTargets(seenSet) {
+    const viewportH = window.innerHeight || document.documentElement.clientHeight || 0;
+    const minTop = 220;
+    const maxBottom = Math.max(minTop + 80, viewportH - 12);
+    const inViewport = (rect) => rect.top >= minTop && rect.bottom <= maxBottom;
+    const skip = (text) => /快速处理|新招呼|99\+人|全部职位|筛选|批量/.test(text);
+    const normalize = (text) => (text || "").replace(/\s+/g, " ").trim();
+
+    const cardAt = (x, y) => {
+      const stack = document.elementsFromPoint(x, y);
+      let best = null;
+      for (const el of stack) {
+        if (!zhilianIsVisible(el)) continue;
+        const rect = el.getBoundingClientRect();
+        const text = normalize(el.innerText || el.textContent);
+        if (
+          rect.left >= 170 && rect.left <= 440 && rect.top >= 220 &&
+          rect.top <= y && rect.bottom >= y &&
+          rect.width >= 200 && rect.width <= 280 &&
+          rect.height >= 45 && rect.height <= 130 &&
+          text.length >= 2 && text.length <= 260 && !skip(text)
+        ) {
+          if (!best || rect.width * rect.height > best.getBoundingClientRect().width * best.getBoundingClientRect().height) {
+            best = el;
+          }
+        }
+      }
+      return best;
+    };
+
+    // Strategy 1: find red badge markers (unread indicators) and locate cards near them
+    const redMarkers = Array.from(document.querySelectorAll("*"))
+      .filter((el) => zhilianIsVisible(el))
+      .map((el) => ({ el, rect: el.getBoundingClientRect(), style: window.getComputedStyle(el), text: normalize(el.innerText || el.textContent) }))
+      .filter((item) => {
+        const rect = item.rect;
+        if (rect.left < 170 || rect.left > 215 || rect.top < 220 || rect.width > 34 || rect.height > 34 || !inViewport(rect)) return false;
+        const className = String(item.el.className || "").toLowerCase();
+        const color = `${item.style.backgroundColor} ${item.style.color} ${item.style.borderColor}`;
+        return /badge|dot|unread|red|count|notice|num/.test(className) || /rgb\( ?(2[0-5][0-5]|1[5-9][0-9])[, ]+([0-9]{1,3})[, ]+([0-9]{1,3})/.test(color) || /^\d{1,3}$/.test(item.text);
+      })
+      .sort((a, b) => a.rect.top - b.rect.top);
+
+    const targets = [];
+    for (const marker of redMarkers) {
+      const y = marker.rect.top + marker.rect.height / 2;
+      const card = cardAt(300, y) || cardAt(260, y) || cardAt(220, y) || cardAt(390, y);
+      if (card && !targets.includes(card)) targets.push(card);
+    }
+
+    // Strategy 2: find list-like elements in the left panel area
+    const rows = Array.from(document.querySelectorAll('li, article, section, div[role="listitem"], div[role="button"], [class*="conversation"], [class*="session"], [class*="item"], [class*="card"]'))
+      .filter((el) => zhilianIsVisible(el))
+      .map((el) => ({ el, rect: el.getBoundingClientRect(), text: normalize(el.innerText || el.textContent) }))
+      .filter((item) =>
+        item.rect.left >= 170 && item.rect.left <= 440 && item.rect.top >= 220 && inViewport(item.rect) &&
+        item.rect.width >= 200 && item.rect.width <= 280 &&
+        item.rect.height >= 45 && item.rect.height <= 130 &&
+        item.text.length >= 2 && item.text.length <= 260 && !skip(item.text)
+      )
+      .sort((a, b) => a.rect.top - b.rect.top);
+
+    for (const row of rows) {
+      if (!targets.includes(row.el)) targets.push(row.el);
+    }
+
+    // Build output, filtering already-seen candidates
+    const output = [];
+    const used = new Set();
+    for (const target of targets) {
+      const rect = target.getBoundingClientRect();
+      const signature = normalize(target.innerText || target.textContent).slice(0, 220);
+      const positionKey = `pos:${Math.round(rect.left)}:${Math.round(rect.top)}:${Math.round(rect.width)}:${Math.round(rect.height)}`;
+      const key = `${positionKey}:${signature}`;
+      if (!signature || seenSet.has(signature) || used.has(key) || skip(signature) || !inViewport(rect)) continue;
+      const clickX = Math.min(410, Math.max(230, rect.left + rect.width * 0.55));
+      const clickY = rect.top + rect.height / 2;
+      if (clickY < minTop || clickY > maxBottom) continue;
+      used.add(key);
+      output.push({ element: target, name: signature, index: output.length, clickX, clickY });
+      if (output.length >= 24) break;
+    }
+    return output;
+  }
+
+  function extractZhilianContactInfo() {
+    const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 1440;
+    const rightLeft = Math.max(420, viewportWidth * 0.42);
+    const normalize = (text) => (text || "").replace(/\s+/g, " ").trim();
+    const summaryCore = /\d{2}\s*岁|博士|硕士|研究生|本科|大专|专科|高中|中专|离职|在职|期望[:：]|1[3-9]\d(?:\s*\d){8}/;
+    const excludes = /聊天记录|快捷回复|发送|表情|请输入|已读|未读|要附件简历|查看附件简历|下载简历|工作经历|项目经历|教育经历|自我评价|求职信/;
+
+    // Find the best summary container in the right panel top area
+    const nodes = Array.from(document.querySelectorAll("aside, section, header, article, div"))
+      .filter((el) => zhilianIsVisible(el))
+      .map((el) => {
+        const rect = el.getBoundingClientRect();
+        const text = normalize(el.innerText || el.textContent || el.getAttribute("title") || el.getAttribute("aria-label"));
+        const cls = String(el.className || "");
+        const area = rect.width * rect.height;
+        const topSummaryZone = rect.left >= rightLeft && rect.top >= 40 && rect.top <= 360 && rect.width >= 260 && rect.height >= 36 && rect.height <= 360;
+        const classScore = /candidate|profile|detail|resume|user|person|talent|card|info|basic|summary/i.test(cls) ? 30 : 0;
+        const textScore = (summaryCore.test(text) ? 50 : 0) + (/期望[:：].*·.*·/.test(text) ? 45 : 0) + (/1[3-9]\d(?:\s*\d){8}/.test(text) ? 35 : 0);
+        return { el, rect, text, area, topSummaryZone, score: classScore + textScore + Math.max(0, 40 - rect.top / 10) + Math.min(area / 12000, 20) };
+      })
+      .filter((item) => item.topSummaryZone && item.text && item.text.length >= 4 && item.text.length <= 1200 && !excludes.test(item.text) && summaryCore.test(item.text));
+
+    nodes.sort((a, b) => b.score - a.score || a.rect.top - b.rect.top || b.area - a.area);
+    const best = nodes[0];
+    if (!best) return { name: "待识别", age: "待识别", education: "待识别", job_title: "", phone: "", raw_text: "" };
+
+    // Collect text parts from the best container
+    const parts = [];
+    const seen = new Set();
+    const add = (text) => {
+      const line = normalize(text);
+      if (!line || seen.has(line) || line.length > 260 || excludes.test(line)) return;
+      seen.add(line);
+      parts.push(line);
+    };
+    add(best.text);
+    for (const child of Array.from(best.el.querySelectorAll("div, span, p, li")).filter(zhilianIsVisible)) {
+      add(child.innerText || child.textContent || child.getAttribute("title") || child.getAttribute("aria-label"));
+      if (parts.length >= 16) break;
+    }
+    const merged = parts.join(" ");
+
+    // Parse fields from merged text
+    const info = { name: "待识别", age: "待识别", education: "待识别", job_title: "", phone: "", raw_text: merged.slice(0, 200) };
+    const degreePattern = /博士|硕士|研究生|本科|大专|专科|高中|中专/;
+    const summaryMatch = merged.match(/([一-龥]{2,4}|[A-Za-z][A-Za-z .·-]{1,30})\s+(\d{2})\s*岁\s*(博士|硕士|研究生|本科|大专|专科|高中|中专)?/);
+    if (summaryMatch) {
+      info.name = summaryMatch[1].trim();
+      info.age = `${summaryMatch[2]}岁`;
+      let edu = summaryMatch[3] || "";
+      if (edu === "研究生") edu = "硕士";
+      if (edu === "专科") edu = "大专";
+      if (edu) info.education = edu;
+    } else {
+      // Fallback: try to find age and education separately
+      const ageMatch = merged.match(/(\d{2})\s*岁/);
+      if (ageMatch) info.age = `${ageMatch[1]}岁`;
+      const eduMatch = merged.match(degreePattern);
+      if (eduMatch) {
+        let edu = eduMatch[0];
+        if (edu === "研究生") edu = "硕士";
+        if (edu === "专科") edu = "大专";
+        info.education = edu;
+      }
+      // Try to find name before age
+      if (ageMatch) {
+        const beforeAge = merged.slice(0, ageMatch.index).trim();
+        const nameMatches = Array.from(beforeAge.matchAll(/[一-龥]{2,4}/g)).map((m) => m[0]);
+        if (nameMatches.length > 0) info.name = nameMatches[nameMatches.length - 1];
+      }
+    }
+    // Extract job title from "期望" line
+    const expectMatch = merged.match(/期望[:：]\s*([^·\n\r]{1,40})\s*·\s*([^·\n\r,，；;]{2,40})\s*·\s*([^·\n\r,，；;]{2,40})/);
+    if (expectMatch) info.job_title = expectMatch[2].trim();
+    // Extract phone
+    const phoneMatch = merged.match(/(?<!\d)(1[3-9]\d(?:\s*\d){8})(?!\d)/);
+    if (phoneMatch) info.phone = phoneMatch[1].replace(/\s/g, "");
+    return info;
+  }
+
+  function getZhilianAttachmentButtonState() {
+    const viewportW = window.innerWidth || document.documentElement.clientWidth || 0;
+    const viewportH = window.innerHeight || document.documentElement.clientHeight || 0;
+    const chatLeft = Math.max(420, Math.round(viewportW * 0.34));
+    const bottomTop = Math.max(70, Math.round(viewportH * 0.50));
+    const normalize = (text) => (text || "").replace(/\s+/g, " ").trim();
+    const allText = (el) => normalize([el.innerText, el.textContent, el.getAttribute("title"), el.getAttribute("aria-label")].filter(Boolean).join(" "));
+    const disabledLike = (el) => {
+      const cls = String(el.className || "").toLowerCase();
+      const style = window.getComputedStyle(el);
+      return el.disabled === true || el.getAttribute("disabled") !== null || el.getAttribute("aria-disabled") === "true" || cls.includes("is-disabled") || /(^|[-_\s])disabled($|[-_\s])/.test(cls) || style.pointerEvents === "none";
+    };
+    const inRightBottom = (rect) => rect.left > chatLeft && rect.top > bottomTop && rect.top < viewportH - 8 && rect.width <= 900 && rect.height <= 320;
+    const classify = (text) => {
+      if (/查看附件简历|查看简历附件|下载附件简历|下载简历附件/.test(text)) return "view";
+      if (/已向对方要附件简历|已要附件简历|已索要|附件简历索要中/.test(text)) return "already_requested";
+      if (/要附件简历|索要附件简历|请求附件简历|获取附件简历|要简历/.test(text)) return "request";
+      return "";
+    };
+
+    const nodes = document.querySelectorAll('button, a, [role="button"], [tabindex], span, div, [class*="button"], [class*="btn"], [class*="attach"], [class*="resume"]');
+    const candidates = [];
+    for (const el of nodes) {
+      if (!zhilianIsVisible(el)) continue;
+      const rect = el.getBoundingClientRect();
+      if (!inRightBottom(rect)) continue;
+      const text = allText(el);
+      const kind = classify(text);
+      if (!kind) continue;
+      candidates.push({ kind, disabled: disabledLike(el), top: rect.top, left: rect.left, area: rect.width * rect.height });
+    }
+    candidates.sort((a, b) => b.top - a.top || a.area - b.area || a.left - b.left);
+    const item = candidates[0];
+    if (!item) return "missing";
+    if (item.kind === "view") return item.disabled ? "missing" : "view";
+    if (item.kind === "already_requested") return "already_requested";
+    return item.disabled ? "missing" : "request";
+  }
+
+  function clickZhilianTextButton(patterns) {
+    const viewportW = window.innerWidth || document.documentElement.clientWidth || 0;
+    const chatLeft = Math.max(420, Math.round(viewportW * 0.34));
+    const nodes = document.querySelectorAll('button, a, [role="button"], span, div, [class*="btn"], [class*="button"], [class*="attach"], [class*="resume"]');
+    for (const el of nodes) {
+      if (!zhilianIsVisible(el)) continue;
+      const rect = el.getBoundingClientRect();
+      if (rect.left < chatLeft || rect.width > 900) continue;
+      const text = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
+      for (const pat of patterns) {
+        if (text.includes(pat)) {
+          el.click();
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  function clickZhilianViewAttachment() {
+    return clickZhilianTextButton(["查看附件简历", "查看简历附件", "下载附件简历", "下载简历附件"]);
+  }
+
+  function clickZhilianRequestAttachment() {
+    return clickZhilianTextButton(["要附件简历", "索要附件简历", "请求附件简历", "获取附件简历", "要简历"]);
+  }
+
+  function clickZhilianAttachmentCard() {
+    const viewportW = window.innerWidth || document.documentElement.clientWidth || 0;
+    const chatLeft = Math.max(420, Math.round(viewportW * 0.34));
+    const cards = document.querySelectorAll('[class*="file"], [class*="attach"], [class*="card"], [class*="message"]');
+    for (const el of cards) {
+      if (!zhilianIsVisible(el)) continue;
+      const rect = el.getBoundingClientRect();
+      if (rect.left < chatLeft || rect.width > 600 || rect.height > 200 || rect.height < 20) continue;
+      const text = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
+      if (/\.(pdf|doc|docx|zip|rar)/i.test(text) || /简历|resume/i.test(text)) {
+        el.click();
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function scrollZhilianCandidateList(dy) {
+    const viewportW = window.innerWidth || document.documentElement.clientWidth || 0;
+    const panelRight = Math.min(440, Math.round(viewportW * 0.35));
+    const midX = Math.round(panelRight / 2 + 85);
+    const midY = Math.round((window.innerHeight || 600) / 2);
+    const els = document.elementsFromPoint(midX, midY);
+    for (const el of els) {
+      if (el.scrollHeight > el.clientHeight + 10) {
+        el.scrollBy({ top: dy, behavior: "smooth" });
+        return true;
+      }
+    }
+    return false;
+  }
+
+  async function waitZhilianDetailSwitch(previousName, timeoutMs) {
+    const deadline = Date.now() + (timeoutMs || 3000);
+    while (Date.now() < deadline) {
+      const info = extractZhilianContactInfo();
+      if (info.name && info.name !== previousName && info.name !== "未知") return info.name;
+      await sleep(200);
+    }
+    return null;
+  }
+
+  async function zhilianCollectLoop() {
+    if (!isAuthenticated()) {
+      emit({ type: "error", data: { message: "未检测到智联招聘登录态", stage: "pre_check" } });
+      state = "idle";
+      return;
+    }
+    emit({ type: "page_ready", data: { url: location.href } });
+    emit({ type: "boss_content_script_collect_started", data: { content_script_version: CONTENT_SCRIPT_VERSION, key_count: preDedup.keys.size, signature_count: preDedup.signatures.size } });
+
+    const seenSet = new Set();
+    let scrollRetries = 0;
+    const MAX_SCROLL_RETRIES = 5;
+    let previousDetailName = "";
+
+    while (state !== "stopped" && results.completed < config.max_resumes) {
+      await waitForPause();
+      if (state === "stopped") break;
+
+      let targets = getZhilianCandidateTargets(seenSet);
+      emit({ type: "candidate_list_scanned", data: { count: targets.length, scanned: results.scanned } });
+
+      if (targets.length === 0) {
+        scrollRetries++;
+        if (scrollRetries > MAX_SCROLL_RETRIES) {
+          emit({ type: "collect_finished", data: { reason: "no_more_candidates", completed: results.completed, skipped: results.skipped } });
+          state = "idle";
+          return;
+        }
+        scrollZhilianCandidateList(400);
+        await sleep(1200);
+        continue;
+      }
+      scrollRetries = 0;
+
+      for (const target of targets) {
+        if (state === "stopped") break;
+        await waitForPause();
+        if (state === "stopped") break;
+        if (results.completed >= config.max_resumes) break;
+
+        seenSet.add(target.name || `idx_${target.index}`);
+        results.scanned++;
+        results.currentIndex = target.index;
+        const stepStart = Date.now();
+
+        try {
+          target.element.scrollIntoView({ block: "center" });
+          await sleep(100);
+          target.element.click();
+          await sleep(600);
+        } catch (err) {
+          emit({ type: "candidate_skipped", data: { candidate_signature: target.name || `idx_${target.index}`, reason: "click_failed", error: String(err) } });
+          results.skipped++;
+          emitProgress();
+          continue;
+        }
+
+        const newName = await waitZhilianDetailSwitch(previousDetailName, 4000);
+        const info = extractZhilianContactInfo();
+        const candidateName = info.name || newName || target.name || "未知";
+        const candidateAge = info.age || "未知";
+        const candidateEdu = info.education || "未知";
+        const candidateSig = `${candidateName}/${candidateAge}/${candidateEdu}`;
+        previousDetailName = candidateName;
+
+        emit({ type: "candidate_clicked", data: { name: candidateName, age: candidateAge, education: candidateEdu, job_title: info.job_title || "", index: target.index, elapsed_ms: Date.now() - stepStart } });
+
+        if (candidateName === "未知" && candidateAge === "未知" && candidateEdu === "未知") {
+          emit({ type: "candidate_skipped", data: { candidate_signature: candidateSig, reason: "candidate_info_unrecognized" } });
+          results.skipped++;
+          emitProgress();
+          continue;
+        }
+
+        const dedupResult = checkPreDedup(candidateSig, info);
+        if (dedupResult.hit) {
+          emit({ type: "candidate_skipped", data: { candidate_signature: candidateSig, reason: "boss_dedup_hit", candidate_key: dedupResult.key } });
+          results.skipped++;
+          emitProgress();
+          continue;
+        }
+
+        await sleep(300);
+        const btnState = getZhilianAttachmentButtonState();
+        emit({ type: "zhilian_attachment_button_state", data: { candidate_signature: candidateSig, state: btnState } });
+
+        if (btnState === "view") {
+          const clicked = clickZhilianViewAttachment();
+          if (!clicked) {
+            const cardClicked = clickZhilianAttachmentCard();
+            if (!cardClicked) {
+              emit({ type: "candidate_skipped", data: { candidate_signature: candidateSig, reason: "download_button_not_found" } });
+              results.skipped++;
+              emitProgress();
+              continue;
+            }
+          }
+          await sleep(1500);
+
+          const downloadRequestId = `zhilian_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+          const downloadWaiter = registerDownloadWaiter(downloadRequestId);
+
+          chrome.runtime.sendMessage({
+            type: "download_intent",
+            data: {
+              candidate_signature: candidateSig,
+              candidate_info: info,
+              download_request_id: downloadRequestId,
+              platform_code: "zhilian",
+            },
+          });
+
+          const downloadResult = await Promise.race([downloadWaiter, sleep(30000).then(() => null)]);
+
+          if (downloadResult && downloadResult.download_path) {
+            emit({
+              type: "resume_downloaded",
+              data: {
+                candidate_signature: candidateSig,
+                candidate_info: info,
+                filename: downloadResult.filename || "",
+                download_path: downloadResult.download_path,
+                url: downloadResult.url || "",
+                download_request_id: downloadRequestId,
+              },
+            });
+            const ack = await waitForPersistAck(candidateSig, 15000);
+            if (ack && ack.status === "saved") {
+              results.completed++;
+            } else {
+              results.skipped++;
+            }
+          } else {
+            emit({ type: "candidate_skipped", data: { candidate_signature: candidateSig, reason: "download_failed" } });
+            results.skipped++;
+          }
+        } else if (btnState === "request") {
+          if (config.request_resume_if_missing) {
+            const requestClicked = clickZhilianRequestAttachment();
+            if (requestClicked) {
+              await sleep(1000);
+              emit({ type: "zhilian_resume_request_clicked", data: { candidate_signature: candidateSig } });
+              emit({ type: "resume_request_success", data: { candidate_signature: candidateSig, request_sent: true } });
+              emit({ type: "candidate_skipped", data: { candidate_signature: candidateSig, reason: "resume_requested_by_user" } });
+            } else {
+              emit({ type: "candidate_skipped", data: { candidate_signature: candidateSig, reason: "no_resume_attachment" } });
+            }
+            results.skipped++;
+          } else {
+            emit({ type: "candidate_skipped", data: { candidate_signature: candidateSig, reason: "need_request_resume" } });
+            results.skipped++;
+          }
+        } else if (btnState === "already_requested") {
+          emit({ type: "candidate_skipped", data: { candidate_signature: candidateSig, reason: "resume_request_already_sent" } });
+          results.skipped++;
+        } else {
+          emit({ type: "candidate_skipped", data: { candidate_signature: candidateSig, reason: "no_resume_attachment" } });
+          results.skipped++;
+        }
+
+        emitProgress();
+        const interval = config.scan_interval_ms || config.interval_ms || 2000;
+        await sleep(interval + Math.random() * 500);
+      }
+
+      scrollZhilianCandidateList(300);
+      await sleep(800);
+    }
+
+    const stopped = state === "stopped";
+    state = "idle";
+    emit({ type: "collect_finished", data: { completed: results.completed, skipped: results.skipped, stopped } });
+  }
+
   async function collectLoop() {
     if (!isActiveInstance()) return;
     if (activeCollectLoopRunId === activeRunId) return;
@@ -3020,6 +3494,10 @@
       }
       if (PLATFORM && PLATFORM.code === "qiancheng") {
         await qianchengCollectLoop();
+        return;
+      }
+      if (PLATFORM && PLATFORM.code === "zhilian") {
+        await zhilianCollectLoop();
         return;
       }
       if (!isAuthenticated()) {

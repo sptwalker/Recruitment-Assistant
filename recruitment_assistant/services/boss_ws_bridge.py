@@ -27,8 +27,8 @@ from recruitment_assistant.services.test_run_watchdog import WatchdogState
 
 
 BOSS_BRIDGE_VERSION = "1.95.0"
-BOSS_EXTENSION_EXPECTED_VERSION = "1.87.0"
-BOSS_CONTENT_SCRIPT_EXPECTED_VERSION = "1.87.0"
+BOSS_EXTENSION_EXPECTED_VERSION = "1.95.0"
+BOSS_CONTENT_SCRIPT_EXPECTED_VERSION = "1.95.0"
 
 
 class BossWSBridge:

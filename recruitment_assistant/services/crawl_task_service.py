@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import BigInteger, Column, DateTime, Integer, MetaData, String, Table, Text, delete, func, select
+from sqlalchemy import BigInteger, Column, DateTime, Integer, MetaData, String, Table, Text, delete, func, select, update
 from sqlalchemy.orm import Session
 
 from recruitment_assistant.storage.db import engine
@@ -91,6 +91,20 @@ class CrawlTaskService:
             stmt = stmt.where(CrawlTask.platform_code == platform_code)
         task_count, resume_count = self.session.execute(stmt).one()
         return int(task_count or 0), int(resume_count or 0)
+
+    def reap_stale_running_tasks(self, platform_code: str | None = None) -> int:
+        # Streamlit/Chrome 异常退出会留下 status='running' 但进程已死的孤儿任务，
+        # 启动时统一收尾为 cancelled，避免首页 "运行中" 永久误报。
+        stmt = update(CrawlTask).where(CrawlTask.status == "running").values(
+            status="cancelled",
+            finished_at=datetime.now(),
+            error_message="进程异常退出，启动时自动收尾",
+        )
+        if platform_code:
+            stmt = stmt.where(CrawlTask.platform_code == platform_code)
+        result = self.session.execute(stmt)
+        self.session.commit()
+        return int(result.rowcount or 0)
 
 
 class PlatformCandidateRecordService:

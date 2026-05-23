@@ -10,6 +10,7 @@ from components.layout import icon_data_uri, inject_vibe_style
 from recruitment_assistant.config.settings import get_settings
 from recruitment_assistant.storage.db import create_session
 from recruitment_assistant.storage.models import CrawlTask
+from recruitment_assistant.services.crawl_task_service import CrawlTaskService
 from recruitment_assistant.storage.resume_db import create_resume_session, init_resume_database
 from recruitment_assistant.storage.resume_models import (
     Candidate,
@@ -66,6 +67,12 @@ def ensure_home_resume_database_initialized() -> None:
     init_resume_database()
 
 
+@st.cache_resource
+def reap_stale_running_tasks_once() -> int:
+    with create_session() as session:
+        return CrawlTaskService(session).reap_stale_running_tasks()
+
+
 def fmt_count(value: int | float | None) -> str:
     if value is None:
         return "-"
@@ -90,6 +97,7 @@ def load_home_dashboard_data() -> dict:
 
     try:
         ensure_home_resume_database_initialized()
+        reap_stale_running_tasks_once()
         with create_resume_session() as session:
             platform_counts = dict(
                 session.execute(

@@ -1,12 +1,13 @@
-﻿"""Bridge between WebSocket events and Zhilian (zhaopin rd5) business logic.
+﻿"""Bridge between WebSocket events and Zhilian (zhaopin rd5/rd6) business logic.
 
-基于 boss_ws_bridge.py 复制 + 命名空间替换而来。BOSS 专属事件 case 保留
-（运行时不会被触发，因为扩展端不会在 zhilian 平台 emit BOSS 专属事件）。
-等 Phase 4 学习模式起来后再补 zhilian 专属事件 case。
+最初基于 boss_ws_bridge.py 拷贝命名空间而来。BOSS 专属事件 case 和 boss_*
+配置字段是协议层兼容用的占位（content.js 在 zhilian 路径下不会 emit
+boss_svg_* 等事件，但保留 case 以便切换平台时事件类型保持单一来源）。
 """
 
 import asyncio
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -31,9 +32,9 @@ from recruitment_assistant.utils.snapshot_utils import safe_filename
 from recruitment_assistant.services.test_run_watchdog import WatchdogState
 
 
-ZHILIAN_BRIDGE_VERSION = "1.1.0"
-ZHILIAN_EXTENSION_EXPECTED_VERSION = "1.87.0"
-ZHILIAN_CONTENT_SCRIPT_EXPECTED_VERSION = "1.87.0"
+ZHILIAN_BRIDGE_VERSION = "1.21.0"
+ZHILIAN_EXTENSION_EXPECTED_VERSION = "2.14.0"
+ZHILIAN_CONTENT_SCRIPT_EXPECTED_VERSION = "2.14.0"
 
 
 class ZhilianWSBridge:
@@ -45,6 +46,7 @@ class ZhilianWSBridge:
         self._seen_skip_records: set[str] = set()
         self._recent_ui_log_keys: dict[str, float] = {}
         self._saved_resume_hash_signatures: dict[str, str] = {}
+        self._last_content_script_ready_signature: str | None = None
         self._collect_timer: threading.Timer | None = None
         self._watchdog: WatchdogState = WatchdogState()
         self._watchdog_task: "Future[None] | None" = None  # concurrent.futures.Future from run_coroutine_threadsafe
@@ -94,6 +96,7 @@ class ZhilianWSBridge:
         self._seen_skip_records.clear()
         self._recent_ui_log_keys.clear()
         self._saved_resume_hash_signatures.clear()
+        self._last_content_script_ready_signature = None
         self._stop_watchdog_loop()
         self._watchdog.reset()
         self.runtime_state.update({
@@ -186,7 +189,6 @@ class ZhilianWSBridge:
             run_id = self.runtime_state.get("run_id", "")
             max_resumes = int(config.get("max_resumes") or 0)
             interval_ms = config.get("interval_ms", config.get("scan_interval_ms", ""))
-            request_resume = bool(config.get("request_resume_if_missing"))
             test_mode = config.get("test_mode")
             test_mode_label = test_mode if test_mode not in (None, "", False) else "正式"
             key_count = len(config.get("boss_candidate_keys") or [])
@@ -202,13 +204,12 @@ class ZhilianWSBridge:
             task_label = f"#{task_id}" if task_id else "未创建"
 
             self._log("highlight", f"━━━ 任务初始化 {task_label} ━━━")
-            self._log("highlight", f"执行日期：{now.strftime('%Y-%m-%d %H:%M:%S')}")
             self._log("highlight", f"运行 ID：{run_id}")
             self._log("highlight", f"任务目标：{target_text}（test_mode={test_mode_label}）")
-            self._log("highlight", f"配置：request_resume_if_missing={request_resume}；扫描间隔={interval_text}")
+            if interval_text != "默认":
+                self._log("highlight", f"扫描间隔：{interval_text}")
             self._log("highlight", f"去重基线：{key_count} 条 key / {signature_count} 条签名")
             self._log("highlight", f"版本：页面 {APP_VERSION} / 桥接 {ZHILIAN_BRIDGE_VERSION} / 扩展 {ZHILIAN_EXTENSION_EXPECTED_VERSION} / 脚本 {ZHILIAN_CONTENT_SCRIPT_EXPECTED_VERSION}")
-            self._log("highlight", f"当前会话：扩展已连接 {ext_version}")
             self._log("highlight", "━━━━━━━━━━━━━━━━━━━━")
 
             self._write_event_log("boss_task_initialization_logged", {
@@ -218,7 +219,6 @@ class ZhilianWSBridge:
                 "collect_mode": collect_mode,
                 "collect_minutes": collect_minutes,
                 "interval_ms": interval_ms,
-                "request_resume_if_missing": request_resume,
                 "test_mode": test_mode_label,
                 "key_count": key_count,
                 "signature_count": signature_count,
@@ -610,9 +610,12 @@ class ZhilianWSBridge:
                 version = data.get("content_script_version", "?")
                 key_count = data.get("key_count", 0)
                 signature_count = data.get("signature_count", 0)
-                self._log("info", f"内容脚本已启动采集 v{version}；去重 key={key_count} 条；签名={signature_count} 条")
-                if version and version != ZHILIAN_CONTENT_SCRIPT_EXPECTED_VERSION:
-                    self._log("warning", f"内容脚本版本不匹配: 当前={version}；期望={ZHILIAN_CONTENT_SCRIPT_EXPECTED_VERSION}，请刷新 智联招聘页面")
+                ready_signature = f"{version}|{key_count}|{signature_count}"
+                if ready_signature != self._last_content_script_ready_signature:
+                    self._last_content_script_ready_signature = ready_signature
+                    self._log("info", f"内容脚本已启动采集 v{version}；去重 key={key_count} 条；签名={signature_count} 条")
+                    if version and version != ZHILIAN_CONTENT_SCRIPT_EXPECTED_VERSION:
+                        self._log("warning", f"内容脚本版本不匹配: 当前={version}；期望={ZHILIAN_CONTENT_SCRIPT_EXPECTED_VERSION}，请刷新 智联招聘页面")
             case "boss_pre_dedup_checked":
                 sig = data.get("candidate_signature", "未知")
                 key_count = data.get("key_count", 0)
@@ -689,6 +692,8 @@ class ZhilianWSBridge:
             case "page_ready":
                 self.runtime_state["page_ready"] = True
                 self.runtime_state["page_url"] = data.get("url", "")
+            case "zhilian_nav":
+                pass
             case "page_detected":
                 self.runtime_state["page_ready"] = False
                 self.runtime_state["page_url"] = data.get("url", "")
@@ -703,6 +708,16 @@ class ZhilianWSBridge:
                 elapsed = data.get("elapsed_ms")
                 elapsed_text = f"；识别耗时={elapsed}ms" if elapsed is not None else ""
                 self._log("info", f"点击候选人: {sig} (#{data.get('index', 0)}){elapsed_text}")
+            case "zhilian_attachment_button_state":
+                self._log("info", f"附件按钮状态: {data.get('candidate_signature', '?')} → {data.get('state', '?')}")
+            case "zhilian_attachment_button_found":
+                pass
+            case "zhilian_view_attachment_clicked":
+                pass
+            case "zhilian_attachment_tab_captured":
+                pass
+            case "zhilian_download_no_intent":
+                self._log("warning", f"附件下载触发但 intent 队列为空: download_id={data.get('download_id', '?')}；url={(data.get('url', '') or '')[:120]}")
             case "resume_downloaded":
                 self._save_resume(data)
             case "candidate_skipped":
@@ -1155,6 +1170,17 @@ class ZhilianWSBridge:
                 task_id=task_id,
             )
 
+    @staticmethod
+    def _simplify_talking_position(raw: str) -> str:
+        if not raw:
+            return ""
+        s = re.sub(r"[（(][^）)]*[）)]", "", raw)
+        s = re.split(r"[/／]", s, maxsplit=1)[0]
+        s = s.strip()
+        if len(s) > 8:
+            s = s[:8]
+        return s
+
     def _save_resume(self, data: dict) -> None:
         candidate_sig = data.get("candidate_signature", "未知")
         candidate_info = data.get("candidate_info", {})
@@ -1163,18 +1189,6 @@ class ZhilianWSBridge:
         source_url = str(data.get("url", "") or data.get("direct_url", "") or "") or None
         candidate_key = self._build_boss_candidate_key(candidate_sig, candidate_info)
         download_request_id = str(data.get("download_request_id", "") or "")
-
-        if candidate_key and candidate_key in self._seen_candidate_records:
-            self._log("info", f"去重命中，已存在记录: {candidate_sig}")
-            self._write_event_log("resume_saved_duplicate_skipped", {
-                "signature": candidate_sig,
-                "candidate_key": candidate_key,
-                "info": candidate_info,
-                "status": "duplicate_skipped",
-                "at": datetime.now().isoformat(),
-            })
-            self._send_persist_ack(candidate_sig, candidate_info, "duplicate_skipped", download_request_id, "duplicate_in_run")
-            return
 
         if download_path:
             source = Path(download_path)
@@ -1215,8 +1229,15 @@ class ZhilianWSBridge:
                 name = self._normalize_resume_filename_part(candidate_info.get("name"), "未知姓名")
                 age = self._normalize_resume_filename_part(candidate_info.get("age"), "未知年龄")
                 education = self._normalize_resume_filename_part(candidate_info.get("education"), "未知学历")
+                talking_position_raw = (candidate_info.get("talking_position") or "").strip()
+                simplified_position = self._simplify_talking_position(talking_position_raw)
+                position_part = self._normalize_resume_filename_part(simplified_position, simplified_position) if simplified_position else ""
                 seq = self.runtime_state["downloaded_count"] + 1
-                filename_stem = f"{name}-{age}-{education}-智联招聘-{now.strftime('%Y%m%d')}-{now.strftime('%H%M%S')}-{seq:03d}"
+                stem_parts = [name, age, education]
+                if position_part:
+                    stem_parts.append(position_part)
+                stem_parts.extend(["智联招聘", now.strftime("%Y%m%d"), now.strftime("%H%M%S"), f"{seq:03d}"])
+                filename_stem = "-".join(stem_parts)
                 filename = f"{filename_stem}{suffix}"
 
                 target = target_dir / filename
@@ -1266,6 +1287,7 @@ class ZhilianWSBridge:
                 final_filename = target.name
                 logger.debug("简历已保存: {}", final_filename)
                 self.runtime_state["downloaded_count"] = seq
+                self._log("success", f"已归档简历: {candidate_sig} → {final_filename}")
                 record = {
                     "signature": candidate_sig,
                     "info": candidate_info,
@@ -1346,8 +1368,6 @@ class ZhilianWSBridge:
             self._log("info", f"跳过已索要简历的候选人{candidate_sig}")
         elif reason == "no_resume_attachment":
             pass
-        if reason == "boss_dedup_hit":
-            self._log("info", f"下载前去重命中，跳过附件识别: {candidate_sig}")
         self._write_event_log("candidate_skipped_seen", {
             "signature": candidate_sig,
             "reason": reason,

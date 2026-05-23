@@ -1,5 +1,76 @@
 # 开发日志
 
+## 2026-05-23
+
+### 智联采集闭环：扩展 v1.88.0 → v2.14.0，bridge v1.1.0 → v1.21.0
+
+本日围绕智联采集页面（沟通中聊天页）做了一整轮迭代，从"附件下载失败 / 30s 超时"一路改到"10/10 全成功 + 文件名带简化沟通职位 + 日志精简琥珀化"。
+
+**核心 bug 修复链路**
+
+- **附件主动下载**（`chrome_extension/background.js`）：内联 PDF 服务器不下发 `Content-Disposition: attachment`，`chrome.downloads.onDeterminingFilename` 被动监听永不触发。改为在 `chrome.tabs.onUpdated` 捕获 `attachment.zhaopin.com/.../downloadFileTemporary?file=...` 后主动调 `chrome.downloads.download({url, filename, conflictAction: "uniquify"})` 强制保存，再 500ms 关闭弹出 tab。
+- **列表滚顶**（`chrome_extension/content.js::scrollZhilianCandidateListToTop`）：`zhilianCollectLoop` 进入扫描前找到 `.im-session-item.km-list__item` 向上首个可滚父节点，`scrollTop = 0`，确保从列表真正首位开始采集。
+- **冗余去重清理**（`recruitment_assistant/services/zhilian_ws_bridge.py::_save_resume`）：删除下载成功后再跑一次 `candidate_key in self._seen_candidate_records` 的判定（11 行），下载前 dedup 已经拦截过，重复判定还会在第一份归档完成 + 源文件 unlink 后让第二次走 `_save_resume` 报 "未找到可归档文件"。同时去掉 content.js 内 `notifyDownloadResult` 回执后重复 emit `resume_downloaded` 的代码块（BOSS/前程无忧没这层重复 emit）。
+- **识别耗时跳变**：上游版本中 `extractZhilianContactInfo` 用 `document.querySelectorAll("aside, section, header, article, div")` 全文档遍历 + 节点 `.innerText` / `getBoundingClientRect`，详情面板首次填充后 1k+ 节点强制 layout flush 把单次 extract 推到 1.5–3.5s；`waitZhilianDetailSwitch` 200ms 轮询累计放大到 33s / 74s。
+  - **B（去冗余）**：`waitZhilianDetailSwitch` 改成返回完整 info 对象（超时也返回最近一次 lastInfo），调用方一次 await 拿到 name/age/education/job_title 全字段，删除循环结束后多余的二次 extract 调用。
+  - **C 第一次尝试（已回滚）**：把 selector 收窄成 `[class*="candidate-info"]` 等 5 个模糊候选 → 命中错误的 placeholder 容器，所有姓名都变 "待识别"，立即回退。
+  - **C 第二次（v2.14.0 固化）**：用户提供真实 outerHTML `<div class="im-three-list__panel--job--title" title="...">...`，改用 O(1) 精确 selector `document.querySelector(".im-three-list__panel--job--title")` 拿 `title` 属性（CSS ellipsis 下仍是完整文本）做沟通职位提取；删除上一轮加的 banner 全文档扫描循环。
+- **文件名加沟通职位**（`zhilian_ws_bridge.py::_save_resume`）：在 stem 拼装处插入 `simplified_position = self._simplify_talking_position(...)`，规则：去括号 → 取 `/` 前 → trim → ≤8 字符。非空时 append 进 `stem_parts`，空时跳过避免出现 "--"。新文件名格式：`{姓名}-{年龄}-{学历}-{沟通职位简化}-智联招聘-{YYYYMMDD}-{HHMMSS}-{NNN}{后缀}`。
+
+**UI/日志规范化**
+
+- 实时日志区新增 `boss-log-success` 绿色 class（`#0a7d2e`，AA 对比度）+ font-weight:700；归档成功 `已归档简历: {签名} → {文件名}` 用该 class。
+- "黄色"高亮 `.boss-log-highlight` 改琥珀 `#b45309 !important`（替换原 `var(--color-accent)`）。
+- 删除蓝色沟通职位日志（同信息已固化进文件名，UI 日志不再赘述），同步删除 `boss-log-blue` CSS + `classify_zhilian_log` 路由分支。
+- 删除冗余事件日志：`zhilian_nav` 全部 step、`zhilian_attachment_button_found`、`zhilian_view_attachment_clicked`、`zhilian_attachment_tab_captured` 改为 `pass`（事件统计 / runtime_state 不动）。
+- 任务初始化块去掉 `执行日期：...`、`当前会话：扩展已连接 ...`（已在版本信息行）、`扫描间隔：默认`（仅非默认时输出）。
+- 重复 echo `内容脚本已启动采集 v2.14.0` 去重：bridge 新增 `_last_content_script_ready_signature: str | None`，相同 `version|key_count|signature_count` 不再重复打。
+- 删除 `下载前去重命中，跳过附件识别: {签名}`（前一条 `跳过: {签名} (去重命中...)` 已表达）。
+
+**索要简历彻底清理**
+
+智联沟通中页基本都已聊起来，"识别到没附件就索要简历"分支无业务价值。删除：
+
+- `app/pages/06_智联采集.py` 复选框 + collect_start payload 字段
+- `zhilian_ws_bridge.py` payload 读取 + "配置：request_resume_if_missing=..." 日志 + event_log 字段 + `case "zhilian_resume_request_clicked"`
+- `chrome_extension/content.js` 智联流程中 `btnState === "request"` 分支的索要简历点击代码块 + `clickZhilianRequestAttachment()` 函数
+- BOSS / 前程无忧的同名字段全部保留（未受影响）
+
+**页面布局调整**
+
+- 去重 banner 从底部独立卡片移到"运行状态"区 `status_cols[3]`，复用 `st.metric` 与扩展版本/最近事件同尺寸；Run ID metric 已废弃。
+- 删除已无用 `.zhilian-dedup-banner` CSS（5 行）。
+
+**沟通职位识别**
+
+- content.js `extractZhilianContactInfo` 新增 `info.talking_position`（精确 selector + `title` 属性优先）。
+- emit `candidate_clicked` 把字段透传到 `candidate_info`，事件链经 `download_intent` → background.js `pendingDownloads` 展开 → bridge `resume_downloaded` data，bridge 端 `_save_resume` 拿 `candidate_info["talking_position"]` 直接用，无需新增独立事件。
+- bridge 新增 `_simplify_talking_position(raw) -> str` 静态方法用于文件名和（已删除的）日志输出。
+
+**版本号最终态**
+
+- `chrome_extension/manifest.json` `2.14.0`
+- `chrome_extension/content.js` `CONTENT_SCRIPT_VERSION = "2.14.0"`
+- `recruitment_assistant/services/zhilian_ws_bridge.py` `ZHILIAN_BRIDGE_VERSION = "1.21.0"`，`ZHILIAN_EXTENSION_EXPECTED_VERSION = "2.14.0"`，`ZHILIAN_CONTENT_SCRIPT_EXPECTED_VERSION = "2.14.0"`
+
+**测试结果**
+
+`#164` 批次目标 10 份：识别耗时全程稳定 ~2s（之前 33–74s 抖动彻底消失）、10/10 下载 + 归档成功、文件名样本：
+
+```
+许高健-38岁-本科-资深产品策划-智联招聘-20260523-220551-001.pdf
+周江超-37岁-本科-Golang后台-智联招聘-20260523-220607-002.doc
+姚朝芳-32岁-本科-用户及市场调研经-智联招聘-20260523-220638-005.pdf
+李首亿-22岁-本科-UI设计师-智联招聘-20260523-220710-008.pdf
+```
+
+总耗时 123s / avg 12.4s/份，Chrome 下载目录与归档目录对账无遗漏。
+
+### 周边修复（同日批次）
+
+- `app/main.py` + `recruitment_assistant/services/crawl_task_service.py`：新增 `CrawlTaskService.reap_stale_running_tasks(platform_code=None)`，Streamlit 启动时 `@st.cache_resource` 跑一次，把 `status='running'` 但进程已死的孤儿 CrawlTask 收尾为 `cancelled`，避免首页"运行中"误报。
+- `recruitment_assistant/services/boss_ws_bridge.py` / `qiancheng_ws_bridge.py`：跟智联同步小幅调整（与本日主线弱相关，详见 diff）。
+
 ## 2026-05-22
 
 ### V2.50 主题接管深度补全 + WS 桥接自愈 + 采集页 UI 对齐

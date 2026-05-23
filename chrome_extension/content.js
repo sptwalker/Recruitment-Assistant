@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  const CONTENT_SCRIPT_VERSION = "1.88.0";
+  const CONTENT_SCRIPT_VERSION = "2.14.0";
 
   // 平台注册表：每个平台的 hostname、WS 端口、文本标记、localStorage key 一站式声明。
   // 这是从单平台升级到多平台的核心入口——新加平台只需在此对象增加一条配置。
@@ -848,6 +848,25 @@
     for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
       node.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, clientX: x, clientY: y, view: window }));
     }
+    return true;
+  }
+
+  function clickElementDirect(el) {
+    // 对已经精准定位到的元素派发点击 —— 不做 closest 上跳、不做 elementFromPoint 重定位。
+    // 用途：智联顶部 tab、左导菜单这种 sibling 共享外层容器的场景。
+    // clickElementReliably 会走 closest("[class*='filter']") 跳到容器，再用容器中心坐标派发，
+    // 容器中心可能落在错误兄弟 tab 上（如"已获取微信"），造成误点。这里完全锚定 el 本身。
+    if (!el) return false;
+    try { el.scrollIntoView?.({ block: "center", inline: "center" }); } catch {}
+    const rect = el.getBoundingClientRect();
+    const x = Math.max(1, Math.min(window.innerWidth - 1, rect.left + rect.width / 2));
+    const y = Math.max(1, Math.min(window.innerHeight - 1, rect.top + rect.height / 2));
+    for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+      try {
+        el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, clientX: x, clientY: y, view: window }));
+      } catch {}
+    }
+    try { el.click?.(); } catch {}
     return true;
   }
 
@@ -3078,85 +3097,40 @@
   }
 
   function getZhilianCandidateTargets(seenSet) {
+    // 智联沟通中候选人卡片 DOM 真实样本（DevTools console 采样 2026-05-23）：
+    //   <div class="im-session-list__virtual--box">  L=180 T=226 W=247 H=4296（虚拟滚动容器, 30 子节点）
+    //     <div class="im-session-item km-list__item">  L=180 T=226 W=247 H=72  ← 真候选人卡片
+    //       <div class="im-session-item__box">          内含头像/姓名/职位/最近消息预览
+    //         <div class="km-list-item__avatar">         L=188 W=40 H=40 内嵌未读红点
+    //           <div class="km-badge im-session-item__unread">
+    //             <sup class="km-badge__item km-badge__item--fixed">  数字角标
+    //         <div class="km-list-item__title">         姓名 + 职位（最稳定文本）
+    //   <div class="greeting-new-entry">  L=180 T=146  ← noise，"快速处理新招呼"卡片，靠 skip 正则排除
+    //
+    // 旧版基于 [class*="session"]/[class*="item"] 通配 + bbox 几何过滤，命中率脆弱；
+    // 现在 class 已知，直接精确锚定 + 视口可见性判断即可。
     const viewportH = window.innerHeight || document.documentElement.clientHeight || 0;
-    const minTop = 220;
-    const maxBottom = Math.max(minTop + 80, viewportH - 12);
-    const inViewport = (rect) => rect.top >= minTop && rect.bottom <= maxBottom;
     const skip = (text) => /快速处理|新招呼|99\+人|全部职位|筛选|批量/.test(text);
     const normalize = (text) => (text || "").replace(/\s+/g, " ").trim();
 
-    const cardAt = (x, y) => {
-      const stack = document.elementsFromPoint(x, y);
-      let best = null;
-      for (const el of stack) {
-        if (!zhilianIsVisible(el)) continue;
-        const rect = el.getBoundingClientRect();
-        const text = normalize(el.innerText || el.textContent);
-        if (
-          rect.left >= 170 && rect.left <= 440 && rect.top >= 220 &&
-          rect.top <= y && rect.bottom >= y &&
-          rect.width >= 200 && rect.width <= 280 &&
-          rect.height >= 45 && rect.height <= 130 &&
-          text.length >= 2 && text.length <= 260 && !skip(text)
-        ) {
-          if (!best || rect.width * rect.height > best.getBoundingClientRect().width * best.getBoundingClientRect().height) {
-            best = el;
-          }
-        }
-      }
-      return best;
-    };
-
-    // Strategy 1: find red badge markers (unread indicators) and locate cards near them
-    const redMarkers = Array.from(document.querySelectorAll("*"))
-      .filter((el) => zhilianIsVisible(el))
-      .map((el) => ({ el, rect: el.getBoundingClientRect(), style: window.getComputedStyle(el), text: normalize(el.innerText || el.textContent) }))
-      .filter((item) => {
-        const rect = item.rect;
-        if (rect.left < 170 || rect.left > 215 || rect.top < 220 || rect.width > 34 || rect.height > 34 || !inViewport(rect)) return false;
-        const className = String(item.el.className || "").toLowerCase();
-        const color = `${item.style.backgroundColor} ${item.style.color} ${item.style.borderColor}`;
-        return /badge|dot|unread|red|count|notice|num/.test(className) || /rgb\( ?(2[0-5][0-5]|1[5-9][0-9])[, ]+([0-9]{1,3})[, ]+([0-9]{1,3})/.test(color) || /^\d{1,3}$/.test(item.text);
-      })
-      .sort((a, b) => a.rect.top - b.rect.top);
-
-    const targets = [];
-    for (const marker of redMarkers) {
-      const y = marker.rect.top + marker.rect.height / 2;
-      const card = cardAt(300, y) || cardAt(260, y) || cardAt(220, y) || cardAt(390, y);
-      if (card && !targets.includes(card)) targets.push(card);
-    }
-
-    // Strategy 2: find list-like elements in the left panel area
-    const rows = Array.from(document.querySelectorAll('li, article, section, div[role="listitem"], div[role="button"], [class*="conversation"], [class*="session"], [class*="item"], [class*="card"]'))
-      .filter((el) => zhilianIsVisible(el))
-      .map((el) => ({ el, rect: el.getBoundingClientRect(), text: normalize(el.innerText || el.textContent) }))
-      .filter((item) =>
-        item.rect.left >= 170 && item.rect.left <= 440 && item.rect.top >= 220 && inViewport(item.rect) &&
-        item.rect.width >= 200 && item.rect.width <= 280 &&
-        item.rect.height >= 45 && item.rect.height <= 130 &&
-        item.text.length >= 2 && item.text.length <= 260 && !skip(item.text)
-      )
-      .sort((a, b) => a.rect.top - b.rect.top);
-
-    for (const row of rows) {
-      if (!targets.includes(row.el)) targets.push(row.el);
-    }
-
-    // Build output, filtering already-seen candidates
+    const cards = Array.from(document.querySelectorAll(".im-session-item.km-list__item"));
     const output = [];
     const used = new Set();
-    for (const target of targets) {
-      const rect = target.getBoundingClientRect();
-      const signature = normalize(target.innerText || target.textContent).slice(0, 220);
-      const positionKey = `pos:${Math.round(rect.left)}:${Math.round(rect.top)}:${Math.round(rect.width)}:${Math.round(rect.height)}`;
-      const key = `${positionKey}:${signature}`;
-      if (!signature || seenSet.has(signature) || used.has(key) || skip(signature) || !inViewport(rect)) continue;
-      const clickX = Math.min(410, Math.max(230, rect.left + rect.width * 0.55));
+
+    for (const el of cards) {
+      if (!zhilianIsVisible(el)) continue;
+      const rect = el.getBoundingClientRect();
+      // 仅扫描视口内可见的卡片（虚拟滚动下方未渲染的卡片 rect.top > viewportH，跳过）。
+      if (rect.bottom < 100 || rect.top > viewportH - 12) continue;
+      const signature = normalize(el.innerText || el.textContent).slice(0, 220);
+      if (!signature || signature.length < 4) continue;
+      if (skip(signature)) continue;
+      if (seenSet.has(signature) || used.has(signature)) continue;
+      used.add(signature);
+      // clickX 偏右一点（0.55），避开左侧头像区，落到主信息块。
+      const clickX = rect.left + rect.width * 0.55;
       const clickY = rect.top + rect.height / 2;
-      if (clickY < minTop || clickY > maxBottom) continue;
-      used.add(key);
-      output.push({ element: target, name: signature, index: output.length, clickX, clickY });
+      output.push({ element: el, name: signature, index: output.length, clickX, clickY });
       if (output.length >= 24) break;
     }
     return output;
@@ -3239,73 +3213,92 @@
     // Extract phone
     const phoneMatch = merged.match(/(?<!\d)(1[3-9]\d(?:\s*\d){8})(?!\d)/);
     if (phoneMatch) info.phone = phoneMatch[1].replace(/\s/g, "");
+    const jobTitleEl = document.querySelector(".im-three-list__panel--job--title");
+    info.talking_position = jobTitleEl
+      ? (jobTitleEl.getAttribute("title") || jobTitleEl.textContent || "").trim()
+      : "";
     return info;
   }
 
-  function getZhilianAttachmentButtonState() {
-    const viewportW = window.innerWidth || document.documentElement.clientWidth || 0;
-    const viewportH = window.innerHeight || document.documentElement.clientHeight || 0;
-    const chatLeft = Math.max(420, Math.round(viewportW * 0.34));
-    const bottomTop = Math.max(70, Math.round(viewportH * 0.50));
-    const normalize = (text) => (text || "").replace(/\s+/g, " ").trim();
-    const allText = (el) => normalize([el.innerText, el.textContent, el.getAttribute("title"), el.getAttribute("aria-label")].filter(Boolean).join(" "));
-    const disabledLike = (el) => {
-      const cls = String(el.className || "").toLowerCase();
-      const style = window.getComputedStyle(el);
-      return el.disabled === true || el.getAttribute("disabled") !== null || el.getAttribute("aria-disabled") === "true" || cls.includes("is-disabled") || /(^|[-_\s])disabled($|[-_\s])/.test(cls) || style.pointerEvents === "none";
-    };
-    const inRightBottom = (rect) => rect.left > chatLeft && rect.top > bottomTop && rect.top < viewportH - 8 && rect.width <= 900 && rect.height <= 320;
-    const classify = (text) => {
-      if (/查看附件简历|查看简历附件|下载附件简历|下载简历附件/.test(text)) return "view";
-      if (/已向对方要附件简历|已要附件简历|已索要|附件简历索要中/.test(text)) return "already_requested";
-      if (/要附件简历|索要附件简历|请求附件简历|获取附件简历|要简历/.test(text)) return "request";
-      return "";
-    };
+  function findZhilianAttachmentButton() {
+    // hover 链 + DOM 采样确认（2026-05-23）的两个稳定 class：
+    //   首选：.session-new-action a.km-button —— 底部固定 footer 的"查看附件简历"按钮。
+    //         位置稳定（永远在右下角 footer 工具栏），不会随聊天滚动消失。
+    //   兜底：.im-attachment-card__button —— 聊天气泡内附件卡片按钮，会随聊天滚动浮动甚至滚出视口。
+    // 旧版 getZhilianAttachmentButtonState 用 `[class*="button"], [class*="btn"], [class*="attach"]` 通配
+    // 接近全 DOM 扫描，每节点 getComputedStyle + getBoundingClientRect，智联重 DOM 下耗时 30+s 卡死无 emit。
+    const footerBtns = Array.from(document.querySelectorAll(".session-new-action a.km-button, .session-new-action button, .session-new-action--left a, .session-new-action--left button"));
+    const cardBtns = Array.from(document.querySelectorAll(".im-attachment-card__button"));
+    const all = [...footerBtns, ...cardBtns];
 
-    const nodes = document.querySelectorAll('button, a, [role="button"], [tabindex], span, div, [class*="button"], [class*="btn"], [class*="attach"], [class*="resume"]');
-    const candidates = [];
-    for (const el of nodes) {
+    let best = null;
+    const priority = { view: 3, already_requested: 2, request: 1 };
+
+    for (const el of all) {
       if (!zhilianIsVisible(el)) continue;
-      const rect = el.getBoundingClientRect();
-      if (!inRightBottom(rect)) continue;
-      const text = allText(el);
-      const kind = classify(text);
+      const text = (el.innerText || el.textContent || "").trim();
+      let kind = "";
+      if (/查看附件简历|查看简历附件|下载附件简历|下载简历附件/.test(text)) kind = "view";
+      else if (/已向对方要附件简历|已要附件简历|已索要|附件简历索要中/.test(text)) kind = "already_requested";
+      else if (/要附件简历|索要附件简历|请求附件简历|获取附件简历|要简历/.test(text)) kind = "request";
       if (!kind) continue;
-      candidates.push({ kind, disabled: disabledLike(el), top: rect.top, left: rect.left, area: rect.width * rect.height });
-    }
-    candidates.sort((a, b) => b.top - a.top || a.area - b.area || a.left - b.left);
-    const item = candidates[0];
-    if (!item) return "missing";
-    if (item.kind === "view") return item.disabled ? "missing" : "view";
-    if (item.kind === "already_requested") return "already_requested";
-    return item.disabled ? "missing" : "request";
-  }
 
-  function clickZhilianTextButton(patterns) {
-    const viewportW = window.innerWidth || document.documentElement.clientWidth || 0;
-    const chatLeft = Math.max(420, Math.round(viewportW * 0.34));
-    const nodes = document.querySelectorAll('button, a, [role="button"], span, div, [class*="btn"], [class*="button"], [class*="attach"], [class*="resume"]');
-    for (const el of nodes) {
-      if (!zhilianIsVisible(el)) continue;
-      const rect = el.getBoundingClientRect();
-      if (rect.left < chatLeft || rect.width > 900) continue;
-      const text = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
-      for (const pat of patterns) {
-        if (text.includes(pat)) {
-          el.click();
-          return true;
-        }
+      // 内层 button / a 是 React onClick 真实挂载点；DIV.im-attachment-card__button 是包装层。
+      const inner = el.matches("button, a") ? el : el.querySelector("button, a");
+      const target = inner || el;
+
+      if (!best || priority[kind] > priority[best.state]) {
+        best = { element: target, state: kind, text: text.slice(0, 40), wrapperCls: String(el.className || "").slice(0, 60) };
       }
     }
-    return false;
+    return best;
+  }
+
+  function getZhilianAttachmentButtonState() {
+    const found = findZhilianAttachmentButton();
+    if (!found) return "missing";
+    const el = found.element;
+    const cls = String(el.className || "").toLowerCase();
+    const style = getComputedStyle(el);
+    const disabled =
+      el.disabled === true ||
+      el.getAttribute("disabled") !== null ||
+      el.getAttribute("aria-disabled") === "true" ||
+      cls.includes("is-disabled") ||
+      /(^|[-_\s])disabled($|[-_\s])/.test(cls) ||
+      style.pointerEvents === "none";
+    if (disabled && (found.state === "view" || found.state === "request")) return "missing";
+    emit({
+      type: "zhilian_attachment_button_found",
+      data: {
+        state: found.state,
+        text: found.text,
+        wrapper_cls: found.wrapperCls,
+        target_tag: el.tagName,
+        target_cls: String(el.className || "").slice(0, 60),
+      },
+    });
+    return found.state;
   }
 
   function clickZhilianViewAttachment() {
-    return clickZhilianTextButton(["查看附件简历", "查看简历附件", "下载附件简历", "下载简历附件"]);
+    const found = findZhilianAttachmentButton();
+    if (!found || found.state !== "view") return false;
+    // 用 Direct 派发完整事件序列；clickElementReliably 会 closest 跳出，对气泡内/footer tab 群都是误触陷阱。
+    clickElementDirect(found.element);
+    return true;
   }
 
-  function clickZhilianRequestAttachment() {
-    return clickZhilianTextButton(["要附件简历", "索要附件简历", "请求附件简历", "获取附件简历", "要简历"]);
+  function clickZhilianViewAttachmentButton() {
+    // 智联"查看附件简历"按钮的 React onClick 会 window.open 弹出 attachment.zhaopin.com/...downloadFileTemporary
+    // 新 tab，该 tab 的 URL 本身就是 PDF 直链。content.js 只负责点按钮 + 提前发 download_intent 占座，
+    // background.js 用 chrome.tabs.onUpdated 监听新 tab URL，命中后调 chrome.downloads.download 直接下载。
+    // 浏览器需在"允许弹出式窗口和重定向"白名单里加 rd5/rd6.zhaopin.com，否则弹窗被拦。
+    const found = findZhilianAttachmentButton();
+    if (!found || found.state !== "view") return { clicked: false };
+    clickElementDirect(found.element);
+    emit({ type: "zhilian_view_attachment_clicked", data: { wrapper_cls: found.wrapperCls, text: found.text } });
+    return { clicked: true };
   }
 
   function clickZhilianAttachmentCard() {
@@ -3340,24 +3333,266 @@
     return false;
   }
 
+  function scrollZhilianCandidateListToTop() {
+    const firstCard = document.querySelector(".im-session-item.km-list__item");
+    let node = firstCard ? firstCard.parentElement : null;
+    while (node && node !== document.body) {
+      if (node.scrollHeight > node.clientHeight + 10) {
+        node.scrollTop = 0;
+        return true;
+      }
+      node = node.parentElement;
+    }
+    return false;
+  }
+
   async function waitZhilianDetailSwitch(previousName, timeoutMs) {
     const deadline = Date.now() + (timeoutMs || 3000);
+    let lastInfo = null;
     while (Date.now() < deadline) {
-      const info = extractZhilianContactInfo();
-      if (info.name && info.name !== previousName && info.name !== "未知") return info.name;
+      lastInfo = extractZhilianContactInfo();
+      if (lastInfo.name && lastInfo.name !== previousName && lastInfo.name !== "未知") return lastInfo;
       await sleep(200);
     }
-    return null;
+    return lastInfo;
+  }
+
+  function findDeepestClickable(el) {
+    // 智联左导菜单是 li > div > a > span 多层嵌套，外层 div 没有 React click handler。
+    // 优先点最深的 a / button / [role=button]，否则回落到 el 本身。
+    if (!el) return el;
+    const inner = el.querySelector('a, button, [role="button"], [role="menuitem"]');
+    return inner || el;
+  }
+
+  function findZhilianLeftNavChatEntry() {
+    // 端口自老 Playwright `_click_sidebar_chat_entry`：
+    // 文字用 /聊天/ 子串匹配（叶子 span 文字精确等于"聊天"，但外层 a/li innerText 常带"99+"角标，
+    // 精确等于会全军覆没）；几何约束 left<95、top>60、宽<=200、高 24-80 锁定左导窄条；
+    // 长度上限 length<=16 防整段侧边栏文本（多菜单拼接）误命中。
+    const NOISE = /(微信沟通|已获取微信|获取微信|打招呼)/;
+    const candidates = [];
+    const all = document.querySelectorAll("a, button, span, li, div, [role='menuitem'], [class*='menu'], [class*='nav'], [class*='side']");
+    for (const el of all) {
+      const ownText = (el.innerText || el.textContent || "").trim();
+      const compact = ownText.replace(/\s/g, "");
+      const label = (el.getAttribute("aria-label") || "").trim();
+      const title = (el.getAttribute("title") || "").trim();
+      const hit = /聊天/.test(compact) || /聊天/.test(label) || /聊天/.test(title);
+      if (!hit) continue;
+      if (compact.length > 16) continue;
+      if (NOISE.test(ownText) || NOISE.test(label) || NOISE.test(title)) continue;
+      const rect = el.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) continue;
+      if (!(rect.left < 95 && rect.top > 60)) continue;
+      if (!(rect.height >= 24 && rect.height <= 80)) continue;
+      if (!(rect.width <= 200)) continue;
+      candidates.push({ el, rect, ownText, label, title });
+    }
+    if (!candidates.length) {
+      emit({ type: "zhilian_nav", data: { step: "left_chat_menu_search", found: 0 } });
+      return null;
+    }
+    // 排序与老 Playwright 一致：left → width → top，最贴左、最窄、最靠上的优先。
+    candidates.sort((a, b) => a.rect.left - b.rect.left || a.rect.width - b.rect.width || a.rect.top - b.rect.top);
+    emit({
+      type: "zhilian_nav",
+      data: {
+        step: "left_chat_menu_search",
+        found: candidates.length,
+        sample: candidates.slice(0, 3).map((c) => ({
+          tag: c.el.tagName,
+          text: c.ownText.slice(0, 20),
+          aria: c.label.slice(0, 20),
+          title: c.title.slice(0, 20),
+          rect: { left: Math.round(c.rect.left), top: Math.round(c.rect.top), w: Math.round(c.rect.width), h: Math.round(c.rect.height) },
+        })),
+      },
+    });
+    return candidates[0].el;
+  }
+
+  function findZhilianTopChattingTab() {
+    // hover 链采样确认：tab class 为 .im-custom-filter__item，文本"沟通中"。
+    // 优先 class 锚定，bbox 仅作 sanity check（防 class 名漂移时整页搜出无关元素）。
+    const NOISE = /(微信沟通|已获取微信|获取微信|打招呼)/;
+    const candidates = [];
+    const all = document.querySelectorAll(".im-custom-filter__item, [class*='filter__item']");
+    for (const el of all) {
+      const text = (el.textContent || "").trim();
+      if (!text) continue;
+      if (NOISE.test(text)) continue;
+      const compact = text.replace(/\s/g, "");
+      if (!/沟通中/.test(compact)) continue;
+      if (compact.length > 8) continue;
+      const rect = el.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) continue;
+      candidates.push({ el, rect, text });
+    }
+    if (!candidates.length) {
+      emit({ type: "zhilian_nav", data: { step: "top_chatting_tab_search", found: 0 } });
+      return null;
+    }
+    candidates.sort((a, b) => a.rect.top - b.rect.top || a.rect.left - b.rect.left);
+    emit({
+      type: "zhilian_nav",
+      data: {
+        step: "top_chatting_tab_search",
+        found: candidates.length,
+        sample: candidates.slice(0, 3).map((c) => ({
+          tag: c.el.tagName,
+          cls: String(c.el.className || "").slice(0, 60),
+          text: c.text.slice(0, 20),
+          rect: { left: Math.round(c.rect.left), top: Math.round(c.rect.top), w: Math.round(c.rect.width), h: Math.round(c.rect.height) },
+        })),
+      },
+    });
+    return candidates[0].el;
+  }
+
+  function isZhilianChattingTabActive() {
+    // hover 链采样确认：当前激活 tab 的 class 为 "im-custom-filter__item im-custom-filter__item--active"。
+    // 只有当 --active 节点的文本含"沟通中"，才能视为已在正确 tab。
+    const actives = document.querySelectorAll(".im-custom-filter__item--active, [class*='filter__item--active']");
+    for (const el of actives) {
+      const text = (el.textContent || "").trim();
+      if (/沟通中/.test(text)) return true;
+    }
+    return false;
+  }
+
+  function isOnZhilianChatPage() {
+    // 端口自老 Playwright `_is_probably_chat_page`：靠正文文本特征判断已进入聊天/沟通中视图。
+    const t = (document.body && document.body.innerText) || "";
+    return /要附件简历|查看附件简历|未联系|未读|在线沟通|候选人沟通|请从左侧列表中选择/.test(t);
+  }
+
+  function clickAtCoord(x, y) {
+    // 兜底坐标点击：仅用于左侧聊天菜单（老 Playwright 验证过 (46, 146) 命中率高）。
+    const el = document.elementFromPoint(x, y);
+    if (!el) return null;
+    const target = findDeepestClickable(el);
+    try { target.scrollIntoView({ block: "center" }); } catch {}
+    try { target.click(); } catch {}
+    return target;
+  }
+
+  async function waitForZhilianCandidateListStable(timeoutMs = 3500) {
+    // 智联 tab 切换：--active class 同步切，但 .im-session-list__virtual--box 列表数据是异步拉取/重渲染。
+    // 期间扫描会拿到前一个 tab 残留的虚拟节点（虚拟滚动复用 DOM），导致 50% 概率点错人。
+    // 解决：等"两次连续扫描签名列表完全相同"才视为稳定。
+    const startedAt = Date.now();
+    let prevSignatures = "";
+    let stableHits = 0;
+    while (Date.now() - startedAt < timeoutMs) {
+      const targets = getZhilianCandidateTargets(new Set());
+      const sigs = targets.slice(0, 8).map((t) => t.name).join("|");
+      if (sigs && sigs === prevSignatures) {
+        stableHits++;
+        if (stableHits >= 1) {
+          emit({ type: "zhilian_nav", data: { step: "candidate_list_stable", count: targets.length, elapsed_ms: Date.now() - startedAt } });
+          return true;
+        }
+      } else {
+        stableHits = 0;
+        prevSignatures = sigs;
+      }
+      await sleep(350);
+    }
+    emit({ type: "zhilian_nav", data: { step: "candidate_list_stable_timeout", elapsed_ms: Date.now() - startedAt } });
+    return false;
+  }
+
+  async function ensureZhilianOnChattingPage() {
+    // 幂等：若已经在「聊天 → 沟通中」（active class + 候选人可见 + 文本特征），跳过整个导航。
+    if (
+      isZhilianChattingTabActive() &&
+      getZhilianCandidateTargets(new Set()).length > 0 &&
+      isOnZhilianChatPage()
+    ) {
+      emit({ type: "zhilian_nav", data: { step: "already_on_chat", action: "skip" } });
+      return true;
+    }
+
+    // 第 1 步：点击左侧「聊天」菜单。
+    const navEntry = findZhilianLeftNavChatEntry();
+    if (navEntry) {
+      const clickTarget = findDeepestClickable(navEntry);
+      try { clickTarget.scrollIntoView({ block: "center" }); } catch {}
+      // 用 Direct 而非 Reliably：智联左导是 li/a/span 兄弟拼装的菜单组，closest 上跳会跳到整个 nav 容器，
+      // 再用容器中心坐标派发会落到错误菜单项上。Direct 完全锚定 clickTarget 自己。
+      clickElementDirect(clickTarget);
+      emit({ type: "zhilian_nav", data: { step: "left_chat_menu_clicked", target_tag: clickTarget.tagName } });
+      await sleep(1800);
+    } else {
+      // DOM 扫描失败时启用坐标兜底（仅对左侧聊天菜单，顶部 tab 不允许兜底）。
+      emit({ type: "zhilian_nav", data: { step: "left_chat_menu_missing", fallback: "coord_click" } });
+      const fallback = clickAtCoord(46, 146);
+      emit({
+        type: "zhilian_nav",
+        data: {
+          step: "left_chat_menu_coord_fallback",
+          hit_tag: fallback ? fallback.tagName : null,
+          hit_text: fallback ? (fallback.textContent || "").trim().slice(0, 16) : null,
+        },
+      });
+      await sleep(1800);
+    }
+
+    // 双确认：active tab 必须是「沟通中」才能跳过 tab 点击；
+    // 仅候选人可见 + 文本特征不够——智联未联系/已获取微信 tab 下候选人列表 DOM 一样能扫到，class 区分不出来。
+    // 等列表稳定再判定，否则虚拟滚动复用的旧节点会让 candidates_visible 假阳。
+    await waitForZhilianCandidateListStable(2000);
+    const afterLeft = {
+      tab_active_is_chatting: isZhilianChattingTabActive(),
+      candidates_visible: getZhilianCandidateTargets(new Set()).length > 0,
+      chat_page_text: isOnZhilianChatPage(),
+    };
+    emit({ type: "zhilian_nav", data: { step: "after_left_click_check", ...afterLeft } });
+    if (afterLeft.tab_active_is_chatting && afterLeft.candidates_visible) {
+      emit({ type: "zhilian_nav", data: { step: "ensure_done_after_left", candidates_visible: true } });
+      return true;
+    }
+
+    // 第 2 步：点击顶部「沟通中」tab（绝不允许坐标兜底，找不到就放弃这一步）。
+    const tab = findZhilianTopChattingTab();
+    if (tab) {
+      try { tab.scrollIntoView({ block: "center" }); } catch {}
+      // 用 Direct：tab 是 filter-tabs 容器内的兄弟节点，clickElementReliably 的 closest("[class*='filter']")
+      // 会跳到外层 filter-tabs 容器，容器中心坐标常常落在默认 active 的"已获取微信"上，造成误点。
+      clickElementDirect(tab);
+      emit({ type: "zhilian_nav", data: { step: "top_chatting_tab_clicked", target_tag: tab.tagName } });
+      await sleep(1200);
+      // tab 切换是异步的：active class 同步，但虚拟滚动列表数据异步重渲染——等列表稳定后再扫，
+      // 否则扫到的可能是前一个 tab 残留的虚拟节点。
+      await waitForZhilianCandidateListStable(3500);
+    } else {
+      emit({ type: "zhilian_nav", data: { step: "top_chatting_tab_missing", fallback: "skip_no_coord" } });
+    }
+
+    await sleep(400);
+    const finalCheck = {
+      tab_active_is_chatting: isZhilianChattingTabActive(),
+      candidates_visible: getZhilianCandidateTargets(new Set()).length > 0,
+      chat_page_text: isOnZhilianChatPage(),
+    };
+    const finalReady = finalCheck.tab_active_is_chatting && finalCheck.candidates_visible;
+    emit({ type: "zhilian_nav", data: { step: "ensure_done", ...finalCheck, ready: finalReady } });
+    return finalReady;
   }
 
   async function zhilianCollectLoop() {
-    if (!isAuthenticated()) {
-      emit({ type: "error", data: { message: "未检测到智联招聘登录态", stage: "pre_check" } });
-      state = "idle";
-      return;
-    }
+    // 智联 rd5/rd6 子域本身受平台认证保护，未登录的浏览器无法到达——
+    // 移除继承自 BOSS 的 isAuthenticated() 文本标记探测，避免误报"未检测到登录态"。
     emit({ type: "page_ready", data: { url: location.href } });
-    emit({ type: "boss_content_script_collect_started", data: { content_script_version: CONTENT_SCRIPT_VERSION, key_count: preDedup.keys.size, signature_count: preDedup.signatures.size } });
+
+    // 采集前先点「聊天」菜单 + 「沟通中」tab，确保候选人列表已渲染再开始扫描。
+    await ensureZhilianOnChattingPage();
+    scrollZhilianCandidateListToTop();
+    await sleep(500);
+    const dedupKeys = new Set(Array.isArray(config.boss_candidate_keys) ? config.boss_candidate_keys : []);
+    const dedupSignatures = new Set(Array.isArray(config.boss_candidate_signatures) ? config.boss_candidate_signatures : []);
+    emit({ type: "boss_content_script_collect_started", data: { content_script_version: CONTENT_SCRIPT_VERSION, key_count: dedupKeys.size, signature_count: dedupSignatures.size } });
 
     const seenSet = new Set();
     let scrollRetries = 0;
@@ -3398,7 +3633,10 @@
         try {
           target.element.scrollIntoView({ block: "center" });
           await sleep(100);
-          target.element.click();
+          // 智联候选人卡片是 React 组件，handler 挂在 .im-session-item.km-list__item 本身，
+          // 直接 .click() 在 production React 下偶尔哑火（无 pointerdown/mouseup 完整事件链）。
+          // 用 clickElementDirect 派发完整事件序列 + 锚定卡片自身（不 closest 上跳到 virtual--box 容器）。
+          clickElementDirect(target.element);
           await sleep(600);
         } catch (err) {
           emit({ type: "candidate_skipped", data: { candidate_signature: target.name || `idx_${target.index}`, reason: "click_failed", error: String(err) } });
@@ -3407,15 +3645,14 @@
           continue;
         }
 
-        const newName = await waitZhilianDetailSwitch(previousDetailName, 4000);
-        const info = extractZhilianContactInfo();
-        const candidateName = info.name || newName || target.name || "未知";
+        const info = await waitZhilianDetailSwitch(previousDetailName, 4000);
+        const candidateName = info.name || target.name || "未知";
         const candidateAge = info.age || "未知";
         const candidateEdu = info.education || "未知";
         const candidateSig = `${candidateName}/${candidateAge}/${candidateEdu}`;
         previousDetailName = candidateName;
 
-        emit({ type: "candidate_clicked", data: { name: candidateName, age: candidateAge, education: candidateEdu, job_title: info.job_title || "", index: target.index, elapsed_ms: Date.now() - stepStart } });
+        emit({ type: "candidate_clicked", data: { name: candidateName, age: candidateAge, education: candidateEdu, job_title: info.job_title || "", talking_position: info.talking_position || "", index: target.index, elapsed_ms: Date.now() - stepStart } });
 
         if (candidateName === "未知" && candidateAge === "未知" && candidateEdu === "未知") {
           emit({ type: "candidate_skipped", data: { candidate_signature: candidateSig, reason: "candidate_info_unrecognized" } });
@@ -3424,9 +3661,12 @@
           continue;
         }
 
-        const dedupResult = checkPreDedup(candidateSig, info);
-        if (dedupResult.hit) {
-          emit({ type: "candidate_skipped", data: { candidate_signature: candidateSig, reason: "boss_dedup_hit", candidate_key: dedupResult.key } });
+        const normalizedSig = normalizeBossCandidateSignature(candidateSig);
+        const dedupKey = await buildBossCandidateKey(candidateSig, info);
+        const sigHit = dedupSignatures.has(candidateSig) || dedupSignatures.has(normalizedSig);
+        const keyHit = Boolean(dedupKey && dedupKeys.has(dedupKey));
+        if (sigHit || keyHit) {
+          emit({ type: "candidate_skipped", data: { candidate_signature: candidateSig, reason: "boss_dedup_hit", candidate_key: dedupKey } });
           results.skipped++;
           emitProgress();
           continue;
@@ -3437,8 +3677,31 @@
         emit({ type: "zhilian_attachment_button_state", data: { candidate_signature: candidateSig, state: btnState } });
 
         if (btnState === "view") {
-          const clicked = clickZhilianViewAttachment();
-          if (!clicked) {
+          // 智联流程：先发 download_intent 占座（背带 candidate_info / download_request_id），
+          // 再点"查看附件简历"按钮；按钮触发 window.open 弹出 attachment.zhaopin.com 的 PDF 直链 tab，
+          // background.js 用 chrome.tabs.onUpdated 监听该 tab，URL 命中后由 onDeterminingFilename
+          // 劫持文件名 + 绑定到 pendingDownloads，下载完成通过 download_completed/download_failed
+          // 消息回到 waitForDownloadResult。
+          const downloadRequestId = makeDownloadRequestId("", candidateSig);
+
+          chrome.runtime.sendMessage({
+            target: "background",
+            event: {
+              type: "download_intent",
+              data: {
+                candidate_signature: candidateSig,
+                candidate_info: info,
+                download_request_id: downloadRequestId,
+                platform_code: "zhilian",
+                run_id: activeRunId,
+              },
+            },
+          });
+
+          const resultPromise = waitForDownloadResult(downloadRequestId, 30000);
+
+          const clickResult = clickZhilianViewAttachmentButton();
+          if (!clickResult.clicked) {
             const cardClicked = clickZhilianAttachmentCard();
             if (!cardClicked) {
               emit({ type: "candidate_skipped", data: { candidate_signature: candidateSig, reason: "download_button_not_found" } });
@@ -3447,61 +3710,24 @@
               continue;
             }
           }
-          await sleep(1500);
 
-          const downloadRequestId = `zhilian_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-          const downloadWaiter = registerDownloadWaiter(downloadRequestId);
+          const downloadResult = await resultPromise;
+          const downloadData = downloadResult && downloadResult.data ? downloadResult.data : {};
 
-          chrome.runtime.sendMessage({
-            type: "download_intent",
-            data: {
-              candidate_signature: candidateSig,
-              candidate_info: info,
-              download_request_id: downloadRequestId,
-              platform_code: "zhilian",
-            },
-          });
-
-          const downloadResult = await Promise.race([downloadWaiter, sleep(30000).then(() => null)]);
-
-          if (downloadResult && downloadResult.download_path) {
-            emit({
-              type: "resume_downloaded",
-              data: {
-                candidate_signature: candidateSig,
-                candidate_info: info,
-                filename: downloadResult.filename || "",
-                download_path: downloadResult.download_path,
-                url: downloadResult.url || "",
-                download_request_id: downloadRequestId,
-              },
-            });
-            const ack = await waitForPersistAck(candidateSig, 15000);
-            if (ack && ack.status === "saved") {
+          if (downloadResult && downloadResult.ok && downloadData.download_path) {
+            const ack = await waitForPersistAck(downloadRequestId, candidateSig, 15000);
+            if (ack && ack.ok) {
               results.completed++;
             } else {
               results.skipped++;
             }
           } else {
-            emit({ type: "candidate_skipped", data: { candidate_signature: candidateSig, reason: "download_failed" } });
+            emit({ type: "candidate_skipped", data: { candidate_signature: candidateSig, reason: "download_failed", error: downloadResult && downloadResult.reason ? downloadResult.reason : "" } });
             results.skipped++;
           }
         } else if (btnState === "request") {
-          if (config.request_resume_if_missing) {
-            const requestClicked = clickZhilianRequestAttachment();
-            if (requestClicked) {
-              await sleep(1000);
-              emit({ type: "zhilian_resume_request_clicked", data: { candidate_signature: candidateSig } });
-              emit({ type: "resume_request_success", data: { candidate_signature: candidateSig, request_sent: true } });
-              emit({ type: "candidate_skipped", data: { candidate_signature: candidateSig, reason: "resume_requested_by_user" } });
-            } else {
-              emit({ type: "candidate_skipped", data: { candidate_signature: candidateSig, reason: "no_resume_attachment" } });
-            }
-            results.skipped++;
-          } else {
-            emit({ type: "candidate_skipped", data: { candidate_signature: candidateSig, reason: "need_request_resume" } });
-            results.skipped++;
-          }
+          emit({ type: "candidate_skipped", data: { candidate_signature: candidateSig, reason: "no_resume_attachment" } });
+          results.skipped++;
         } else if (btnState === "already_requested") {
           emit({ type: "candidate_skipped", data: { candidate_signature: candidateSig, reason: "resume_request_already_sent" } });
           results.skipped++;

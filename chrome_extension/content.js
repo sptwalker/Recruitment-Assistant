@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  const CONTENT_SCRIPT_VERSION = "2.25.0";
+  const CONTENT_SCRIPT_VERSION = "2.30.0";
 
   // 平台注册表：每个平台的 hostname、WS 端口、文本标记、localStorage key 一站式声明。
   // 这是从单平台升级到多平台的核心入口——新加平台只需在此对象增加一条配置。
@@ -3076,6 +3076,54 @@
     return info;
   }
 
+  function extractQianchengTalkingPosition() {
+    // 51 沟通页"沟通职位"元素已确认：<div id="sensor_Bchatinfo_switch" class="change-position">游戏策划</div>
+    // 元素 textContent.trim() 直接就是职位文本（不带"沟通职位："标签前缀）。
+    // 主策略：单 selector 直命中；兜底：少量容器 innerText 严格正则（防 51 改版）。
+    try {
+      const el = document.querySelector("#sensor_Bchatinfo_switch")
+              || document.querySelector(".change-position");
+      if (el) {
+        const text = (el.textContent || "").trim();
+        if (text && /[一-龥a-zA-Z0-9]/.test(text) && !/^沟通职位[：:\s]*$/.test(text)) {
+          return text;
+        }
+      }
+      const fallbackContainers = [
+        ".chat-user-info", ".info-main", ".user-info-main",
+        ".user-info", ".candidate-info", ".right-content",
+      ];
+      const STRICT_RE = /沟通职位[\s\-—–]*[：:]\s*([^\n\r│|｜·、/／]{2,50})/;
+      for (const sel of fallbackContainers) {
+        const c = document.querySelector(sel);
+        if (!c) continue;
+        const m = (c.innerText || "").match(STRICT_RE);
+        if (m && m[1] && /[一-龥a-zA-Z0-9]/.test(m[1])) {
+          return m[1].trim();
+        }
+      }
+      return "";
+    } catch (e) {
+      try { console.warn("[qiancheng] extractTalkingPosition error", e); } catch (_e) {}
+      return "";
+    }
+  }
+
+  function simplifyQianchengTalkingPosition(raw) {
+    // 对齐 bridge 端 _simplify_talking_position 规则：剥括号 + 首段 + 限 8 字符。
+    // 防御：纯标点 / 空白 / 单冒号必须返回空串，不能进入文件名。
+    if (!raw) return "";
+    const s0 = String(raw).trim();
+    if (!s0) return "";
+    if (!/[一-龥a-zA-Z0-9]/.test(s0)) return ""; // 纯标点 / 空白 / 单冒号 → 拒绝
+    let s = s0.replace(/[（(][^）)]*[）)]/g, "");
+    s = s.split(/[/／、|｜・·]/)[0];
+    s = s.trim();
+    if (!s || !/[一-龥a-zA-Z0-9]/.test(s)) return "";
+    if (s.length > 8) s = s.slice(0, 8);
+    return s;
+  }
+
   function getQianchengCandidateItems() {
     const container = document.querySelector(QIANCHENG_SELECTORS.candidate_list_container);
     if (!container) return [];
@@ -3110,6 +3158,26 @@
     return null;
   }
 
+  async function waitForQianchengCandidateDetailReady(prevName, timeoutMs = 1800) {
+    // 点击候选人后右侧详情区从上一个候选人切换需要时间；
+    // 在 .info-main 姓名节点的文本与 prevName 不同时认为已切换。
+    // prevName 为空（首个候选人）则等到任意非空姓名出现即返回。
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const root = document.querySelector(QIANCHENG_SELECTORS.profile_info_container);
+      const nameEl = root
+        ? (root.querySelector(QIANCHENG_SELECTORS.profile_name) || root.querySelector(".username-text"))
+        : null;
+      const currName = nameEl ? (nameEl.innerText || nameEl.textContent || "").trim() : "";
+      if (currName) {
+        if (!prevName) return currName;
+        if (currName !== prevName) return currName;
+      }
+      await sleep(120);
+    }
+    return "";
+  }
+
   function findQianchengDownloadButton() {
     const sensor = document.querySelector(QIANCHENG_SELECTORS.download_btn_sensor);
     if (sensor) return sensor;
@@ -3120,19 +3188,84 @@
     return document.querySelector(QIANCHENG_SELECTORS.close_preview);
   }
 
+  function isQianchengTabActive(el) {
+    // 51 ehire 顶部 tab 选中态可能是以下任一 class（按改版历史扩展）。
+    if (!el) return false;
+    const cls = (el.className || "") + " " + ((el.parentElement && el.parentElement.className) || "");
+    return /\b(active|current|selected|checked|on)\b/i.test(cls)
+        || el.getAttribute?.("aria-selected") === "true";
+  }
+
+  function looksLikeQianchengChattingRoute() {
+    // URL / 标题 / 面包屑任一项含沟通中关键词即认为已在沟通中页面（用于辅助判定）。
+    try {
+      const url = String(location.href || "");
+      if (/talent[-_]?communicate|chat|communication|chatting/i.test(url)) return true;
+    } catch {}
+    try {
+      const title = String(document.title || "");
+      if (title.includes("沟通中") || title.includes("人才沟通")) return true;
+    } catch {}
+    try {
+      const breadcrumb = document.querySelector(".breadcrumb, .crumbs, .ant-breadcrumb");
+      if (breadcrumb && (breadcrumb.innerText || "").includes("沟通中")) return true;
+    } catch {}
+    return false;
+  }
+
   async function ensureQianchengOnChattingPage() {
-    if (document.querySelector(QIANCHENG_SELECTORS.candidate_list_container)) return true;
+    // v2.30.0：不再以"列表容器存在"作为短路条件 —— 因为 51 SPA 结构下"全部候选人"页面
+    // 也可能存在同名容器，导致函数判定"已在沟通中"而跳过导航。改为每次都强制点击
+    // 「人才沟通」菜单 → 「沟通中」tab，确保一定落在沟通中。重复点击对已在沟通中的
+    // 用户只是无害的二次激活。
+    try { console.log("[qiancheng nav] enter ensureQianchengOnChattingPage", { url: location.href, title: document.title }); } catch {}
+
     const navMenu = document.querySelector(QIANCHENG_SELECTORS.nav_menu_chat);
     if (navMenu) {
-      clickElementReliably(navMenu);
-      await sleep(1500);
+      try { console.log("[qiancheng nav] click talent menu #sensor_talentcommunicate"); } catch {}
+      clickElementDirect(navMenu);
+      await sleep(900);
+    } else {
+      try { console.warn("[qiancheng nav] talent menu (#sensor_talentcommunicate) not found"); } catch {}
     }
-    const tab = document.querySelector(QIANCHENG_SELECTORS.tab_chatting);
+
+    let tab = document.querySelector(QIANCHENG_SELECTORS.tab_chatting);
     if (tab) {
-      clickElementReliably(tab);
-      await sleep(800);
+      try { console.log("[qiancheng nav] click chat tab #sensor_Bchat_communication; activeBefore=", isQianchengTabActive(tab)); } catch {}
+      clickElementDirect(tab);
+      await sleep(700);
+    } else {
+      try { console.warn("[qiancheng nav] chat tab (#sensor_Bchat_communication) not found, will wait"); } catch {}
     }
-    return Boolean(document.querySelector(QIANCHENG_SELECTORS.candidate_list_container));
+
+    // 等到目标 tab 可见且呈激活态 + 列表容器渲染出来才算就绪。最长等 6 秒。
+    const deadline = Date.now() + 6000;
+    while (Date.now() < deadline) {
+      tab = tab || document.querySelector(QIANCHENG_SELECTORS.tab_chatting);
+      const active = isQianchengTabActive(tab);
+      const listContainer = document.querySelector(QIANCHENG_SELECTORS.candidate_list_container);
+      const items = listContainer ? listContainer.querySelectorAll(QIANCHENG_SELECTORS.candidate_card).length : 0;
+      const routeHint = looksLikeQianchengChattingRoute();
+      // 任意两条同时成立即视为已就绪（防 51 改版破坏单一信号）：
+      //   1) tab 激活
+      //   2) 列表容器内有 list-item
+      //   3) URL/标题/面包屑命中沟通中关键词
+      const signals = (active ? 1 : 0) + (items > 0 ? 1 : 0) + (routeHint ? 1 : 0);
+      if (signals >= 2) {
+        try { console.log("[qiancheng nav] on chatting page", { active, items, routeHint, url: location.href }); } catch {}
+        emit({ type: "qiancheng_navigation_status", data: { status: "on_chatting_page", route: location.pathname || location.href, tab_active: active, list_items: items, route_hint: routeHint } });
+        return true;
+      }
+      await sleep(250);
+    }
+
+    const finalTab = document.querySelector(QIANCHENG_SELECTORS.tab_chatting);
+    const finalActive = isQianchengTabActive(finalTab);
+    const finalListContainer = document.querySelector(QIANCHENG_SELECTORS.candidate_list_container);
+    const finalItems = finalListContainer ? finalListContainer.querySelectorAll(QIANCHENG_SELECTORS.candidate_card).length : 0;
+    try { console.warn("[qiancheng nav] navigation_failed", { tabFound: !!finalTab, active: finalActive, list_items: finalItems, url: location.href }); } catch {}
+    emit({ type: "qiancheng_navigation_status", data: { status: "navigation_failed", reason: "timeout_waiting_chatting_page", tab_found: !!finalTab, tab_active: finalActive, list_items: finalItems, route: location.pathname || location.href } });
+    return Boolean(finalListContainer);
   }
 
   function buildQianchengCandidateKey(info) {
@@ -3163,6 +3296,7 @@
     const seenSignatures = new Set();
     const dedupSignatures = new Set(Array.isArray(config.boss_candidate_signatures) ? config.boss_candidate_signatures : []);
     const dedupKeys = new Set(Array.isArray(config.boss_candidate_keys) ? config.boss_candidate_keys : []);
+    let prevCandidateName = "";
 
     for (let i = 0; i < items.length && results.completed < config.max_resumes; i++) {
       if (state === "stopped") break;
@@ -3184,11 +3318,34 @@
         continue;
       }
 
+      // 等右侧详情面板真正切换到本候选人，再去取联系信息和沟通职位（前轮日志显示
+      // 没等待时会抓到上一个候选人的"沟通职位"，且姓名仍是"待识别"）。
+      const switchedName = await waitForQianchengCandidateDetailReady(prevCandidateName, 1800);
+      // 给 Vue/React 子节点（沟通职位行常常异步加载）再补 350ms 渲染窗口。
+      await sleep(350);
+
       const info = extractQianchengContactInfo();
       const signature = `${info.name}/${info.age}/${info.education}`;
       const candidateId = `${activeRunId || "run"}_${i}_${signature}`;
+      if (info.name && info.name !== "待识别") {
+        prevCandidateName = info.name;
+      } else if (switchedName) {
+        prevCandidateName = switchedName;
+      }
 
-      emit({ type: "candidate_clicked", data: { ...info, candidate_id: candidateId, candidate_signature: signature, index: i } });
+      const talkingRaw = extractQianchengTalkingPosition();
+      const talkingSimplified = simplifyQianchengTalkingPosition(talkingRaw);
+      if (talkingSimplified) {
+        emit({ type: "qiancheng_talking_position", data: { candidate_signature: signature, raw: talkingRaw, simplified: talkingSimplified } });
+      } else {
+        // 静默退出问题：raw 抓到但简化掉 / 完全没抓到都走这里，console.log 便于排查 DOM 结构。
+        try { console.log("[qiancheng] talking_position not found", { sig: signature, raw: talkingRaw }); } catch (_e) {}
+        emit({ type: "qiancheng_talking_position_skip", data: { candidate_signature: signature, raw: talkingRaw || "", reason: talkingRaw ? "simplified_empty" : "not_found" } });
+      }
+      info.talking_position = talkingSimplified;
+      info.talking_position_raw = talkingRaw;
+
+      emit({ type: "candidate_clicked", data: { ...info, candidate_id: candidateId, candidate_signature: signature, talking_position: talkingSimplified, talking_position_raw: talkingRaw, index: i } });
 
       if (signature === "待识别/待识别/待识别") {
         emit({ type: "candidate_skipped", data: { candidate_id: candidateId, candidate_signature: signature, reason: "candidate_info_unrecognized", raw_text: info.raw_text } });

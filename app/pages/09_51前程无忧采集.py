@@ -64,7 +64,7 @@ st.markdown(
 .boss-log-success { color:#0a7d2e !important; font-weight:700; font-size:13px; }
 .boss-log-error { color:var(--color-danger); font-weight:700; font-size:13px; }
 .boss-log-skipped { color:#b45309 !important; font-weight:700; font-size:13px; }
-.boss-log-stat { color:var(--color-primary); font-weight:700; font-size:13px; }
+.boss-log-stat { color:#2563eb !important; font-weight:700; font-size:13px; }
 .plain-section-title { display:flex; align-items:center; justify-content:space-between; gap:12px; margin:18px 0 10px; }
 .plain-section-title h3 { margin:0; font-size:18px; line-height:1.3; color:var(--color-text); }
 .collect-panel-stat { color:var(--color-primary); font-size:14px; font-weight:700; white-space:nowrap; }
@@ -94,7 +94,7 @@ def classify_boss_log(message: str, level: str = "info") -> str:
         return "boss-log-skipped"
     if any(token in message for token in ["保存归档", "保存", "已下载", "下载完成"]):
         return "boss-log-success"
-    if any(token in message for token in ["统计", "采集完成", "扫描完成"]):
+    if any(token in message for token in ["统计", "采集完成", "扫描完成", "沟通职位"]):
         return "boss-log-stat"
     return "boss-log-info"
 
@@ -264,7 +264,7 @@ html, body {{ margin:0; padding:0; background:transparent; font-family:Arial, 'M
 .boss-log-success {{ color:#0a7d2e !important; font-weight:700; font-size:12px; }}
 .boss-log-error {{ color:var(--color-danger); font-weight:700; font-size:12px; }}
 .boss-log-skipped {{ color:#b45309 !important; font-weight:700; font-size:12px; }}
-.boss-log-stat {{ color:var(--color-primary); font-weight:700; font-size:12px; }}
+.boss-log-stat {{ color:#2563eb !important; font-weight:700; font-size:12px; }}
 </style>
 <div id="{anchor}-wrap">{body_html}</div>
 <script>

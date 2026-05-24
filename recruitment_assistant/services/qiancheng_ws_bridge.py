@@ -36,7 +36,7 @@ from recruitment_assistant.services.extension_contract import (
 )
 
 
-QIANCHENG_BRIDGE_VERSION = "1.11.0"
+QIANCHENG_BRIDGE_VERSION = "1.16.0"
 
 
 class QianchengWSBridge:
@@ -48,6 +48,7 @@ class QianchengWSBridge:
         self._seen_skip_records: set[str] = set()
         self._recent_ui_log_keys: dict[str, float] = {}
         self._saved_resume_hash_signatures: dict[str, str] = {}
+        self._talking_position_by_sig: dict[str, str] = {}
         self._collect_timer: threading.Timer | None = None
         self._watchdog: WatchdogState = WatchdogState()
         self._watchdog_task: "Future[None] | None" = None  # concurrent.futures.Future from run_coroutine_threadsafe
@@ -97,6 +98,7 @@ class QianchengWSBridge:
         self._seen_skip_records.clear()
         self._recent_ui_log_keys.clear()
         self._saved_resume_hash_signatures.clear()
+        self._talking_position_by_sig.clear()
         self._stop_watchdog_loop()
         self._watchdog.reset()
         self.runtime_state.update({
@@ -679,6 +681,28 @@ class QianchengWSBridge:
                     self._log("highlight", "🎉 7 步学习完成。请在 Chrome F12 → Application → Local Storage → ehire.51job.com 复制 8 个 qiancheng_* key 的 JSON 值发给开发者。")
                 else:
                     self._log("warning", "学习结束但部分 key 未捕获，建议在 ehire 页 F12 Console 手动删除 qiancheng_* localStorage key 后重做。")
+            case "qiancheng_navigation_status":
+                # 内容脚本 v2.30.0：每轮采集启动强制点击「人才沟通」→「沟通中」后回报状态。
+                # 关键词用「已进入沟通中页面」/「导航失败」，避开「沟通职位」以免日志混色。
+                status = data.get("status", "?")
+                route = data.get("route", "")
+                if status == "on_chatting_page":
+                    tab_active = bool(data.get("tab_active"))
+                    items = data.get("list_items", 0)
+                    route_hint = bool(data.get("route_hint"))
+                    self._log(
+                        "info",
+                        f"已进入沟通中页面：route={route}；tab_active={tab_active}；list_items={items}；route_hint={route_hint}",
+                    )
+                else:
+                    reason = data.get("reason", "unknown")
+                    tab_found = bool(data.get("tab_found"))
+                    tab_active = bool(data.get("tab_active"))
+                    items = data.get("list_items", 0)
+                    self._log(
+                        "warning",
+                        f"导航失败（未确认进入沟通中页面）：reason={reason}；route={route}；tab_found={tab_found}；tab_active={tab_active}；list_items={items}",
+                    )
             case "extension_disconnected":
                 self.runtime_state["extension_connected"] = False
                 self.runtime_state["page_ready"] = False
@@ -706,6 +730,24 @@ class QianchengWSBridge:
                 elapsed = data.get("elapsed_ms")
                 elapsed_text = f"；识别耗时={elapsed}ms" if elapsed is not None else ""
                 self._log("info", f"点击候选人: {sig} (#{data.get('index', 0)}){elapsed_text}")
+            case "qiancheng_talking_position":
+                sig = data.get("candidate_signature", "?")
+                raw = (data.get("raw") or "").strip()
+                simplified = (data.get("simplified") or "").strip()
+                if sig and simplified:
+                    self._talking_position_by_sig[sig] = simplified
+                self._log("info", f"识别沟通职位: {sig}；原文={raw}；简化={simplified}")
+            case "qiancheng_talking_position_skip":
+                sig = data.get("candidate_signature", "?")
+                reason = data.get("reason", "?")
+                raw = (data.get("raw") or "").strip()
+                # selector 已确认为 #sensor_Bchatinfo_switch（v2.29.0），默认静默到 debug；
+                # 仅当 raw 抓到但 simplify 后清空这种逻辑异常仍打 info 级，便于发现简化函数 bug。
+                raw_preview = raw[:30] if raw else "(空)"
+                if reason == "raw_empty_after_simplify":
+                    self._log("info", f"沟通职位简化后为空: {sig}；raw={raw_preview}")
+                else:
+                    logger.debug("沟通职位识别跳过: sig={} reason={} raw={}", sig, reason, raw_preview)
             case "resume_downloaded":
                 self._save_resume(data)
             case "candidate_skipped":
@@ -1229,7 +1271,12 @@ class QianchengWSBridge:
                 name = self._normalize_resume_filename_part(candidate_info.get("name"), "未知姓名")
                 age = self._normalize_resume_filename_part(candidate_info.get("age"), "未知年龄")
                 education = self._normalize_resume_filename_part(candidate_info.get("education"), "未知学历")
-                talking_position_raw = (candidate_info.get("talking_position") or candidate_info.get("job_title") or "").strip()
+                talking_position_raw = (
+                    candidate_info.get("talking_position")
+                    or self._talking_position_by_sig.get(candidate_sig)
+                    or candidate_info.get("job_title")
+                    or ""
+                ).strip()
                 simplified_position = self._simplify_talking_position(talking_position_raw)
                 position_part = self._normalize_resume_filename_part(simplified_position, simplified_position) if simplified_position else ""
                 seq = self.runtime_state["downloaded_count"] + 1

@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -24,11 +25,13 @@ from recruitment_assistant.utils.hash_utils import text_hash
 from recruitment_assistant.utils.snapshot_utils import safe_filename
 
 from recruitment_assistant.services.test_run_watchdog import WatchdogState
+from recruitment_assistant.services.extension_contract import (
+    EXPECTED_EXTENSION_VERSION as BOSS_EXTENSION_EXPECTED_VERSION,
+    EXPECTED_CONTENT_SCRIPT_VERSION as BOSS_CONTENT_SCRIPT_EXPECTED_VERSION,
+)
 
 
-BOSS_BRIDGE_VERSION = "1.95.0"
-BOSS_EXTENSION_EXPECTED_VERSION = "1.95.0"
-BOSS_CONTENT_SCRIPT_EXPECTED_VERSION = "1.95.0"
+BOSS_BRIDGE_VERSION = "1.97.0"
 
 
 class BossWSBridge:
@@ -40,6 +43,7 @@ class BossWSBridge:
         self._seen_skip_records: set[str] = set()
         self._recent_ui_log_keys: dict[str, float] = {}
         self._saved_resume_hash_signatures: dict[str, str] = {}
+        self._talking_position_by_sig: dict[str, str] = {}
         self._collect_timer: threading.Timer | None = None
         self._watchdog: WatchdogState = WatchdogState()
         self._watchdog_task: "Future[None] | None" = None  # concurrent.futures.Future from run_coroutine_threadsafe
@@ -89,6 +93,7 @@ class BossWSBridge:
         self._seen_skip_records.clear()
         self._recent_ui_log_keys.clear()
         self._saved_resume_hash_signatures.clear()
+        self._talking_position_by_sig.clear()
         self._stop_watchdog_loop()
         self._watchdog.reset()
         self.runtime_state.update({
@@ -549,6 +554,11 @@ class BossWSBridge:
             payload["data"].update(extra)
         self.ws_server.send_command(payload)
         self._write_event_log("resume_persist_ack_sent", payload["data"])
+        # ui_log 让下一轮调试时可见：ack 是否发出 / 发往哪个 download_request_id
+        self._log(
+            "info",
+            f"持久化 ack 已下发: {candidate_sig}；状态={status}；request_id={download_request_id or '(空)'}",
+        )
 
     def get_run_summary(self) -> dict[str, Any]:
         candidates = self.runtime_state.get("candidates", [])
@@ -659,6 +669,17 @@ class BossWSBridge:
                 elapsed = data.get("elapsed_ms")
                 elapsed_text = f"；识别耗时={elapsed}ms" if elapsed is not None else ""
                 self._log("info", f"点击候选人: {sig} (#{data.get('index', 0)}){elapsed_text}")
+            case "boss_talking_position":
+                sig = data.get("candidate_signature", "?")
+                raw = (data.get("raw") or "").strip()
+                simplified = (data.get("simplified") or "").strip()
+                if sig and simplified:
+                    self._talking_position_by_sig[sig] = simplified
+                self._log("info", f"沟通职位: {sig}；原文={raw}；简化={simplified}")
+            case "boss_talking_position_skip":
+                sig = data.get("candidate_signature", "?")
+                reason = data.get("reason", "?")
+                logger.debug("沟通职位未找到: sig={} reason={}", sig, reason)
             case "resume_downloaded":
                 self._save_resume(data)
             case "candidate_skipped":
@@ -1058,6 +1079,17 @@ class BossWSBridge:
             text = fallback
         return safe_filename(text, max_length=24)
 
+    @staticmethod
+    def _simplify_talking_position(raw: str) -> str:
+        if not raw:
+            return ""
+        s = re.sub(r"[（(][^）)]*[）)]", "", raw)
+        s = re.split(r"[/／]", s, maxsplit=1)[0]
+        s = s.strip()
+        if len(s) > 8:
+            s = s[:8]
+        return s
+
     def _build_boss_candidate_key(self, candidate_sig: str, candidate_info: dict[str, Any]) -> str:
         raw_name = candidate_info.get("name") or ""
         raw_age = candidate_info.get("age") or ""
@@ -1198,8 +1230,15 @@ class BossWSBridge:
                 name = self._normalize_resume_filename_part(candidate_info.get("name"), "未知姓名")
                 age = self._normalize_resume_filename_part(candidate_info.get("age"), "未知年龄")
                 education = self._normalize_resume_filename_part(candidate_info.get("education"), "未知学历")
+                talking_position_raw = (candidate_info.get("talking_position") or self._talking_position_by_sig.get(candidate_sig) or "").strip()
+                simplified_position = self._simplify_talking_position(talking_position_raw)
+                position_part = self._normalize_resume_filename_part(simplified_position, simplified_position) if simplified_position else ""
                 seq = self.runtime_state["downloaded_count"] + 1
-                filename_stem = f"{name}-{age}-{education}-BOSS直聘-{now.strftime('%Y%m%d')}-{now.strftime('%H%M%S')}-{seq:03d}"
+                stem_parts = [name, age, education]
+                if position_part:
+                    stem_parts.append(position_part)
+                stem_parts.extend(["BOSS直聘", now.strftime("%Y%m%d"), now.strftime("%H%M%S"), f"{seq:03d}"])
+                filename_stem = "-".join(stem_parts)
                 filename = f"{filename_stem}{suffix}"
 
                 target = target_dir / filename
@@ -1249,6 +1288,7 @@ class BossWSBridge:
                 final_filename = target.name
                 logger.debug("简历已保存: {}", final_filename)
                 self.runtime_state["downloaded_count"] = seq
+                self._log("success", f"文件下载成功并保存归档: {final_filename}")
                 record = {
                     "signature": candidate_sig,
                     "info": candidate_info,

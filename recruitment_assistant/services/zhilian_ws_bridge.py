@@ -30,11 +30,13 @@ from recruitment_assistant.utils.hash_utils import text_hash
 from recruitment_assistant.utils.snapshot_utils import safe_filename
 
 from recruitment_assistant.services.test_run_watchdog import WatchdogState
+from recruitment_assistant.services.extension_contract import (
+    EXPECTED_EXTENSION_VERSION as ZHILIAN_EXTENSION_EXPECTED_VERSION,
+    EXPECTED_CONTENT_SCRIPT_VERSION as ZHILIAN_CONTENT_SCRIPT_EXPECTED_VERSION,
+)
 
 
-ZHILIAN_BRIDGE_VERSION = "1.21.0"
-ZHILIAN_EXTENSION_EXPECTED_VERSION = "2.14.0"
-ZHILIAN_CONTENT_SCRIPT_EXPECTED_VERSION = "2.14.0"
+ZHILIAN_BRIDGE_VERSION = "1.22.0"
 
 
 class ZhilianWSBridge:
@@ -1287,7 +1289,7 @@ class ZhilianWSBridge:
                 final_filename = target.name
                 logger.debug("简历已保存: {}", final_filename)
                 self.runtime_state["downloaded_count"] = seq
-                self._log("success", f"已归档简历: {candidate_sig} → {final_filename}")
+                self._log("success", f"文件下载成功并保存归档: {final_filename}")
                 record = {
                     "signature": candidate_sig,
                     "info": candidate_info,

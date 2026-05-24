@@ -7,6 +7,7 @@
 
 import asyncio
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -29,11 +30,13 @@ from recruitment_assistant.utils.hash_utils import text_hash
 from recruitment_assistant.utils.snapshot_utils import safe_filename
 
 from recruitment_assistant.services.test_run_watchdog import WatchdogState
+from recruitment_assistant.services.extension_contract import (
+    EXPECTED_EXTENSION_VERSION as QIANCHENG_EXTENSION_EXPECTED_VERSION,
+    EXPECTED_CONTENT_SCRIPT_VERSION as QIANCHENG_CONTENT_SCRIPT_EXPECTED_VERSION,
+)
 
 
-QIANCHENG_BRIDGE_VERSION = "1.9.0"
-QIANCHENG_EXTENSION_EXPECTED_VERSION = "1.95.0"
-QIANCHENG_CONTENT_SCRIPT_EXPECTED_VERSION = "1.95.0"
+QIANCHENG_BRIDGE_VERSION = "1.11.0"
 
 
 class QianchengWSBridge:
@@ -1075,6 +1078,17 @@ class QianchengWSBridge:
             text = fallback
         return safe_filename(text, max_length=24)
 
+    @staticmethod
+    def _simplify_talking_position(raw: str) -> str:
+        if not raw:
+            return ""
+        s = re.sub(r"[（(][^）)]*[）)]", "", raw)
+        s = re.split(r"[/／]", s, maxsplit=1)[0]
+        s = s.strip()
+        if len(s) > 8:
+            s = s[:8]
+        return s
+
     def _build_boss_candidate_key(self, candidate_sig: str, candidate_info: dict[str, Any]) -> str:
         raw_name = candidate_info.get("name") or ""
         raw_age = candidate_info.get("age") or ""
@@ -1215,8 +1229,15 @@ class QianchengWSBridge:
                 name = self._normalize_resume_filename_part(candidate_info.get("name"), "未知姓名")
                 age = self._normalize_resume_filename_part(candidate_info.get("age"), "未知年龄")
                 education = self._normalize_resume_filename_part(candidate_info.get("education"), "未知学历")
+                talking_position_raw = (candidate_info.get("talking_position") or candidate_info.get("job_title") or "").strip()
+                simplified_position = self._simplify_talking_position(talking_position_raw)
+                position_part = self._normalize_resume_filename_part(simplified_position, simplified_position) if simplified_position else ""
                 seq = self.runtime_state["downloaded_count"] + 1
-                filename_stem = f"{name}-{age}-{education}-51前程无忧-{now.strftime('%Y%m%d')}-{now.strftime('%H%M%S')}-{seq:03d}"
+                stem_parts = [name, age, education]
+                if position_part:
+                    stem_parts.append(position_part)
+                stem_parts.extend(["51前程无忧", now.strftime("%Y%m%d"), now.strftime("%H%M%S"), f"{seq:03d}"])
+                filename_stem = "-".join(stem_parts)
                 filename = f"{filename_stem}{suffix}"
 
                 target = target_dir / filename
@@ -1266,6 +1287,7 @@ class QianchengWSBridge:
                 final_filename = target.name
                 logger.debug("简历已保存: {}", final_filename)
                 self.runtime_state["downloaded_count"] = seq
+                self._log("success", f"文件下载成功并保存归档: {final_filename}")
                 record = {
                     "signature": candidate_sig,
                     "info": candidate_info,

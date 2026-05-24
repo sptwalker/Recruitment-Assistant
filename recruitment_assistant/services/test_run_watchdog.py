@@ -17,6 +17,7 @@ GLOBAL_TIMEOUT_SECONDS = 300
 # 每个候选人的终态：到达后停止该 cid 的 watchdog
 CANDIDATE_TERMINAL_EVENTS = frozenset({
     "resume_persist_confirmed",
+    "resume_persist_rejected",  # ack 超时 / hash 冲突等也是终态，下载链已结束，避免 watchdog 再追
     "candidate_skipped",
     "resume_request_success",
 })

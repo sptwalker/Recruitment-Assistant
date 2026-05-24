@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  const CONTENT_SCRIPT_VERSION = "2.14.0";
+  const CONTENT_SCRIPT_VERSION = "2.25.0";
 
   // 平台注册表：每个平台的 hostname、WS 端口、文本标记、localStorage key 一站式声明。
   // 这是从单平台升级到多平台的核心入口——新加平台只需在此对象增加一条配置。
@@ -113,8 +113,6 @@
     ".base-info",
   ];
 
-  const AUTH_MARKERS = PLATFORM.auth_markers;
-  const PAGE_MARKERS = PLATFORM.page_markers;
   const RESUME_VIEW_TEXT = PLATFORM.resume_view_text;
   const RESUME_REQUESTED_TEXT = PLATFORM.resume_requested_text;
 
@@ -176,16 +174,6 @@
     void candidateId;
     void signature;
     void details;
-  }
-
-  function isAuthenticated() {
-    const text = document.body?.innerText || "";
-    return AUTH_MARKERS.filter((m) => text.includes(m)).length >= 2;
-  }
-
-  function isBossPageDetected() {
-    const text = `${document.title || ""} ${document.body?.innerText || ""}`;
-    return PLATFORM.hostnames.includes(location.hostname) && PAGE_MARKERS.some((m) => text.includes(m));
   }
 
   function isVisible(el) {
@@ -280,71 +268,212 @@
       .sort((a, b) => b.score - a.score)[0]?.el || null;
   }
 
-  async function clickBossChattingTab() {
-    // 在 BOSS 沟通页顶部按文本"沟通中"找标签并点击。
-    // 没有稳定 ID/class，按文本扫描可点击元素，限制范围在页面上半部分（避免误中正文里的"沟通中"字样）。
-    const candidates = [];
-    const all = document.querySelectorAll("a, button, span, li, [role='tab'], [class*='tab'], [class*='filter']");
-    for (const el of all) {
-      const text = (el.innerText || el.textContent || "").trim();
-      if (text !== "沟通中") continue;
-      const rect = el.getBoundingClientRect();
-      if (rect.width === 0 || rect.height === 0) continue;
-      if (rect.top < 0 || rect.top > window.innerHeight * 0.5) continue;
-      if (rect.width > 200) continue; // 标签通常很窄
-      candidates.push({ el, rect });
-    }
-    if (candidates.length === 0) {
-      emit({ type: "boss_chatting_tab_skip", data: { reason: "not_found", url: location.href } });
-      return false;
-    }
-    // 取最靠上的那个
-    candidates.sort((a, b) => a.rect.top - b.rect.top);
-    const target = candidates[0].el;
-    try {
-      clickElementReliably(target);
-      emit({ type: "boss_chatting_tab_clicked", data: { rect: candidates[0].rect, text: "沟通中" } });
-      await sleep(800);
+  async function clickBossChatMenu() {
+    if (/\/web\/chat(\/|$|\?)/.test(location.pathname + location.search)) {
+      emit({ type: "boss_chat_menu_skip", data: { reason: "already_on_chat", url: location.href } });
       return true;
-    } catch (exc) {
-      emit({ type: "boss_chatting_tab_skip", data: { reason: "click_failed", error: String(exc) } });
-      return false;
     }
+    let attempts = 0;
+    for (let wave = 0; wave < 3; wave++) {
+      attempts++;
+      const candidates = [];
+      const all = document.querySelectorAll("a, button, span, li, div, [role='menuitem'], [class*='menu'], [class*='nav']");
+      for (const el of all) {
+        const text = (el.innerText || el.textContent || "").trim();
+        if (text !== "沟通") continue;
+        const rect = el.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) continue;
+        if (rect.left >= window.innerWidth * 0.3) continue;
+        if (rect.width >= 200) continue;
+        if (!isVisible(el)) continue;
+        candidates.push({ el, rect });
+      }
+      if (candidates.length > 0) {
+        candidates.sort((a, b) => a.rect.left - b.rect.left);
+        const target = candidates[0].el;
+        try {
+          clickElementDirect(target);
+          emit({ type: "boss_chat_menu_clicked", data: { rect: candidates[0].rect, attempts } });
+          await sleep(800);
+          return true;
+        } catch (exc) {
+          emit({ type: "boss_chat_menu_skip", data: { reason: "click_failed", error: String(exc), attempts } });
+          return false;
+        }
+      }
+      await sleep(500);
+    }
+    emit({ type: "boss_chat_menu_skip", data: { reason: "not_found", url: location.href, attempts } });
+    return false;
+  }
+
+  async function clickBossChattingTab() {
+    let attempts = 0;
+    for (let wave = 0; wave < 3; wave++) {
+      attempts++;
+      const candidates = [];
+      const all = document.querySelectorAll("a, button, span, li, div, [role='tab'], [class*='tab'], [class*='filter']");
+      for (const el of all) {
+        const text = (el.innerText || el.textContent || "").trim();
+        if (text !== "沟通中") continue;
+        const rect = el.getBoundingClientRect();
+        if (rect.width < 20 || rect.height < 10) continue;
+        if (!isVisible(el)) continue;
+        candidates.push({ el, rect });
+      }
+      if (candidates.length > 0) {
+        candidates.sort((a, b) => a.rect.left - b.rect.left);
+        const target = candidates[0].el;
+        try {
+          clickElementDirect(target);
+          emit({ type: "boss_chatting_tab_clicked", data: { rect: candidates[0].rect, text: "沟通中", attempts } });
+          await sleep(800);
+          return true;
+        } catch (exc) {
+          emit({ type: "boss_chatting_tab_skip", data: { reason: "click_failed", error: String(exc), attempts } });
+          return false;
+        }
+      }
+      await sleep(600);
+    }
+    emit({ type: "boss_chatting_tab_skip", data: { reason: "not_found", url: location.href, attempts } });
+    return false;
   }
 
   async function resetCandidateListScroll() {
-    const container = findBestListContainer();
-    if (container) {
-      container.scrollTop = 0;
-      container.dispatchEvent(new Event("scroll", { bubbles: true }));
+    const ANCHOR_SELECTORS = [
+      ".geek-item-wrap",
+      "[class*='geek-item']",
+      ".user-list [class*='item']",
+      ".chat-list li",
+      ".user-list li",
+      ".friend-list li",
+      "[class*='chat-list'] li",
+      "[class*='friend-list'] li",
+      "[class*='user-list'] li",
+      "[class*='conversation'] li",
+    ];
+    const anchorDiag = ANCHOR_SELECTORS.map((sel) => ({
+      sel,
+      count: document.querySelectorAll(sel).length,
+    })).filter((x) => x.count > 0);
+    const anchor = document.querySelector(ANCHOR_SELECTORS.join(", "));
+
+    const directScrollables = Array.from(document.querySelectorAll(
+      ".user-list, .chat-list, .friend-list, [class*='user-list'], [class*='chat-list'], [class*='friend-list'], [class*='b-scroll-stable']"
+    )).filter((el) => {
+      if (!isVisible(el)) return false;
+      const rect = el.getBoundingClientRect();
+      return rect.left < (window.innerWidth || 1440) * 0.55 && el.scrollHeight - el.clientHeight > 30;
+    });
+
+    const scrollables = new Set(directScrollables);
+    if (anchor) {
+      let node = anchor.parentElement;
+      while (node && node !== document.body && node !== document.documentElement) {
+        try {
+          const cs = getComputedStyle(node);
+          if (/(auto|scroll|overlay)/.test(cs.overflowY) && node.scrollHeight - node.clientHeight > 30) {
+            scrollables.add(node);
+          }
+        } catch (_) { /* ignore */ }
+        node = node.parentElement;
+      }
     }
+    const scrollList = Array.from(scrollables);
+    const anchorTopBefore = anchor ? Math.round(anchor.getBoundingClientRect().top) : null;
+    const before = scrollList.map((el) => ({
+      tag: el.tagName,
+      cls: String(el.className || "").slice(0, 80),
+      prev: el.scrollTop,
+      h: el.scrollHeight,
+      ch: el.clientHeight,
+    }));
+    for (const el of scrollList) {
+      try {
+        el.scrollTop = 0;
+        el.scrollTo?.({ top: 0, behavior: "auto" });
+        el.dispatchEvent(new Event("scroll", { bubbles: true }));
+      } catch (_) { /* ignore */ }
+    }
+    try { document.documentElement.scrollTop = 0; } catch (_) { /* ignore */ }
+    try { document.body.scrollTop = 0; } catch (_) { /* ignore */ }
     window.scrollTo(0, 0);
-    await sleep(800);
+    await sleep(900);
+    const after = scrollList.map((el) => el.scrollTop);
+    const anchorTopAfter = anchor
+      ? Math.round((document.querySelector(ANCHOR_SELECTORS.join(", ")) || anchor).getBoundingClientRect().top)
+      : null;
+    emit({
+      type: "boss_diag",
+      data: {
+        step: "scroll_reset_detail",
+        anchor_found: !!anchor,
+        anchor_selectors_hit: anchorDiag,
+        anchor_top_before: anchorTopBefore,
+        anchor_top_after: anchorTopAfter,
+        scrollable_count: scrollList.length,
+        before,
+        after,
+        doc_scrollTop: document.documentElement.scrollTop,
+        body_scrollTop: document.body?.scrollTop || 0,
+      },
+    });
   }
 
   function getCandidateItems() {
     const seen = new Set();
     const seenKeys = new Set();
     const items = [];
+    let hitContainerInfo = null;
     const containers = LIST_CONTAINER_SELECTORS
-      .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
-      .filter((el) => isVisible(el) && isInLeftCandidateArea(el));
+      .flatMap((selector) => Array.from(document.querySelectorAll(selector)).map((el) => ({ selector, el })))
+      .filter(({ el }) => isVisible(el) && isInLeftCandidateArea(el));
 
-    for (const container of containers) {
-      const nodes = container.querySelectorAll("li, [class*='item'], [class*='card'], [class*='user']");
-      for (const el of nodes) {
-        if (seen.has(el)) continue;
-        seen.add(el);
-        const score = scoreCandidateItem(el);
-        if (score < 2) continue;
-        const key = candidateKeyFromText(textOf(el));
-        if (!key || seenKeys.has(key)) continue;
-        seenKeys.add(key);
-        items.push({ el, score, top: el.getBoundingClientRect().top });
+    for (const { selector, el: container } of containers) {
+      const before = items.length;
+      // BOSS 新版聊天列表：.user-list 直接子 .geek-item-wrap 即候选人项，
+      // 卡片本身不显示年龄/学历（点击后才出现在右侧详情），
+      // 所以一旦命中已知的列表容器，就信任结构、跳过 scoring。
+      const trustedNodes = Array.from(container.querySelectorAll(".geek-item-wrap"));
+      if (trustedNodes.length > 0) {
+        for (const el of trustedNodes) {
+          if (seen.has(el)) continue;
+          seen.add(el);
+          if (!isVisible(el)) continue;
+          const text = textOf(el);
+          if (!text || text.length < 2) continue;
+          const key = candidateKeyFromText(text);
+          if (!key || seenKeys.has(key)) continue;
+          seenKeys.add(key);
+          items.push({ el, score: 5, top: el.getBoundingClientRect().top });
+        }
+      } else {
+        const nodes = container.querySelectorAll("li, [class*='item'], [class*='card'], [class*='user']");
+        for (const el of nodes) {
+          if (seen.has(el)) continue;
+          seen.add(el);
+          const score = scoreCandidateItem(el);
+          if (score < 2) continue;
+          const key = candidateKeyFromText(textOf(el));
+          if (!key || seenKeys.has(key)) continue;
+          seenKeys.add(key);
+          items.push({ el, score, top: el.getBoundingClientRect().top });
+        }
+      }
+      if (items.length > before) {
+        hitContainerInfo = {
+          selector,
+          tag: container.tagName,
+          cls: String(container.className || "").slice(0, 100),
+          rect: getRectSnapshot(container),
+          trusted: trustedNodes.length > 0,
+        };
       }
       if (items.length > 0) break;
     }
 
+    let fallbackUsed = null;
     if (items.length === 0) {
       for (const selector of CANDIDATE_SELECTORS) {
         for (const el of document.querySelectorAll(selector)) {
@@ -357,9 +486,20 @@
           seenKeys.add(key);
           items.push({ el, score, top: el.getBoundingClientRect().top });
         }
-        if (items.length > 0) break;
+        if (items.length > 0) {
+          fallbackUsed = selector;
+          break;
+        }
       }
     }
+
+    try {
+      window.__bossLastCandidateScanDiag = {
+        container: hitContainerInfo,
+        fallback_selector: fallbackUsed,
+        item_count: items.length,
+      };
+    } catch (_) { /* ignore */ }
 
     return items.sort((a, b) => a.top - b.top || b.score - a.score).map((x) => x.el);
   }
@@ -721,6 +861,44 @@
       };
     }
     return { name: "待识别", age: "待识别", education: "待识别", raw_text: "", contact_source: "top_profile_red_boxes_not_found", contact_source_note: "未在右侧沟通页顶部红框区域识别到姓名、年龄、学历" };
+  }
+
+  function extractBossTalkingPosition() {
+    const pageWidth = window.innerWidth || document.documentElement.clientWidth || 1440;
+    const rightLeft = Math.max(380, pageWidth * 0.28);
+    const re = /沟通的职位[\s\-：:—–]*([^\n\r]{1,80})/;
+    const candidates = [];
+    const nodes = document.querySelectorAll("div, span, p, header, section");
+    for (const el of nodes) {
+      if (!isVisible(el)) continue;
+      const rect = el.getBoundingClientRect();
+      if (rect.left < rightLeft) continue;
+      if (rect.top < 40 || rect.top > 320) continue;
+      if (rect.width < 100 || rect.width > pageWidth) continue;
+      const text = (el.innerText || el.textContent || "").trim();
+      if (!text || text.length > 240) continue;
+      if (!text.includes("沟通的职位")) continue;
+      const m = text.match(re);
+      if (!m) continue;
+      const raw = m[1].trim();
+      if (!raw) continue;
+      candidates.push({ el, rect, raw, top: rect.top, len: text.length });
+    }
+    if (candidates.length === 0) return "";
+    candidates.sort((a, b) => a.top - b.top || a.len - b.len);
+    return candidates[0].raw;
+  }
+
+  function simplifyBossTalkingPosition(raw) {
+    if (!raw) return "";
+    let s = String(raw).replace(/[（(][^）)]*[）)]/g, "");
+    s = s.split(/[/／]/)[0];
+    s = s.trim();
+    const chineseOnly = (s.match(/[一-龥]/g) || []).join("");
+    if (chineseOnly && chineseOnly.length > 0) {
+      return chineseOnly.length > 8 ? chineseOnly.slice(0, 8) : chineseOnly;
+    }
+    return s.length > 8 ? s.slice(0, 8) : s;
   }
 
   async function waitForContactInfo(clickedItem = null, timeoutMs = 2200) {
@@ -1735,75 +1913,83 @@
   }
 
   function findBossSvgDownloadIcon(preview = null) {
-    const roots = [];
-    const pushRoot = (el) => {
-      if (!el || isInExcludedBossDownloadArea(el)) return;
-      if (!roots.includes(el)) roots.push(el);
-    };
-    if (preview?.root) {
-      pushRoot(preview.root);
-      pushRoot(preview.root.parentElement);
-      pushRoot(preview.root.parentElement?.parentElement);
-      pushRoot(preview.root.closest?.("[role='dialog'], [class*='dialog'], [class*='modal'], [class*='preview'], [class*='viewer'], [class*='pdf'], [class*='resume'], [class*='attachment'], [class*='drawer'], [class*='popup'], [class*='pop'], [class*='layer']"));
-    }
-    for (const root of getPreviewRoots()) pushRoot(root);
-    // Also search the full document for high-confidence selectors like resume-btn-file
-    pushRoot(document.body);
-    const matches = [];
-    const selector = "[class*='attachment-resume-btns'] svg, [class*='attachment-resume-btns'] use, [class*='resume-footer'] svg, [class*='resume-footer'] use, [class*='resume-detail'] [class*='boss-svg'], [class*='resume-detail'] [class*='svg-icon'], span.card-btn, [class*='card-btn'], [class*='resume-btn-file'], a[class*='resume-btn-file']";
-    for (const root of roots) {
-      const nodes = root.matches?.(selector) ? [root, ...root.querySelectorAll(selector)] : Array.from(root.querySelectorAll?.(selector) || []);
-      for (const el of nodes) {
-        if (isInExcludedBossDownloadArea(el)) continue;
-        const clickable = getDownloadClickableNode(el);
-        if (!clickable || !isVisible(clickable) || isDisabled(clickable)) continue;
-        const elHref = el.getAttribute?.("href") || el.getAttribute?.("xlink:href") || "";
-        const isXlinkDownload = /download/i.test(elHref) && (!!el.closest?.("[class*='attachment-resume-btns']") || (preview?.root && preview.root.contains(el)));
-        if (!isXlinkDownload && !isStrictResumeActionArea(clickable, preview) && !isStrictResumeActionArea(el, preview)) continue;
-        const rect = clickable.getBoundingClientRect();
-        if (rect.width < 10 || rect.height < 10 || rect.top < 0 || rect.left < 0) continue;
-        const descriptor = `${getElementDescriptor(el)} ${getElementDescriptor(clickable)} ${getElementDescriptor(clickable.parentElement)}`;
-        const combined = descriptor.toLowerCase();
-        const inPopupContainer = !!clickable.closest?.("[class*='preview'], [class*='dialog'], [class*='modal'], [class*='drawer'], [class*='popup'], [class*='layer'], [role='dialog']");
-        const inPreviewRoot = preview?.root && preview.root.contains(clickable);
-        const isHtmlPopupDownload = /card-btn/i.test(descriptor) && /附件简历|下载/.test(descriptor) && (inPopupContainer || inPreviewRoot);
-        const isPreviewRootDownload = inPreviewRoot && /下载|download|附件简历/.test(combined) && !/关闭|close|取消|返回/i.test(combined);
-        const isResumeBtnFile = /resume-btn-file/i.test(clickable.className || "") && /附件简历|下载|download/i.test(combined);
-        if (!isXlinkDownload && !isHtmlPopupDownload && !isPreviewRootDownload && !isResumeBtnFile && !isBossSvgDownloadDescriptor(descriptor)) continue;
-        if (/关闭|close|取消|返回|back|delete|trash|更多|more|打印|print|zoom|放大|缩小|rotate|旋转|×|✕|esc/i.test(combined)) continue;
-        let score = 40;
-        if (isResumeBtnFile) score += 35;
-        if (isHtmlPopupDownload) score += 30;
-        if (isPreviewRootDownload) score += 20;
-        if (clickable.closest?.("[class*='attachment-resume-btns']")) score += 22;
-        if (clickable.closest?.("[class*='resume-footer']")) score += 14;
-        if (clickable.closest?.("[class*='icon-content']")) score += 8;
-        if (/下载|download|down/i.test(descriptor)) score += 10;
-        if (rect.left > window.innerWidth * 0.55) score += 3;
-        if (rect.left > window.innerWidth * 0.75) score += 2;
-        const finalTarget = isXlinkDownload ? (el.closest?.("span") || clickable) : clickable;
-        matches.push({ el: finalTarget, rect: finalTarget.getBoundingClientRect(), score, text: descriptor.slice(0, 160), descriptor });
+    try {
+      const roots = [];
+      const pushRoot = (el) => {
+        if (!el || isInExcludedBossDownloadArea(el)) return;
+        if (!roots.includes(el)) roots.push(el);
+      };
+      if (preview?.root) {
+        pushRoot(preview.root);
+        pushRoot(preview.root.parentElement);
+        pushRoot(preview.root.parentElement?.parentElement);
+        pushRoot(preview.root.closest?.("[role='dialog'], [class*='dialog'], [class*='modal'], [class*='preview'], [class*='viewer'], [class*='pdf'], [class*='resume'], [class*='attachment'], [class*='drawer'], [class*='popup'], [class*='pop'], [class*='layer']"));
       }
+      for (const root of getPreviewRoots()) pushRoot(root);
+      // 仅在没有任何预览根时才退化到 document.body，避免在 chat 列表 dom 上做全局
+      // [class*='card-btn'] 扫描（聊天列表里大量 card-btn + getElementDescriptor → textOf
+      // 会触发数十万 layout，卡死主线程）。
+      if (roots.length === 0) {
+        pushRoot(document.body);
+      }
+      emit({ type: "boss_svg_scan_roots_prepared", data: { roots_count: roots.length, has_preview: Boolean(preview?.root), fallback_body: roots.length === 1 && roots[0] === document.body } });
+      const matches = [];
+      const selector = "[class*='attachment-resume-btns'] svg, [class*='attachment-resume-btns'] use, [class*='resume-footer'] svg, [class*='resume-footer'] use, [class*='resume-detail'] [class*='boss-svg'], [class*='resume-detail'] [class*='svg-icon'], span.card-btn, [class*='card-btn'], [class*='resume-btn-file'], a[class*='resume-btn-file']";
+      for (const root of roots) {
+        const nodes = root.matches?.(selector) ? [root, ...root.querySelectorAll(selector)] : Array.from(root.querySelectorAll?.(selector) || []);
+        for (const el of nodes) {
+          if (isInExcludedBossDownloadArea(el)) continue;
+          const clickable = getDownloadClickableNode(el);
+          if (!clickable || !isVisible(clickable) || isDisabled(clickable)) continue;
+          const elHref = el.getAttribute?.("href") || el.getAttribute?.("xlink:href") || "";
+          const isXlinkDownload = /download/i.test(elHref) && (!!el.closest?.("[class*='attachment-resume-btns']") || (preview?.root && preview.root.contains(el)));
+          if (!isXlinkDownload && !isStrictResumeActionArea(clickable, preview) && !isStrictResumeActionArea(el, preview)) continue;
+          const rect = clickable.getBoundingClientRect();
+          if (rect.width < 10 || rect.height < 10 || rect.top < 0 || rect.left < 0) continue;
+          const descriptor = `${getElementDescriptor(el)} ${getElementDescriptor(clickable)} ${getElementDescriptor(clickable.parentElement)}`;
+          const combined = descriptor.toLowerCase();
+          const inPopupContainer = !!clickable.closest?.("[class*='preview'], [class*='dialog'], [class*='modal'], [class*='drawer'], [class*='popup'], [class*='layer'], [role='dialog']");
+          const inPreviewRoot = preview?.root && preview.root.contains(clickable);
+          const isHtmlPopupDownload = /card-btn/i.test(descriptor) && /附件简历|下载/.test(descriptor) && (inPopupContainer || inPreviewRoot);
+          const isPreviewRootDownload = inPreviewRoot && /下载|download|附件简历/.test(combined) && !/关闭|close|取消|返回/i.test(combined);
+          const isResumeBtnFile = /resume-btn-file/i.test(clickable.className || "") && /附件简历|下载|download/i.test(combined);
+          if (!isXlinkDownload && !isHtmlPopupDownload && !isPreviewRootDownload && !isResumeBtnFile && !isBossSvgDownloadDescriptor(descriptor)) continue;
+          if (/关闭|close|取消|返回|back|delete|trash|更多|more|打印|print|zoom|放大|缩小|rotate|旋转|×|✕|esc/i.test(combined)) continue;
+          let score = 40;
+          if (isResumeBtnFile) score += 35;
+          if (isHtmlPopupDownload) score += 30;
+          if (isPreviewRootDownload) score += 20;
+          if (clickable.closest?.("[class*='attachment-resume-btns']")) score += 22;
+          if (clickable.closest?.("[class*='resume-footer']")) score += 14;
+          if (clickable.closest?.("[class*='icon-content']")) score += 8;
+          if (/下载|download|down/i.test(descriptor)) score += 10;
+          if (rect.left > window.innerWidth * 0.55) score += 3;
+          if (rect.left > window.innerWidth * 0.75) score += 2;
+          const finalTarget = isXlinkDownload ? (el.closest?.("span") || clickable) : clickable;
+          matches.push({ el: finalTarget, rect: finalTarget.getBoundingClientRect(), score, text: descriptor.slice(0, 160), descriptor });
+        }
+      }
+      matches.sort((a, b) => b.score - a.score || b.rect.left - a.rect.left || a.rect.top - b.rect.top);
+      if (matches.length) {
+        emit({
+          type: "download_button_candidates_detailed",
+          data: {
+            candidates: matches.slice(0, 8).map((item) => ({
+              score: item.score,
+              text: item.text,
+              descriptor: (item.descriptor || item.text || "").slice(0, 220),
+              path: getElementDomPath(item.el),
+              rect: getRectSnapshot(item.el),
+              svg_hints: getElementSvgHints(item.el).slice(0, 5),
+            })),
+          },
+        });
+      }
+      return matches[0]?.el || null;
+    } catch (err) {
+      emit({ type: "boss_svg_scan_error", data: { message: String(err?.message || err), stack: String(err?.stack || "").slice(0, 800) } });
+      return null;
     }
-    matches.sort((a, b) => b.score - a.score || b.rect.left - a.rect.left || a.rect.top - b.rect.top);
-    if (matches.length) {
-      emit({
-        type: "download_button_candidates_detailed",
-        data: {
-          candidate_id: candidateId,
-          candidate_signature: signature,
-          candidates: matches.slice(0, 8).map((item) => ({
-            score: item.score,
-            text: item.text,
-            descriptor: (item.descriptor || item.text || "").slice(0, 220),
-            path: getElementDomPath(item.el),
-            rect: getRectSnapshot(item.el),
-            svg_hints: getElementSvgHints(item.el).slice(0, 5),
-          })),
-        },
-      });
-    }
-    return matches[0]?.el || null;
   }
 
   function _extractVueHref(vm) {
@@ -2028,7 +2214,7 @@
   }
 
   async function finalizeDownloadWithPersistAck(candidateId, signature, downloadRequestId, strategy) {
-    const persist = await waitForPersistAck(downloadRequestId, signature, 12000);
+    const persist = await waitForPersistAck(downloadRequestId, signature, 25000);
     if (persist.ok) {
       results.completed++;
       emit({ type: "resume_persist_confirmed", data: { candidate_id: candidateId, candidate_signature: signature, download_request_id: downloadRequestId, strategy, ...(persist.data || {}) } });
@@ -2037,6 +2223,11 @@
       return true;
     }
     emit({ type: "resume_persist_rejected", data: { candidate_id: candidateId, candidate_signature: signature, download_request_id: downloadRequestId, strategy, status: persist.status || "unknown", reason: persist.reason || "", ...(persist.data || {}) } });
+    // ack 超时 ≠ 下载失败：Chrome 下载已经成功落地（resultPromise 已 ok），
+    // 仅是桥侧归档/ack 链路延迟。返回 true 让上层结束本候选人，避免再次点击下载触发重复下载。
+    if (persist.status === "persist_ack_timeout") {
+      return true;
+    }
     return false;
   }
 
@@ -3767,18 +3958,49 @@
         await zhilianCollectLoop();
         return;
       }
-      if (!isAuthenticated()) {
-      emit({ type: "error", data: { message: "未检测到登录态", stage: "pre_check" } });
-      state = "idle";
-      return;
-    }
+      // BOSS chat 页本身受平台认证保护，未登录会被 302 到登录页（content.js 也就不会被注入），
+      // 历史上保留过基于 body.innerText 文本标记的 isAuthenticated() 检查作为兜底，
+      // 但 React 异步渲染 + BOSS 时不时调整文案，会在已登录的真页面误报"未检测到登录态"，
+      // 让 collect 立刻 fail（参考 2026-05-23 第一轮 BOSS 测试日志）。智联 v2.14.0 已移除同样的检查，
+      // BOSS v2.15.0 一致跟进，依靠 manifest 路径匹配 + 平台 302 兜底足够保证只有已登录页才会进入采集。
+      emit({ type: "page_ready", data: { url: location.href } });
 
-    emit({ type: "page_ready", data: { url: location.href } });
-
+    await clickBossChatMenu();
+    await sleep(900);
     const chattingTabResult = await clickBossChattingTab();
+    await sleep(900);
     emit({ type: "boss_diag", data: { step: "chatting_tab", result: chattingTabResult, url: location.href } });
 
+    await resetCandidateListScroll();
+    emit({ type: "boss_diag", data: { step: "scroll_reset", url: location.href } });
+
     let items = getCandidateItems();
+    {
+      const sample = items.slice(0, 5).map((el, idx) => {
+        const r = el.getBoundingClientRect();
+        const t = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 50);
+        return {
+          idx,
+          top: Math.round(r.top),
+          left: Math.round(r.left),
+          w: Math.round(r.width),
+          h: Math.round(r.height),
+          tag: el.tagName,
+          cls: String(el.className || "").slice(0, 60),
+          text: t,
+        };
+      });
+      emit({
+        type: "boss_diag",
+        data: {
+          step: "candidate_scan",
+          count: items.length,
+          sample,
+          hit: window.__bossLastCandidateScanDiag || null,
+          viewport: { w: window.innerWidth, h: window.innerHeight },
+        },
+      });
+    }
     if (items.length === 0) {
       // Retry: wait for DOM to render after tab click
       for (let retry = 0; retry < 3 && items.length === 0; retry++) {
@@ -3849,7 +4071,15 @@
 
       const candidateId = `${activeRunId || "run"}_${i}_${signature}`;
 
-      emit({ type: "candidate_clicked", data: { ...info, candidate_id: candidateId, candidate_signature: signature, index: i, elapsed_ms: infoElapsedMs } });
+      const talkingRaw = extractBossTalkingPosition();
+      const talkingSimplified = simplifyBossTalkingPosition(talkingRaw);
+      if (talkingSimplified) {
+        emit({ type: "boss_talking_position", data: { candidate_signature: signature, raw: talkingRaw, simplified: talkingSimplified } });
+      } else {
+        emit({ type: "boss_talking_position_skip", data: { candidate_signature: signature, reason: "not_found" } });
+      }
+
+      emit({ type: "candidate_clicked", data: { ...info, candidate_id: candidateId, candidate_signature: signature, talking_position: talkingSimplified, talking_position_raw: talkingRaw, index: i, elapsed_ms: infoElapsedMs } });
 
       if (signature === "待识别/待识别/待识别") {
         emit({ type: "candidate_skipped", data: { candidate_id: candidateId, candidate_signature: signature, reason: "candidate_info_unrecognized", raw_text: info.raw_text || "" } });
@@ -3945,15 +4175,20 @@
         ...attachmentClickSnapshot,
       } });
       await sleep(350);
-      const preview = await startResumePreviewRecognition(candidateId, signature, info, btn, beforeUrl, stalePreview.closed, beforePreviewFingerprint);
-      if (shouldAbortAsyncStep()) break;
-      if (!preview) {
-        await skipCandidate(candidateId, signature, "resume_preview_not_found");
-        continue;
-      }
+      try {
+        const preview = await startResumePreviewRecognition(candidateId, signature, info, btn, beforeUrl, stalePreview.closed, beforePreviewFingerprint);
+        if (shouldAbortAsyncStep()) break;
+        if (!preview) {
+          await skipCandidate(candidateId, signature, "resume_preview_not_found");
+          continue;
+        }
 
-      await tryDownloadResume(candidateId, signature, info, preview, true);
-      await closeExistingResumePreview(candidateId, signature);
+        await tryDownloadResume(candidateId, signature, info, preview, true);
+        await closeExistingResumePreview(candidateId, signature);
+      } catch (perCandidateErr) {
+        emit({ type: "candidate_processing_error", data: { candidate_id: candidateId, candidate_signature: signature, message: String(perCandidateErr?.message || perCandidateErr), stack: String(perCandidateErr?.stack || "").slice(0, 800) } });
+        await skipCandidate(candidateId, signature, "per_candidate_exception");
+      }
     }
 
     while (results.completed < config.max_resumes && state !== "stopped" && scrollRetries < MAX_SCROLL_RETRIES) {
@@ -4060,15 +4295,20 @@
         const clickOk = clickElementReliably(btn.el);
         emit({ type: "resume_attachment_click_dispatched", data: { candidate_id: candidateId, candidate_signature: signature, click_ok: clickOk, button_state: btn.state } });
         await sleep(350);
-        const preview = await startResumePreviewRecognition(candidateId, signature, info, btn, beforeUrl, stalePreview.closed, beforePreviewFingerprint);
-        if (shouldAbortAsyncStep()) break;
-        if (!preview) {
-          await skipCandidate(candidateId, signature, "resume_preview_not_found");
-          continue;
-        }
+        try {
+          const preview = await startResumePreviewRecognition(candidateId, signature, info, btn, beforeUrl, stalePreview.closed, beforePreviewFingerprint);
+          if (shouldAbortAsyncStep()) break;
+          if (!preview) {
+            await skipCandidate(candidateId, signature, "resume_preview_not_found");
+            continue;
+          }
 
-        await tryDownloadResume(candidateId, signature, info, preview, true);
-        await closeExistingResumePreview(candidateId, signature);
+          await tryDownloadResume(candidateId, signature, info, preview, true);
+          await closeExistingResumePreview(candidateId, signature);
+        } catch (perCandidateErr) {
+          emit({ type: "candidate_processing_error", data: { candidate_id: candidateId, candidate_signature: signature, message: String(perCandidateErr?.message || perCandidateErr), stack: String(perCandidateErr?.stack || "").slice(0, 800) } });
+          await skipCandidate(candidateId, signature, "per_candidate_exception");
+        }
       }
     }
 
@@ -4089,17 +4329,18 @@
   }
 
   function emitPageStatus(trigger = "auto") {
-    const authenticated = isAuthenticated();
-    const detected = isBossPageDetected();
+    // BOSS / 51 / 智联三平台的 chat 路径本身受平台认证保护，能注入 content.js 即视为已登录已就绪，
+    // 不再依赖 body.innerText 的文本标记（容易因平台改文案 / 异步渲染时机被误判，
+    // 参考 2026-05-23 第一轮 BOSS 测试日志里的 "未检测到登录态" 误报）。
+    const hostnameMatch = PLATFORM.hostnames.includes(location.hostname);
     emit({
-      type: authenticated || detected ? "page_ready" : "page_detected",
+      type: hostnameMatch ? "page_ready" : "page_detected",
       data: {
         url: location.href,
         title: document.title,
-        authenticated,
-        detected,
+        authenticated: hostnameMatch,
+        detected: hostnameMatch,
         trigger,
-        text_sample: (document.body?.innerText || "").replace(/\s+/g, " ").slice(0, 200),
       },
     });
   }

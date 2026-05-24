@@ -44,7 +44,7 @@ st.markdown(
 .boss-status-pair { display:flex; flex-direction:column; gap:5px; }
 .boss-status-pair div { white-space:nowrap; }
 .stButton > button, .stLinkButton > a { min-height:32px !important; padding:6px 12px !important; font-size:12px !important; border-radius:10px !important; white-space:nowrap !important; width:100% !important; }
-.boss-status-on { color:var(--color-success); font-weight:700; font-size:12px; }
+.boss-status-on { color:#0a7d2e; font-weight:700; font-size:12px; }
 .boss-status-off { color:var(--color-text-muted); font-size:12px; }
 .boss-path { display:block; clear:both; font-family:Consolas,monospace; font-size:12px; color:var(--color-text-secondary); background:var(--color-bg-soft); border:1px solid var(--color-border); border-radius:10px; padding:8px 10px; word-break:break-all; margin-top:8px; }
 .boss-checklist { margin:0 0 0 18px; padding:0; }
@@ -56,14 +56,14 @@ st.markdown(
 .boss-candidate-table th { position:sticky; top:0; z-index:1; background:var(--color-bg-soft); color:var(--color-text-secondary); font-size:12px; text-align:left; padding:8px 7px; border-bottom:1px solid var(--color-border); }
 .boss-candidate-table td { color:var(--color-text); padding:7px; border-bottom:1px solid var(--color-border); vertical-align:top; word-break:break-all; }
 .boss-candidate-table tr:last-child td { border-bottom:0; }
-.boss-candidate-status-downloaded { color:var(--color-success); font-weight:800; white-space:nowrap; }
-.boss-candidate-status-skipped { color:var(--color-warning); font-weight:800; white-space:nowrap; }
+.boss-candidate-status-downloaded { color:#0a7d2e; font-weight:800; white-space:nowrap; }
+.boss-candidate-status-skipped { color:#b45309; font-weight:800; white-space:nowrap; }
 .boss-empty-box { height:300px; overflow-y:auto; background:var(--color-surface); border:1px solid var(--color-border); border-radius:12px; padding:9px 10px; color:var(--color-text-muted); font-size:12px; }
 .boss-log-highlight { color:#b45309 !important; font-weight:900; font-size:14px; }
 .boss-log-info { color:var(--color-text); font-size:13px; }
 .boss-log-success { color:#0a7d2e !important; font-weight:700; font-size:13px; }
 .boss-log-error { color:var(--color-danger); font-weight:700; font-size:13px; }
-.boss-log-skipped { color:var(--color-warning); font-weight:700; font-size:13px; }
+.boss-log-skipped { color:#b45309 !important; font-weight:700; font-size:13px; }
 .boss-log-stat { color:var(--color-primary); font-weight:700; font-size:13px; }
 .plain-section-title { display:flex; align-items:center; justify-content:space-between; gap:12px; margin:18px 0 10px; }
 .plain-section-title h3 { margin:0; font-size:18px; line-height:1.3; color:var(--color-text); }
@@ -94,7 +94,7 @@ def classify_zhilian_log(message: str, level: str = "info") -> str:
         return "boss-log-error"
     if any(token in message for token in ["跳过", "duplicate", "已索要", "索要简历", "resume_requested", "resume_request_clicked"]):
         return "boss-log-skipped"
-    if any(token in message for token in ["保存", "已下载", "下载完成"]):
+    if any(token in message for token in ["保存归档", "保存", "已下载", "下载完成"]):
         return "boss-log-success"
     if any(token in message for token in ["统计", "采集完成", "扫描完成"]):
         return "boss-log-stat"
@@ -258,14 +258,14 @@ html, body {{ margin:0; padding:0; background:transparent; font-family:Arial, 'M
 .boss-candidate-table th {{ position:sticky; top:0; z-index:1; background:var(--color-bg-soft); color:var(--color-text-secondary); font-size:12px; text-align:left; padding:8px 7px; border-bottom:1px solid var(--color-border); }}
 .boss-candidate-table td {{ color:var(--color-text); padding:7px; border-bottom:1px solid var(--color-border); vertical-align:top; word-break:break-all; font-size:12px; line-height:1.35; }}
 .boss-candidate-table tr:last-child td {{ border-bottom:0; }}
-.boss-candidate-status-downloaded {{ color:var(--color-success); font-weight:800; white-space:nowrap; }}
-.boss-candidate-status-skipped {{ color:var(--color-warning); font-weight:800; white-space:nowrap; }}
+.boss-candidate-status-downloaded {{ color:#0a7d2e; font-weight:800; white-space:nowrap; }}
+.boss-candidate-status-skipped {{ color:#b45309; font-weight:800; white-space:nowrap; }}
 .boss-empty-box {{ height:300px; overflow-y:auto; background:var(--color-surface); border:1px solid var(--color-border); border-radius:12px; padding:9px 10px; color:var(--color-text-muted); font-size:12px; box-sizing:border-box; }}
 .boss-log-highlight {{ color:#b45309 !important; font-weight:900; font-size:12px; }}
 .boss-log-info {{ color:var(--color-text); font-size:12px; }}
 .boss-log-success {{ color:#0a7d2e !important; font-weight:700; font-size:12px; }}
 .boss-log-error {{ color:var(--color-danger); font-weight:700; font-size:12px; }}
-.boss-log-skipped {{ color:var(--color-warning); font-weight:700; font-size:12px; }}
+.boss-log-skipped {{ color:#b45309 !important; font-weight:700; font-size:12px; }}
 .boss-log-stat {{ color:var(--color-primary); font-weight:700; font-size:12px; }}
 </style>
 <div id="{anchor}-wrap">{body_html}</div>

@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  const CONTENT_SCRIPT_VERSION = "2.30.0";
+  const CONTENT_SCRIPT_VERSION = "2.38.0";
 
   // 平台注册表：每个平台的 hostname、WS 端口、文本标记、localStorage key 一站式声明。
   // 这是从单平台升级到多平台的核心入口——新加平台只需在此对象增加一条配置。
@@ -127,6 +127,9 @@
   let collectFinishedEmitted = false;
   const pendingDownloadWaiters = new Map();
   const pendingPersistAcks = new Map();
+  const receivedPersistAcks = new Map();
+  const persistAckCreditedRequests = new Set();
+  const persistAckCreditedSignatures = new Set();
   const candidateResourceIdMap = new Map();
   const STORAGE_KEYS = {
     learningStage: PLATFORM.storage_keys.learning_stage,
@@ -266,6 +269,36 @@
       .filter((el) => isVisible(el) && isInLeftCandidateArea(el))
       .map((el) => ({ el, score: el.scrollHeight - el.clientHeight + el.querySelectorAll("li, [class*='item'], [class*='card'], [class*='user']").length * 20 }))
       .sort((a, b) => b.score - a.score)[0]?.el || null;
+  }
+
+  // 与智联 scrollZhilianCandidateList 同款锚点策略：从最后一张候选人卡片反向走 parent 找真正的虚拟滚动容器，
+  // 再走 scrollIntoView(end) 兜底推动 React/Vue 懒加载下一批。仅靠 findBestListContainer 拿到的 score 第一容器
+  // 在 BOSS 沟通页是外层 wrapper（scrollHeight 早就到底），不是真正的虚拟列表容器。
+  function scrollBossCandidateList(dy) {
+    const items = getCandidateItems();
+    const anchor = items.length ? items[items.length - 1] : null;
+    if (anchor) {
+      let node = anchor.parentElement;
+      while (node && node !== document.body) {
+        if (node.scrollHeight > node.clientHeight + 10) {
+          const before = node.scrollTop;
+          node.scrollTop = before + dy;
+          node.dispatchEvent(new Event("scroll", { bubbles: true }));
+          if (node.scrollTop !== before) return { ok: true, container: node, mode: "anchor_parent", before, after: node.scrollTop };
+          break;
+        }
+        node = node.parentElement;
+      }
+      try { anchor.scrollIntoView({ block: "end" }); return { ok: true, container: anchor.parentElement || null, mode: "scroll_into_view_end", before: 0, after: 0 }; } catch {}
+    }
+    const fallback = findBestListContainer();
+    if (fallback) {
+      const before = fallback.scrollTop;
+      fallback.scrollTop = before + dy;
+      fallback.dispatchEvent(new Event("scroll", { bubbles: true }));
+      return { ok: fallback.scrollTop !== before, container: fallback, mode: "fallback_best_container", before, after: fallback.scrollTop };
+    }
+    return { ok: false, container: null, mode: "no_container", before: 0, after: 0 };
   }
 
   async function clickBossChatMenu() {
@@ -437,15 +470,12 @@
       // 所以一旦命中已知的列表容器，就信任结构、跳过 scoring。
       const trustedNodes = Array.from(container.querySelectorAll(".geek-item-wrap"));
       if (trustedNodes.length > 0) {
+        // 信任分支：DOM 节点本身已是候选人唯一标识，不再做文本去重
+        // （沟通列表卡片只显示姓名+聊天预览，文本去重会把姓名相同/前缀相同的候选人误过滤掉）。
         for (const el of trustedNodes) {
           if (seen.has(el)) continue;
           seen.add(el);
           if (!isVisible(el)) continue;
-          const text = textOf(el);
-          if (!text || text.length < 2) continue;
-          const key = candidateKeyFromText(text);
-          if (!key || seenKeys.has(key)) continue;
-          seenKeys.add(key);
           items.push({ el, score: 5, top: el.getBoundingClientRect().top });
         }
       } else {
@@ -516,12 +546,6 @@
       .replace(/刚刚活跃|今日活跃|昨日活跃|活跃|在线|分钟前活跃|\d+分钟前活跃/g, " ")
       .replace(/\s+/g, " ")
       .trim();
-  }
-
-  function isInvalidCandidateNameToken(_value = "") {
-    // 完全忠实采集策略下不再过滤任何姓名 token。
-    // 保留此 stub 仅为不破坏外部调用点（如 getTopProfileTokens 路径仍可能间接调用）。
-    return false;
   }
 
   function parseContactText(text) {
@@ -2199,6 +2223,16 @@
         if (primaryKey) pendingPersistAcks.delete(primaryKey);
         if (fallbackKey && fallbackKey !== primaryKey) pendingPersistAcks.delete(fallbackKey);
       };
+      // 先消费早到的 ack（race: 桥侧 ack 可能在扩展进入 await 之前就到了）
+      const earlyByPrimary = primaryKey ? receivedPersistAcks.get(primaryKey) : null;
+      const earlyByFallback = (!earlyByPrimary && fallbackKey && fallbackKey !== primaryKey) ? receivedPersistAcks.get(fallbackKey) : null;
+      const early = earlyByPrimary || earlyByFallback;
+      if (early) {
+        if (primaryKey) receivedPersistAcks.delete(primaryKey);
+        if (fallbackKey) receivedPersistAcks.delete(fallbackKey);
+        resolve(early);
+        return;
+      }
       const timer = setTimeout(() => {
         cleanup();
         resolve({ ok: false, status: "persist_ack_timeout", reason: "ack 等待超时" });
@@ -2213,19 +2247,34 @@
     });
   }
 
+  function creditPersistCompletion(downloadRequestId, signature, source) {
+    const reqKey = downloadRequestId || "";
+    const sigKey = signature || "";
+    if (reqKey && persistAckCreditedRequests.has(reqKey)) return false;
+    if (!reqKey && sigKey && persistAckCreditedSignatures.has(sigKey)) return false;
+    if (reqKey) persistAckCreditedRequests.add(reqKey);
+    if (sigKey) persistAckCreditedSignatures.add(sigKey);
+    results.completed++;
+    emit({ type: "persist_completion_credited", data: { candidate_signature: sigKey, download_request_id: reqKey, source, completed: results.completed } });
+    emitProgress();
+    return true;
+  }
+
   async function finalizeDownloadWithPersistAck(candidateId, signature, downloadRequestId, strategy) {
-    const persist = await waitForPersistAck(downloadRequestId, signature, 25000);
+    if (downloadRequestId) persistAckCreditedRequests.delete(downloadRequestId);
+    if (signature) persistAckCreditedSignatures.delete(signature);
+    const persist = await waitForPersistAck(downloadRequestId, signature, 8000);
     if (persist.ok) {
-      results.completed++;
+      creditPersistCompletion(downloadRequestId, signature, "ack_ok");
       emit({ type: "resume_persist_confirmed", data: { candidate_id: candidateId, candidate_signature: signature, download_request_id: downloadRequestId, strategy, ...(persist.data || {}) } });
-      emitProgress();
       await sleep(Math.min(Math.max(config.interval_ms || 0, 300), 900));
       return true;
     }
     emit({ type: "resume_persist_rejected", data: { candidate_id: candidateId, candidate_signature: signature, download_request_id: downloadRequestId, strategy, status: persist.status || "unknown", reason: persist.reason || "", ...(persist.data || {}) } });
-    // ack 超时 ≠ 下载失败：Chrome 下载已经成功落地（resultPromise 已 ok），
-    // 仅是桥侧归档/ack 链路延迟。返回 true 让上层结束本候选人，避免再次点击下载触发重复下载。
+    // ack 超时 ≠ 下载失败：桥侧的 resume_saved 事件会在 onMessage 链路里补回 completed 计数（见 creditPersistCompletion）。
+    // 此处保底再补一次：桥侧无论 saved/timeout 都已经落盘，跑完上层应直接结束本候选人，避免重复点击下载。
     if (persist.status === "persist_ack_timeout") {
+      creditPersistCompletion(downloadRequestId, signature, "ack_timeout_fallback");
       return true;
     }
     return false;
@@ -3667,17 +3716,20 @@
   }
 
   function scrollZhilianCandidateList(dy) {
-    const viewportW = window.innerWidth || document.documentElement.clientWidth || 0;
-    const panelRight = Math.min(440, Math.round(viewportW * 0.35));
-    const midX = Math.round(panelRight / 2 + 85);
-    const midY = Math.round((window.innerHeight || 600) / 2);
-    const els = document.elementsFromPoint(midX, midY);
-    for (const el of els) {
-      if (el.scrollHeight > el.clientHeight + 10) {
-        el.scrollBy({ top: dy, behavior: "smooth" });
+    // 虚拟滚动列表：从最后一张卡片反向走 parent 找真正的滚动容器（与 scrollZhilianCandidateListToTop 同款锚点），
+    // 避免 elementsFromPoint 误命中外层 wrapper。即时滚动 + 兜底 scrollIntoView(end) 推动 React 懒加载下一批。
+    const cards = document.querySelectorAll(".im-session-item.km-list__item");
+    const anchor = cards.length ? cards[cards.length - 1] : null;
+    if (!anchor) return false;
+    let node = anchor.parentElement;
+    while (node && node !== document.body) {
+      if (node.scrollHeight > node.clientHeight + 10) {
+        node.scrollTop = node.scrollTop + dy;
         return true;
       }
+      node = node.parentElement;
     }
+    try { anchor.scrollIntoView({ block: "end" }); return true; } catch {}
     return false;
   }
 
@@ -3699,8 +3751,10 @@
     let lastInfo = null;
     while (Date.now() < deadline) {
       lastInfo = extractZhilianContactInfo();
-      if (lastInfo.name && lastInfo.name !== previousName && lastInfo.name !== "未知") return lastInfo;
-      await sleep(200);
+      const nameOk = lastInfo.name && lastInfo.name !== previousName && lastInfo.name !== "未知";
+      const ageOk = lastInfo.age && lastInfo.age !== "未知";
+      if (nameOk && ageOk) return lastInfo;
+      await sleep(80);
     }
     return lastInfo;
   }
@@ -3952,6 +4006,8 @@
       if (state === "stopped") break;
 
       let targets = getZhilianCandidateTargets(seenSet);
+      // diag: outer_scan
+      emit({ type: "zhilian_loop_diag", data: { stage: "outer_scan", targets_count: targets.length, seen_size: seenSet.size, scroll_retries: scrollRetries, completed: results.completed, target_signatures_preview: targets.slice(0, 3).map(t => (t.name || "").slice(0, 30)), seen_size_at: Date.now() } });
       emit({ type: "candidate_list_scanned", data: { count: targets.length, scanned: results.scanned } });
 
       if (targets.length === 0) {
@@ -3961,6 +4017,8 @@
           state = "idle";
           return;
         }
+        // diag: empty_retry
+        emit({ type: "zhilian_loop_diag", data: { stage: "empty_retry", scroll_retries: scrollRetries, max_retries: MAX_SCROLL_RETRIES, seen_size: seenSet.size } });
         scrollZhilianCandidateList(400);
         await sleep(1200);
         continue;
@@ -3977,15 +4035,18 @@
         results.scanned++;
         results.currentIndex = target.index;
         const stepStart = Date.now();
+        const phaseTimes = { iter_start: Date.now() }; // diag: iter phase timestamps
 
         try {
           target.element.scrollIntoView({ block: "center" });
           await sleep(100);
+          phaseTimes.scroll_done = Date.now(); // diag
           // 智联候选人卡片是 React 组件，handler 挂在 .im-session-item.km-list__item 本身，
           // 直接 .click() 在 production React 下偶尔哑火（无 pointerdown/mouseup 完整事件链）。
           // 用 clickElementDirect 派发完整事件序列 + 锚定卡片自身（不 closest 上跳到 virtual--box 容器）。
           clickElementDirect(target.element);
-          await sleep(600);
+          await sleep(150);
+          phaseTimes.click_done = Date.now(); // diag
         } catch (err) {
           emit({ type: "candidate_skipped", data: { candidate_signature: target.name || `idx_${target.index}`, reason: "click_failed", error: String(err) } });
           results.skipped++;
@@ -3994,6 +4055,7 @@
         }
 
         const info = await waitZhilianDetailSwitch(previousDetailName, 4000);
+        phaseTimes.wait_done = Date.now(); // diag
         const candidateName = info.name || target.name || "未知";
         const candidateAge = info.age || "未知";
         const candidateEdu = info.education || "未知";
@@ -4014,6 +4076,7 @@
         const sigHit = dedupSignatures.has(candidateSig) || dedupSignatures.has(normalizedSig);
         const keyHit = Boolean(dedupKey && dedupKeys.has(dedupKey));
         if (sigHit || keyHit) {
+          phaseTimes.branch = "dedup_hit"; // diag
           emit({ type: "candidate_skipped", data: { candidate_signature: candidateSig, reason: "boss_dedup_hit", candidate_key: dedupKey } });
           results.skipped++;
           emitProgress();
@@ -4025,6 +4088,7 @@
         emit({ type: "zhilian_attachment_button_state", data: { candidate_signature: candidateSig, state: btnState } });
 
         if (btnState === "view") {
+          phaseTimes.branch = "download"; // diag
           // 智联流程：先发 download_intent 占座（背带 candidate_info / download_request_id），
           // 再点"查看附件简历"按钮；按钮触发 window.open 弹出 attachment.zhaopin.com 的 PDF 直链 tab，
           // background.js 用 chrome.tabs.onUpdated 监听该 tab，URL 命中后由 onDeterminingFilename
@@ -4074,25 +4138,38 @@
             results.skipped++;
           }
         } else if (btnState === "request") {
+          phaseTimes.branch = "no_attachment_request"; // diag
           emit({ type: "candidate_skipped", data: { candidate_signature: candidateSig, reason: "no_resume_attachment" } });
           results.skipped++;
         } else if (btnState === "already_requested") {
+          phaseTimes.branch = "no_attachment_other"; // diag
           emit({ type: "candidate_skipped", data: { candidate_signature: candidateSig, reason: "resume_request_already_sent" } });
           results.skipped++;
         } else {
+          phaseTimes.branch = "no_attachment_other"; // diag
           emit({ type: "candidate_skipped", data: { candidate_signature: candidateSig, reason: "no_resume_attachment" } });
           results.skipped++;
         }
 
         emitProgress();
+        phaseTimes.iter_end = Date.now(); // diag
+        // diag: iter phase summary — 仅在慢迭代或 download 分支回报
+        const iterTotalMs = phaseTimes.iter_end - phaseTimes.iter_start;
+        if (iterTotalMs > 5000 || phaseTimes.branch === "download") {
+          emit({ type: "zhilian_iter_diag", data: { candidate_signature: candidateSig, branch: phaseTimes.branch || "unknown", iter_total_ms: iterTotalMs, scroll_ms: (phaseTimes.scroll_done || 0) - phaseTimes.iter_start, click_ms: (phaseTimes.click_done || 0) - (phaseTimes.scroll_done || 0), wait_ms: (phaseTimes.wait_done || 0) - (phaseTimes.click_done || 0), post_wait_ms: phaseTimes.iter_end - (phaseTimes.wait_done || 0), element_still_in_dom: document.body.contains(target.element) } });
+        }
         const interval = config.scan_interval_ms || config.interval_ms || 2000;
         await sleep(interval + Math.random() * 500);
       }
 
+      // diag: inner_loop_finished
+      emit({ type: "zhilian_loop_diag", data: { stage: "inner_loop_finished", processed_in_batch: targets.length, seen_size: seenSet.size, completed: results.completed, target_completed: config.max_resumes } });
       scrollZhilianCandidateList(300);
       await sleep(800);
     }
 
+    // diag: outer_loop_exit
+    emit({ type: "zhilian_loop_diag", data: { stage: "outer_loop_exit", state: state, completed: results.completed, target_completed: config.max_resumes, seen_size: seenSet.size, scroll_retries: scrollRetries } });
     const stopped = state === "stopped";
     state = "idle";
     emit({ type: "collect_finished", data: { completed: results.completed, skipped: results.skipped, stopped } });
@@ -4342,6 +4419,7 @@
 
         await tryDownloadResume(candidateId, signature, info, preview, true);
         await closeExistingResumePreview(candidateId, signature);
+        forceRemoveStalePdfPreviewFrames(signature);
       } catch (perCandidateErr) {
         emit({ type: "candidate_processing_error", data: { candidate_id: candidateId, candidate_signature: signature, message: String(perCandidateErr?.message || perCandidateErr), stack: String(perCandidateErr?.stack || "").slice(0, 800) } });
         await skipCandidate(candidateId, signature, "per_candidate_exception");
@@ -4349,22 +4427,40 @@
     }
 
     while (results.completed < config.max_resumes && state !== "stopped" && scrollRetries < MAX_SCROLL_RETRIES) {
-      const container = findBestListContainer();
-      if (!container) break;
-      const prevScrollTop = container.scrollTop;
-      const scrollStep = container.clientHeight * 0.8;
-      container.scrollTop = prevScrollTop + scrollStep;
-      container.dispatchEvent(new Event("scroll", { bubbles: true }));
+      // 反向锚点滚动 + scrollIntoView(end) 兜底，触发虚拟列表懒加载（参照智联同类修复）。
+      const beforeCount = getCandidateItems().length;
+      const scrollResult = scrollBossCandidateList(Math.max(400, Math.floor((findBestListContainer()?.clientHeight || 600) * 0.8)));
+      emit({ type: "boss_list_scroll_attempt", data: { mode: scrollResult.mode, ok: scrollResult.ok, before_count: beforeCount, before_scroll_top: scrollResult.before, after_scroll_top: scrollResult.after, retries: scrollRetries } });
+      if (!scrollResult.ok) {
+        // 容器都没找到，再试一次 scrollIntoView 把最后一张推到底
+        const items = getCandidateItems();
+        const last = items[items.length - 1];
+        try { last?.scrollIntoView({ block: "end" }); } catch {}
+      }
       await sleep(1500);
       const newItems = getCandidateItems();
       const freshItems = newItems.filter((el) => !processedElements.has(el));
       if (freshItems.length === 0) {
-        if (Math.abs(container.scrollTop - prevScrollTop) < 10) break;
-        scrollRetries++;
-        continue;
+        // 没有新候选人就再尝试一次 scrollIntoView 兜底，等多一拍。两次都没动静才退出。
+        const items = getCandidateItems();
+        const last = items[items.length - 1];
+        try { last?.scrollIntoView({ block: "end" }); } catch {}
+        await sleep(1500);
+        const retryItems = getCandidateItems();
+        const retryFresh = retryItems.filter((el) => !processedElements.has(el));
+        if (retryFresh.length === 0) {
+          if (newItems.length === beforeCount && scrollRetries >= MAX_SCROLL_RETRIES - 1) {
+            emit({ type: "boss_list_scroll_exhausted", data: { total_items: newItems.length, retries: scrollRetries } });
+            break;
+          }
+          scrollRetries++;
+          continue;
+        }
+        items = retryFresh;
+      } else {
+        items = freshItems;
       }
       scrollRetries = 0;
-      items = freshItems;
       for (let i = 0; i < items.length && results.completed < config.max_resumes; i++) {
         if (state === "stopped") break;
         await waitForPause();
@@ -4462,6 +4558,7 @@
 
           await tryDownloadResume(candidateId, signature, info, preview, true);
           await closeExistingResumePreview(candidateId, signature);
+          forceRemoveStalePdfPreviewFrames(signature);
         } catch (perCandidateErr) {
           emit({ type: "candidate_processing_error", data: { candidate_id: candidateId, candidate_signature: signature, message: String(perCandidateErr?.message || perCandidateErr), stack: String(perCandidateErr?.stack || "").slice(0, 800) } });
           await skipCandidate(candidateId, signature, "per_candidate_exception");
@@ -4632,11 +4729,40 @@
       }
       case "resume_persist_ack": {
         const data = msg.data || {};
+        const received_at_ms = Date.now();  // diag: persist ack timing
+        const ack_sent_at_ms = Number(data.ack_sent_at_ms) || 0;
+        const ws_chain_ms = ack_sent_at_ms > 0 ? (received_at_ms - ack_sent_at_ms) : -1;
+        emit({
+          type: "persist_ack_timing",
+          data: {
+            candidate_signature: data.candidate_signature || "",
+            download_request_id: data.download_request_id || "",
+            save_duration_ms: Number(data.save_duration_ms) || -1,
+            ack_sent_at_ms,
+            received_at_ms,
+            ws_chain_ms,
+            status: data.status || "",
+          },
+        });
         const key = data.download_request_id || data.candidate_signature || "";
+        const ackResult = { ok: data.status === "saved", status: data.status || "unknown", reason: data.reason || "", data };
         const resolver = pendingPersistAcks.get(key);
         if (resolver) {
           pendingPersistAcks.delete(key);
-          resolver({ ok: data.status === "saved", status: data.status || "unknown", reason: data.reason || "", data });
+          resolver(ackResult);
+        } else {
+          // ack 早于 waiter 到达：缓存供后续 waitForPersistAck 入口消费（同时落 sig 副本，因为 finalize 同时挂双键）
+          if (data.download_request_id) receivedPersistAcks.set(data.download_request_id, ackResult);
+          if (data.candidate_signature) receivedPersistAcks.set(data.candidate_signature, ackResult);
+          // 缓存自动过期（45s 内若没人消费就丢弃，防止内存泄漏）
+          setTimeout(() => {
+            if (data.download_request_id) receivedPersistAcks.delete(data.download_request_id);
+            if (data.candidate_signature) receivedPersistAcks.delete(data.candidate_signature);
+          }, 45000);
+        }
+        // 桥侧 saved 是权威信号；finalizeDownloadWithPersistAck 已超时返回时这里兜底回写。
+        if (data.status === "saved") {
+          creditPersistCompletion(data.download_request_id || "", data.candidate_signature || "", "ack_late");
         }
         break;
       }

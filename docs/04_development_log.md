@@ -2443,3 +2443,181 @@ python -c "import ast; [ast.parse(open(p, encoding='utf-8').read()) for p in ['r
 - `recruitment_assistant/services/resume_ai_service.py`
   - `parse_resume_text` 调用 LLM 时加 `response_format={"type": "json_object"}`，强约束 DeepSeek / OpenAI 兼容端点返回合法 JSON 对象，减少 markdown 代码块剥离的边界情况。
   - `match_candidates` 也试加过 `json_object` 模式，但因为返回的是 JSON **数组**（`json_object` 只支持顶层 object），已回滚并加注释说明。
+
+## 2026-05-25
+
+### 简历解析鲁棒性：docx 文本框 XML 兜底 + PaddleOCR 图像 PDF 回退
+
+本日围绕"简历自动解析"链路里两类长期落入"AI 解析异常 / 文本不足"失败桶的场景做了根因修复 + 兜底通路：
+
+| 失败样本 | 提取结果（修复前） | 失败原因 | 修复后 |
+|---|---|---|---|
+| 任珮瑜-25 岁-本科-电商运营经理-智联招聘-...002.docx | 0 字符 | 全部正文塞在 `<w:txbxContent>` 文本框，python-docx 不下钻 | 3177 字符（XML 兜底） |
+| 文国斌-31 岁-本科-UI 设计师-智联招聘-...005.pdf | 86 字符 | 纯图像 PDF，pypdf/pymupdf 抽不出文字 | 977 字符（PaddleOCR） |
+| 周辉-29 岁-本科-UI 设计师-智联招聘-...003.pdf | — | 单页 539×13177 pt 屏滚长图，OpenCV warpPerspective 触发 SHRT_MAX 断言 | 直接跳过该页（阈值 8000pt）|
+
+---
+
+#### A. docx 文本框排版兜底
+
+**根因**：python-docx 的 `Document().paragraphs` / `tables` 只遍历 body 顶层段落和表格，**不下钻** `<w:txbxContent>`（Word 文本框）/ `<w:sdt>`（内容控件）/ `<w:pict>` / `<w:drawing>`。设计感强的简历模板（智联/前程模板尤其常见）经常把全部正文塞进文本框做版式，结果 `paragraphs/tables` 全空 → 外层 `is_empty_or_corrupted` 因 `< 50` 字符把文件误判为"空白/损坏"，整份简历直接归入失败桶。
+
+任珮瑜.docx 验证：zip 完整、`Document()` 能打开、`word/document.xml` 196 KB、`<w:txbxContent>` × 22、`<w:t>` 标签数百个 —— 但 paragraphs/tables 都为 0，全部 3058 字符正文在文本框里。
+
+**修复**：
+
+新增 `recruitment_assistant/utils/docx_utils.py::docx_xml_text_fallback`，直接用 `zipfile` 打开 docx，读 `word/document.xml` + 所有 `word/header*.xml` / `word/footer*.xml`，正则 `<w:t(?:\s[^>]*)?>([^<]*)</w:t>` 抓全部文本节点拼接。**3 处** docx 提取函数统一接入兜底（常规提取 `< 50` 字符时自动回退到 XML 兜底，取更长者）：
+
+- `recruitment_assistant/utils/docx_utils.py::extract_docx_text`
+- `recruitment_assistant/parsers/pdf_resume_parser.py::extract_docx_text`（L177）
+- `recruitment_assistant/parsers/pdf_resume_parser.py::extract_text_from_docx`（L676，归档落档路径）
+
+**设计取舍**：
+
+- 不替换 python-docx —— paragraphs/tables 在有标题/表格的常规简历下输出更干净；XML 兜底用于"常规提取产能不足"时
+- 不对 `<w:t>` 做 namespace-aware XML 解析 —— 简历模板的 namespace prefix 经常被工具改写（`<w:t>` / `<w14:t>` / 带 `xml:space`），正则比 ElementTree 更鲁棒
+- 阈值 50 字符 —— 真正的空 docx 会落到 0–10 字符，有标题但无正文的会落到 30–50；阈值 50 能区分"几乎空"和"全文本"
+
+---
+
+#### B. PaddleOCR 图像 PDF 回退
+
+**根因**：智联 / BOSS 部分简历是"截屏拼接型" PDF（HTML 简历转 PDF 时把页面整体渲染成位图嵌入），pypdf/pymupdf 抽不出文本，进入 AI 解析时整份 prompt 都是无内容字段，AI 输出 nullable 全空 → pydantic 校验失败 → 失败桶。
+
+**修复**：
+
+新增 `recruitment_assistant/parsers/ocr_service.py`，作为**可选模块**通过 `pip install ".[ocr]"` 启用。核心结构：
+
+| 函数 | 作用 |
+|---|---|
+| `is_paddleocr_available()` | 延迟检查 + 缓存，未安装时不抛错只返回 False |
+| `_get_ocr()` | PaddleOCR 单例懒加载，逐级尝试 4 套构造参数兼容 2.x / 3.x |
+| `_cache_path(pdf)` | `<pdf>.ocr.txt` 同目录缓存路径 |
+| `_extract_text_from_paddle_result()` | 兼容 3.x `OCRResult.rec_texts` + 2.x 嵌套 list `[[box, (text, conf)], ...]` |
+| `ocr_pdf_to_text(pdf, log, use_cache, dpi=200)` | 主入口：命中缓存直接返回；否则 pymupdf 渲染每页 → PaddleOCR.predict → 拼接 + 写回 `.ocr.txt` |
+
+`app/pages/07_简历管理.py` 在 `raw_text = extract_text(path)` 后加 OCR 回退分支（PDF 且 `< 200` 字符时触发）：
+
+```python
+if path.suffix.lower() == ".pdf" and len(raw_text.strip()) < 200:
+    from recruitment_assistant.parsers.ocr_service import (
+        is_paddleocr_available, ocr_pdf_to_text,
+    )
+    log(f"           🖼️ PDF 文本过短（{len(raw_text.strip())} 字符），疑似图像简历，启动 OCR 回退…")
+    if not is_paddleocr_available():
+        log("           ⚠️ PaddleOCR 未安装（pip install paddlepaddle paddleocr），跳过 OCR")
+    else:
+        try:
+            ocr_text = ocr_pdf_to_text(path, log=log)
+            if len(ocr_text.strip()) > len(raw_text.strip()):
+                log(f"           ✅ OCR 完成，得到 {len(ocr_text)} 字符")
+                raw_text = ocr_text
+            else:
+                log("           ⚠️ OCR 未识别出更多文本")
+        except Exception as exc:
+            log(f"           ❌ OCR 异常：{exc}")
+```
+
+**Windows 部署痛点（已沉淀到 memory）**：
+
+- `paddlepaddle` 3.3.x 系列（含 3.3.1）在 Windows 上有 PIR/OneDNN 不兼容 bug：`NotImplementedError: ConvertPirAttribute2RuntimeAttribute not support [pir::ArrayAttribute<pir::DoubleAttribute>]`。环境变量 `FLAGS_use_mkldnn=0` / `FLAGS_enable_pir_in_executor=0` 不能绕过。
+- 强制锁定 `paddlepaddle==3.0.0`，并补装 `decorator>=5.3.0`、`astor>=0.8.1`（3.3.x 自带这两个间接依赖，3.0.0 需要显式装）。
+- `pyproject.toml` 新增 `[project.optional-dependencies.ocr]`：
+
+```toml
+ocr = [
+    "paddlepaddle==3.0.0",
+    "paddleocr>=3.5.0",
+    "decorator>=5.3.0",
+    "astor>=0.8.1",
+]
+```
+
+模型首次自动下载到 `C:\Users\<user>\.paddlex\official_models\`（PP-OCRv5_server_det + rec + textline_ori + UVDoc + doc_ori，合计约 200 MB+）。单页 CPU 模式 20–100 秒（首次含模型加载），后续 < 30 秒；命中 `.ocr.txt` 缓存直接读，二次扫描 0 秒。
+
+---
+
+#### C. 超长图简历跳过策略
+
+**问题**：周辉.pdf 实测物理尺寸 539 × 13177 pt（约 4.65 米高的屏滚截图）。dpi=200 渲染 → 1498 × 36604 像素，触发 OpenCV warpPerspective 的 `dst.cols < SHRT_MAX` (32767) 断言。中间尝试过 `text_det_limit_side_len=8000` 放宽 PaddleOCR 内置 4000 上限 + 自适应 dpi + 分段 OCR，但**这类长图本身识别价值低**：PaddleOCR 强缩放后行高失真，输出准确率掉到几乎不可用。
+
+**修复**：
+
+`ocr_service.py` 设 `SKIP_LONG_PAGE_PT = 8000`（标准 A4 仅 595 × 842 pt，阈值已经很宽松），超过直接跳过该页 + log 提示：
+
+```python
+SKIP_LONG_PAGE_PT = 8000
+for idx, page in enumerate(doc, 1):
+    max_pt = max(page.rect.width, page.rect.height)
+    if max_pt > SKIP_LONG_PAGE_PT:
+        skipped += 1
+        if log:
+            log(f"           ⏭️ 第 {idx}/{page_count} 页物理尺寸过大（最长边 {max_pt:.0f}pt > {SKIP_LONG_PAGE_PT}pt），跳过 OCR")
+        continue
+    ...
+if skipped == page_count and page_count > 0 and log:
+    log(f"           ⚠️ {page_count} 页全部因尺寸过大被跳过，OCR 未产出文本")
+```
+
+周辉.pdf 实测：单页判定耗时 4.2 秒（仅 pymupdf 打开 + 量尺寸），不进入渲染 → 不触发 OpenCV 断言 → 优雅降级回失败桶。
+
+---
+
+#### D. PaddleOCR 2.x / 3.x 双兼容
+
+PaddleOCR 在 3.x 重写了 API，参数名和返回结构都变了：
+
+| 方面 | 2.x | 3.x |
+|---|---|---|
+| 方向检测开关 | `use_angle_cls=True` | `use_textline_orientation=True` |
+| 日志开关 | `show_log=False` | 已移除（传入会 `ValueError`）|
+| 调用方法 | `ocr.ocr(arr, cls=True)` | `ocr.predict(arr)` |
+| 返回结构 | 嵌套 list `[[ [box, (text, conf)], ... ]]` | `OCRResult` 对象，`rec_texts` / `rec_scores` / `rec_polys` 键 |
+| 长边限制 | 内部默认 4000 | `text_det_limit_side_len=8000` 可放宽 |
+
+`_get_ocr()` 用 4 套 kwargs 逐级 try 兼容：
+
+```python
+for kwargs in (
+    {"lang": "ch", "use_textline_orientation": True, "text_det_limit_side_len": 8000},  # 3.x 放宽长边
+    {"lang": "ch", "use_textline_orientation": True},                                    # 3.x 标准
+    {"lang": "ch", "use_angle_cls": True, "show_log": False},                            # 2.x
+    {"lang": "ch"},                                                                       # minimal
+):
+    try:
+        _ocr_instance = PaddleOCR(**kwargs)
+        return _ocr_instance
+    except (TypeError, ValueError):
+        continue
+```
+
+`_extract_text_from_paddle_result()` 同样两路兼容 —— 优先尝试 `page["rec_texts"]` / `getattr(page, "rec_texts", None)`（3.x），否则 fallback 到 `isinstance(page, list)` 走嵌套 tuple 拆解（2.x）。
+
+---
+
+#### 同批次扩展端 v2.37.0 → v2.38.0（三联升版）
+
+借这次发版顺手做了一轮扩展端日志降噪 + 死代码清理：
+
+- `chrome_extension/content.js` 2.37.0 → 2.38.0：UI 重复 log demote 到 debug（`console.debug` 仅 stderr 不进采集面板）；删除 `isInvalidCandidateNameToken` stub（早期占位函数，从未被调用）。
+- `chrome_extension/manifest.json` 同步 bump。
+- `recruitment_assistant/services/extension_contract.py::EXPECTED_CONTENT_SCRIPT_VERSION` 同步 `"2.38.0"`，保证 bridge `_check_content_script_version` 启动时不打 mismatch warning。
+- `recruitment_assistant/services/boss_ws_bridge.py` v2.03.0 → v2.04.0：UI 日志分级修正（info → UI、debug → stderr only），降低 BOSS 沟通中页面长时间运行时的重复回放噪音。
+
+> 三联升版机制（content.js + manifest + extension_contract）是从早期"Chrome 不重载扩展导致版本不一致 + bridge 不输出 mismatch warning"的事故沉淀下来的硬规则 —— 任一文件改动都必须升对应版本号常量。
+
+---
+
+### 验证
+
+- 任珮瑜.docx → 重跑 07 简历管理扫描，从"空白/损坏"桶 → "AI 解析成功"。
+- 文国斌.pdf → 第一次 OCR 70 秒（含 PaddleOCR 模型加载 + 单页识别）→ 0.95 秒命中 `.ocr.txt` 缓存。
+- 周辉.pdf → 单页 4.2 秒判定为超长跳过，输出 `⏭️ 第 1/1 页物理尺寸过大（最长边 13177pt > 8000pt），跳过 OCR` + `⚠️ 1 页全部因尺寸过大被跳过`，降级回失败桶不污染。
+- 三平台 bridge 启动均无 content script version mismatch warning。
+
+### 设计取舍
+
+- **OCR 做成可选模块（`pip install ".[ocr]"`）而不是必装**：paddlepaddle 体积 600 MB+，模型再 200 MB+，纯文本简历用户不应被强制下载。`is_paddleocr_available()` 优雅降级 + UI 日志明确提示安装命令。
+- **OCR 阈值定 200 字符（不是 50）**：50 字符是 docx 兜底阈值（区分"几乎空"和"有正文"）；OCR 触发阈值要更宽松一些，因为 pypdf 偶尔从图像 PDF 里抠出十几个字符的水印/页眉，仍然属于"识别失败"应进 OCR。200 字符约等于一份正常简历前两行（姓名+联系方式+教育起始）的长度。
+- **OCR 缓存写到 PDF 同目录而不是 `data/cache/`**：用户手动管理简历文件时缓存跟随，删除 PDF 时缓存随之消失，不需要额外清理任务。
+- **超长图阈值 8000pt（不是按像素）**：物理尺寸是 PaddleOCR 输入前就能拿到的稳定信号，不依赖 dpi；像素阈值会随 dpi 浮动需要复杂换算。8000pt ≈ 2.82 米，已经远超任何合理简历版面。

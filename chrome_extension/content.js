@@ -3101,7 +3101,7 @@
     const root = document.querySelector(QIANCHENG_SELECTORS.profile_info_container);
     if (!root) return info;
     const nameEl = root.querySelector(QIANCHENG_SELECTORS.profile_name) || root.querySelector(".username-text");
-    if (nameEl) info.name = (nameEl.innerText || nameEl.textContent || "").trim() || "待识别";
+    if (nameEl) info.name = (nameEl.getAttribute("title") || nameEl.innerText || nameEl.textContent || "").trim() || "待识别";
     const linkEl = root.querySelector(QIANCHENG_SELECTORS.profile_link_info) || root.querySelector(".link-info");
     let segments = [];
     if (linkEl) {
@@ -3182,15 +3182,14 @@
   function findQianchengAttachmentButton() {
     const scope = document.querySelector(QIANCHENG_SELECTORS.attachment_btn_scope);
     if (!scope) return null;
+    // 精确 class 锚定：.file-type-text 文本为"附件简历"
+    const el = scope.querySelector(".file-type-text");
+    if (el && (el.innerText || el.textContent || "").trim() === QIANCHENG_SELECTORS.attachment_btn_text) return el;
+    // 兜底：通用标签遍历
     const candidates = Array.from(scope.querySelectorAll("span, div, button, a"));
-    for (const el of candidates) {
-      const txt = (el.innerText || el.textContent || "").trim();
-      if (txt === QIANCHENG_SELECTORS.attachment_btn_text) {
-        return el;
-      }
+    for (const c of candidates) {
+      if ((c.innerText || c.textContent || "").trim() === QIANCHENG_SELECTORS.attachment_btn_text) return c;
     }
-    const fallback = scope.querySelector(".file-type-text");
-    if (fallback && (fallback.innerText || "").trim().includes("附件")) return fallback;
     return null;
   }
 
@@ -3238,11 +3237,8 @@
   }
 
   function isQianchengTabActive(el) {
-    // 51 ehire 顶部 tab 选中态可能是以下任一 class（按改版历史扩展）。
     if (!el) return false;
-    const cls = (el.className || "") + " " + ((el.parentElement && el.parentElement.className) || "");
-    return /\b(active|current|selected|checked|on)\b/i.test(cls)
-        || el.getAttribute?.("aria-selected") === "true";
+    return el.classList.contains("active") || el.getAttribute?.("aria-selected") === "true";
   }
 
   function looksLikeQianchengChattingRoute() {

@@ -3534,82 +3534,111 @@
   }
 
   function extractZhilianContactInfo() {
-    const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 1440;
-    const rightLeft = Math.max(420, viewportWidth * 0.42);
     const normalize = (text) => (text || "").replace(/\s+/g, " ").trim();
-    const summaryCore = /\d{2}\s*岁|博士|硕士|研究生|本科|大专|专科|高中|中专|离职|在职|期望[:：]|1[3-9]\d(?:\s*\d){8}/;
-    const excludes = /聊天记录|快捷回复|发送|表情|请输入|已读|未读|要附件简历|查看附件简历|下载简历|工作经历|项目经历|教育经历|自我评价|求职信/;
-
-    // Find the best summary container in the right panel top area
-    const nodes = Array.from(document.querySelectorAll("aside, section, header, article, div"))
-      .filter((el) => zhilianIsVisible(el))
-      .map((el) => {
-        const rect = el.getBoundingClientRect();
-        const text = normalize(el.innerText || el.textContent || el.getAttribute("title") || el.getAttribute("aria-label"));
-        const cls = String(el.className || "");
-        const area = rect.width * rect.height;
-        const topSummaryZone = rect.left >= rightLeft && rect.top >= 40 && rect.top <= 360 && rect.width >= 260 && rect.height >= 36 && rect.height <= 360;
-        const classScore = /candidate|profile|detail|resume|user|person|talent|card|info|basic|summary/i.test(cls) ? 30 : 0;
-        const textScore = (summaryCore.test(text) ? 50 : 0) + (/期望[:：].*·.*·/.test(text) ? 45 : 0) + (/1[3-9]\d(?:\s*\d){8}/.test(text) ? 35 : 0);
-        return { el, rect, text, area, topSummaryZone, score: classScore + textScore + Math.max(0, 40 - rect.top / 10) + Math.min(area / 12000, 20) };
-      })
-      .filter((item) => item.topSummaryZone && item.text && item.text.length >= 4 && item.text.length <= 1200 && !excludes.test(item.text) && summaryCore.test(item.text));
-
-    nodes.sort((a, b) => b.score - a.score || a.rect.top - b.rect.top || b.area - a.area);
-    const best = nodes[0];
-    if (!best) return { name: "待识别", age: "待识别", education: "待识别", job_title: "", phone: "", raw_text: "" };
-
-    // Collect text parts from the best container
-    const parts = [];
-    const seen = new Set();
-    const add = (text) => {
-      const line = normalize(text);
-      if (!line || seen.has(line) || line.length > 260 || excludes.test(line)) return;
-      seen.add(line);
-      parts.push(line);
-    };
-    add(best.text);
-    for (const child of Array.from(best.el.querySelectorAll("div, span, p, li")).filter(zhilianIsVisible)) {
-      add(child.innerText || child.textContent || child.getAttribute("title") || child.getAttribute("aria-label"));
-      if (parts.length >= 16) break;
-    }
-    const merged = parts.join(" ");
-
-    // Parse fields from merged text
-    const info = { name: "待识别", age: "待识别", education: "待识别", job_title: "", phone: "", raw_text: merged.slice(0, 200) };
     const degreePattern = /博士|硕士|研究生|本科|大专|专科|高中|中专/;
-    const summaryMatch = merged.match(/([一-龥]{2,4}|[A-Za-z][A-Za-z .·-]{1,30})\s+(\d{2})\s*岁\s*(博士|硕士|研究生|本科|大专|专科|高中|中专)?/);
-    if (summaryMatch) {
-      info.name = summaryMatch[1].trim();
-      info.age = `${summaryMatch[2]}岁`;
-      let edu = summaryMatch[3] || "";
-      if (edu === "研究生") edu = "硕士";
-      if (edu === "专科") edu = "大专";
-      if (edu) info.education = edu;
-    } else {
-      // Fallback: try to find age and education separately
-      const ageMatch = merged.match(/(\d{2})\s*岁/);
+    const info = { name: "待识别", age: "待识别", education: "待识别", job_title: "", phone: "", raw_text: "" };
+
+    // 精确 class 优先提取
+    const nameEl = document.querySelector("span.new-resume-basic__name");
+    const infosEl = document.querySelector("div.new-resume-basic__infos");
+
+    if (nameEl && infosEl) {
+      info.name = (nameEl.getAttribute("title") || nameEl.textContent || "").trim();
+      const infosText = normalize(infosEl.textContent);
+      info.raw_text = `${info.name} ${infosText}`.slice(0, 200);
+      const ageMatch = infosText.match(/(\d{2})\s*岁/);
       if (ageMatch) info.age = `${ageMatch[1]}岁`;
-      const eduMatch = merged.match(degreePattern);
+      const eduMatch = infosText.match(degreePattern);
       if (eduMatch) {
         let edu = eduMatch[0];
         if (edu === "研究生") edu = "硕士";
         if (edu === "专科") edu = "大专";
         info.education = edu;
       }
-      // Try to find name before age
-      if (ageMatch) {
-        const beforeAge = merged.slice(0, ageMatch.index).trim();
-        const nameMatches = Array.from(beforeAge.matchAll(/[一-龥]{2,4}/g)).map((m) => m[0]);
-        if (nameMatches.length > 0) info.name = nameMatches[nameMatches.length - 1];
+      // 精确 class 提取电话
+      const phoneLabelEl = document.querySelector(".hover-resume-basic__phone--label");
+      if (phoneLabelEl) {
+        const phoneSibling = phoneLabelEl.nextElementSibling;
+        const phoneText = normalize(phoneSibling ? phoneSibling.textContent : "");
+        const pm = phoneText.match(/(?<!\d)(1[3-9]\d(?:\s*\d){8})(?!\d)/);
+        if (pm) info.phone = pm[1].replace(/\s/g, "");
       }
+      if (!info.phone) {
+        const phoneMatch = infosText.match(/(?<!\d)(1[3-9]\d(?:\s*\d){8})(?!\d)/);
+        if (phoneMatch) info.phone = phoneMatch[1].replace(/\s/g, "");
+      }
+      const expectMatch = infosText.match(/期望[:：]\s*([^·\n\r]{1,40})\s*·\s*([^·\n\r,，；;]{2,40})\s*·\s*([^·\n\r,，；;]{2,40})/);
+      if (expectMatch) info.job_title = expectMatch[2].trim();
+    } else {
+      // 兜底：通用标签 + 坐标扫描
+      const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 1440;
+      const rightLeft = Math.max(420, viewportWidth * 0.42);
+      const summaryCore = /\d{2}\s*岁|博士|硕士|研究生|本科|大专|专科|高中|中专|离职|在职|期望[:：]|1[3-9]\d(?:\s*\d){8}/;
+      const excludes = /聊天记录|快捷回复|发送|表情|请输入|已读|未读|要附件简历|查看附件简历|下载简历|工作经历|项目经历|教育经历|自我评价|求职信/;
+
+      const nodes = Array.from(document.querySelectorAll("aside, section, header, article, div"))
+        .filter((el) => zhilianIsVisible(el))
+        .map((el) => {
+          const rect = el.getBoundingClientRect();
+          const text = normalize(el.innerText || el.textContent || el.getAttribute("title") || el.getAttribute("aria-label"));
+          const cls = String(el.className || "");
+          const area = rect.width * rect.height;
+          const topSummaryZone = rect.left >= rightLeft && rect.top >= 40 && rect.top <= 360 && rect.width >= 260 && rect.height >= 36 && rect.height <= 360;
+          const classScore = /candidate|profile|detail|resume|user|person|talent|card|info|basic|summary/i.test(cls) ? 30 : 0;
+          const textScore = (summaryCore.test(text) ? 50 : 0) + (/期望[:：].*·.*·/.test(text) ? 45 : 0) + (/1[3-9]\d(?:\s*\d){8}/.test(text) ? 35 : 0);
+          return { el, rect, text, area, topSummaryZone, score: classScore + textScore + Math.max(0, 40 - rect.top / 10) + Math.min(area / 12000, 20) };
+        })
+        .filter((item) => item.topSummaryZone && item.text && item.text.length >= 4 && item.text.length <= 1200 && !excludes.test(item.text) && summaryCore.test(item.text));
+
+      nodes.sort((a, b) => b.score - a.score || a.rect.top - b.rect.top || b.area - a.area);
+      const best = nodes[0];
+      if (!best) return { name: "待识别", age: "待识别", education: "待识别", job_title: "", phone: "", raw_text: "" };
+
+      const parts = [];
+      const seen = new Set();
+      const add = (text) => {
+        const line = normalize(text);
+        if (!line || seen.has(line) || line.length > 260 || excludes.test(line)) return;
+        seen.add(line);
+        parts.push(line);
+      };
+      add(best.text);
+      for (const child of Array.from(best.el.querySelectorAll("div, span, p, li")).filter(zhilianIsVisible)) {
+        add(child.innerText || child.textContent || child.getAttribute("title") || child.getAttribute("aria-label"));
+        if (parts.length >= 16) break;
+      }
+      const merged = parts.join(" ");
+      info.raw_text = merged.slice(0, 200);
+
+      const summaryMatch = merged.match(/([一-龥]{2,4}|[A-Za-z][A-Za-z .·-]{1,30})\s+(\d{2})\s*岁\s*(博士|硕士|研究生|本科|大专|专科|高中|中专)?/);
+      if (summaryMatch) {
+        info.name = summaryMatch[1].trim();
+        info.age = `${summaryMatch[2]}岁`;
+        let edu = summaryMatch[3] || "";
+        if (edu === "研究生") edu = "硕士";
+        if (edu === "专科") edu = "大专";
+        if (edu) info.education = edu;
+      } else {
+        const ageMatch = merged.match(/(\d{2})\s*岁/);
+        if (ageMatch) info.age = `${ageMatch[1]}岁`;
+        const eduMatch = merged.match(degreePattern);
+        if (eduMatch) {
+          let edu = eduMatch[0];
+          if (edu === "研究生") edu = "硕士";
+          if (edu === "专科") edu = "大专";
+          info.education = edu;
+        }
+        if (ageMatch) {
+          const beforeAge = merged.slice(0, ageMatch.index).trim();
+          const nameMatches = Array.from(beforeAge.matchAll(/[一-龥]{2,4}/g)).map((m) => m[0]);
+          if (nameMatches.length > 0) info.name = nameMatches[nameMatches.length - 1];
+        }
+      }
+      const expectMatch = merged.match(/期望[:：]\s*([^·\n\r]{1,40})\s*·\s*([^·\n\r,，；;]{2,40})\s*·\s*([^·\n\r,，；;]{2,40})/);
+      if (expectMatch) info.job_title = expectMatch[2].trim();
+      const phoneMatch = merged.match(/(?<!\d)(1[3-9]\d(?:\s*\d){8})(?!\d)/);
+      if (phoneMatch) info.phone = phoneMatch[1].replace(/\s/g, "");
     }
-    // Extract job title from "期望" line
-    const expectMatch = merged.match(/期望[:：]\s*([^·\n\r]{1,40})\s*·\s*([^·\n\r,，；;]{2,40})\s*·\s*([^·\n\r,，；;]{2,40})/);
-    if (expectMatch) info.job_title = expectMatch[2].trim();
-    // Extract phone
-    const phoneMatch = merged.match(/(?<!\d)(1[3-9]\d(?:\s*\d){8})(?!\d)/);
-    if (phoneMatch) info.phone = phoneMatch[1].replace(/\s/g, "");
     const jobTitleEl = document.querySelector(".im-three-list__panel--job--title");
     info.talking_position = jobTitleEl
       ? (jobTitleEl.getAttribute("title") || jobTitleEl.textContent || "").trim()
@@ -3716,8 +3745,8 @@
   }
 
   function scrollZhilianCandidateList(dy) {
-    // 虚拟滚动列表：从最后一张卡片反向走 parent 找真正的滚动容器（与 scrollZhilianCandidateListToTop 同款锚点），
-    // 避免 elementsFromPoint 误命中外层 wrapper。即时滚动 + 兜底 scrollIntoView(end) 推动 React 懒加载下一批。
+    // 虚拟滚动列表：从最后一张卡片反向走 parent 找真正的滚动容器，
+    // 设置 scrollTop 后必须派发 scroll 事件，否则 React 虚拟滚动不会渲染新节点。
     const cards = document.querySelectorAll(".im-session-item.km-list__item");
     const anchor = cards.length ? cards[cards.length - 1] : null;
     if (!anchor) return false;
@@ -3725,11 +3754,17 @@
     while (node && node !== document.body) {
       if (node.scrollHeight > node.clientHeight + 10) {
         node.scrollTop = node.scrollTop + dy;
+        node.dispatchEvent(new Event("scroll", { bubbles: true }));
         return true;
       }
       node = node.parentElement;
     }
-    try { anchor.scrollIntoView({ block: "end" }); return true; } catch {}
+    // 兜底：scrollIntoView 最后一张卡片底部 + wheel 事件模拟
+    try {
+      anchor.scrollIntoView({ block: "end" });
+      anchor.dispatchEvent(new WheelEvent("wheel", { deltaY: dy, bubbles: true }));
+      return true;
+    } catch {}
     return false;
   }
 
@@ -3768,10 +3803,16 @@
   }
 
   function findZhilianLeftNavChatEntry() {
-    // 端口自老 Playwright `_click_sidebar_chat_entry`：
-    // 文字用 /聊天/ 子串匹配（叶子 span 文字精确等于"聊天"，但外层 a/li innerText 常带"99+"角标，
-    // 精确等于会全军覆没）；几何约束 left<95、top>60、宽<=200、高 24-80 锁定左导窄条；
-    // 长度上限 length<=16 防整段侧边栏文本（多菜单拼接）误命中。
+    // 精确 class 锚定：.app-menu-item__label 文本为"聊天"
+    const labels = document.querySelectorAll(".app-menu-item__label");
+    for (const el of labels) {
+      if ((el.textContent || "").trim() === "聊天") {
+        const wrapper = el.closest(".app-menu-item-content-normal__label") || el;
+        emit({ type: "zhilian_nav", data: { step: "left_chat_menu_search", found: 1, method: "precise_class" } });
+        return wrapper;
+      }
+    }
+    // 兜底：通用标签扫描 + 几何约束
     const NOISE = /(微信沟通|已获取微信|获取微信|打招呼)/;
     const candidates = [];
     const all = document.querySelectorAll("a, button, span, li, div, [role='menuitem'], [class*='menu'], [class*='nav'], [class*='side']");
@@ -3795,18 +3836,16 @@
       emit({ type: "zhilian_nav", data: { step: "left_chat_menu_search", found: 0 } });
       return null;
     }
-    // 排序与老 Playwright 一致：left → width → top，最贴左、最窄、最靠上的优先。
     candidates.sort((a, b) => a.rect.left - b.rect.left || a.rect.width - b.rect.width || a.rect.top - b.rect.top);
     emit({
       type: "zhilian_nav",
       data: {
         step: "left_chat_menu_search",
         found: candidates.length,
+        method: "fallback_geometry",
         sample: candidates.slice(0, 3).map((c) => ({
           tag: c.el.tagName,
           text: c.ownText.slice(0, 20),
-          aria: c.label.slice(0, 20),
-          title: c.title.slice(0, 20),
           rect: { left: Math.round(c.rect.left), top: Math.round(c.rect.top), w: Math.round(c.rect.width), h: Math.round(c.rect.height) },
         })),
       },
@@ -3998,7 +4037,7 @@
 
     const seenSet = new Set();
     let scrollRetries = 0;
-    const MAX_SCROLL_RETRIES = 5;
+    const MAX_SCROLL_RETRIES = 10;
     let previousDetailName = "";
 
     while (state !== "stopped" && results.completed < config.max_resumes) {
@@ -4019,8 +4058,8 @@
         }
         // diag: empty_retry
         emit({ type: "zhilian_loop_diag", data: { stage: "empty_retry", scroll_retries: scrollRetries, max_retries: MAX_SCROLL_RETRIES, seen_size: seenSet.size } });
-        scrollZhilianCandidateList(400);
-        await sleep(1200);
+        scrollZhilianCandidateList(600);
+        await sleep(1800);
         continue;
       }
       scrollRetries = 0;
@@ -4128,9 +4167,7 @@
 
           if (downloadResult && downloadResult.ok && downloadData.download_path) {
             const ack = await waitForPersistAck(downloadRequestId, candidateSig, 15000);
-            if (ack && ack.ok) {
-              results.completed++;
-            } else {
+            if (!ack || !ack.ok) {
               results.skipped++;
             }
           } else {
@@ -4164,8 +4201,8 @@
 
       // diag: inner_loop_finished
       emit({ type: "zhilian_loop_diag", data: { stage: "inner_loop_finished", processed_in_batch: targets.length, seen_size: seenSet.size, completed: results.completed, target_completed: config.max_resumes } });
-      scrollZhilianCandidateList(300);
-      await sleep(800);
+      scrollZhilianCandidateList(500);
+      await sleep(1500);
     }
 
     // diag: outer_loop_exit

@@ -1,5 +1,28 @@
 # 开发日志
 
+## 2026-05-25（晚）
+
+### 智联采集模块精确定位 + 滚动加载修复 + completed 双计数 bug 修复
+
+**精确 DOM 定位替换通用扫描**
+
+- **左侧导航「聊天」菜单**：新增精确 class 锚定 `.app-menu-item__label` 文本匹配"聊天"，命中即返回；未命中才走原有通用标签 + 几何约束兜底。替换原先 `querySelectorAll("a, button, span, li, div, ...")` 全标签扫描。
+- **候选人详情提取**：优先用 `span.new-resume-basic__name`（title 属性取姓名）和 `div.new-resume-basic__infos`（年龄/学历/状态）精确提取；未找到才走原有全 DOM 坐标扫描兜底。
+- **电话号码采集**：新增 `.hover-resume-basic__phone--label` 定位"电话："标签，取 nextElementSibling 提取手机号并写入候选人数据库。
+
+**虚拟滚动列表加载修复**
+
+- `scrollZhilianCandidateList`：`scrollTop` 赋值后增加 `dispatchEvent(new Event("scroll"))` 通知 React 虚拟滚动渲染新节点；兜底增加 `WheelEvent` 模拟。
+- 空列表重试滚动距离 400px → 600px，等待 1200ms → 1800ms。
+- 批次结束滚动距离 300px → 500px，等待 800ms → 1500ms。
+- `MAX_SCROLL_RETRIES` 从 5 → 10。
+
+**completed 双计数 bug 修复（根因）**
+
+- `results.completed++` 在两处被执行：`creditPersistCompletion`（persist ack 消息处理器，有去重保护）和 `zhilianCollectLoop` 中 `waitForPersistAck` 返回后。每次成功下载被计数两次。
+- 表现：目标 3 份，实际下载 2 份但 completed=4，`completed >= max_resumes` 提前为 true 导致循环退出，不再滚动加载新候选人。
+- 修复：移除 zhilianCollectLoop 中的 `results.completed++`，仅保留 `creditPersistCompletion` 中的统一计数。
+
 ## 2026-05-23
 
 ### 智联采集闭环：扩展 v1.88.0 → v2.14.0，bridge v1.1.0 → v1.21.0

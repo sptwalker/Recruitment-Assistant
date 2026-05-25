@@ -6,6 +6,8 @@ from pathlib import Path
 from docx import Document
 from pypdf import PdfReader
 
+from ..utils.docx_utils import docx_xml_text_fallback
+
 try:
     import pymupdf as _pymupdf
 except ImportError:  # pragma: no cover - 仅在未装 pymupdf 时回落
@@ -175,14 +177,23 @@ def extract_pdf_text(file_path: str | Path) -> str:
 
 
 def extract_docx_text(file_path: str | Path) -> str:
-    document = Document(str(file_path))
+    try:
+        document = Document(str(file_path))
+    except Exception:
+        return normalize_text(docx_xml_text_fallback(file_path))
     parts = [paragraph.text for paragraph in document.paragraphs if paragraph.text.strip()]
     for table in document.tables:
         for row in table.rows:
             row_text = " ".join(cell.text.strip() for cell in row.cells if cell.text.strip())
             if row_text:
                 parts.append(row_text)
-    return normalize_text("\n".join(parts))
+    result = normalize_text("\n".join(parts))
+    if len(result.strip()) < 50:
+        # 文本框 / SDT 排版的简历，paragraphs/tables 取不到内容
+        fallback = normalize_text(docx_xml_text_fallback(file_path))
+        if len(fallback.strip()) > len(result.strip()):
+            return fallback
+    return result
 
 
 def extract_doc_text(file_path: str | Path) -> str:
@@ -674,13 +685,13 @@ def extract_text_from_pdf(path: str | Path) -> str:
 
 
 def extract_text_from_docx(path: str | Path) -> str:
-    """用 python-docx 提取 DOCX 纯文本，去空行。"""
+    """用 python-docx 提取 DOCX 纯文本，去空行；正文全在文本框中时回退 XML 兜底。"""
     from docx import Document
     path = Path(path)
     try:
         doc = Document(str(path))
     except Exception:
-        return ""
+        return docx_xml_text_fallback(path)
     lines = []
     for para in doc.paragraphs:
         text = para.text.strip()
@@ -691,7 +702,12 @@ def extract_text_from_docx(path: str | Path) -> str:
             row_text = " | ".join(cell.text.strip() for cell in row.cells if cell.text.strip())
             if row_text:
                 lines.append(row_text)
-    return "\n".join(lines)
+    result = "\n".join(lines)
+    if len(result.strip()) < 50:
+        fallback = docx_xml_text_fallback(path)
+        if len(fallback.strip()) > len(result.strip()):
+            return fallback
+    return result
 
 
 def is_empty_or_corrupted(path: str | Path) -> bool:

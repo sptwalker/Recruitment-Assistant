@@ -23,8 +23,8 @@ const PLATFORM_REGISTRY = {
     code: "zhilian",
     name: "智联招聘",
     ws_url: "ws://127.0.0.1:8767",
-    tab_url_pattern: "https://rd5.zhaopin.com/*",
-    tab_url_regex: /^https:\/\/rd5\.zhaopin\.com\//,
+    tab_url_pattern: "https://*.zhaopin.com/*",
+    tab_url_regex: /^https:\/\/rd[0-9]+\.zhaopin\.com\//,
     extra_path_regex: /./,
     download_dir_name: "智联招聘",
   },
@@ -117,6 +117,9 @@ function handleServerCommand(platform, msg) {
     case "resume_persist_ack":
       sendToContentScript(platform, { type: "resume_persist_ack", data: msg.data || {}, run_id: platform.activeRunId });
       break;
+    case "skip_current_candidate":
+      sendToContentScript(platform, { type: "skip_current_candidate", data: msg.data || {}, run_id: platform.activeRunId });
+      break;
   }
 }
 
@@ -130,7 +133,7 @@ async function ensureContentScript(tabId) {
 }
 
 function shouldTargetSingleTab(msg) {
-  return ["start_collect", "pause_collect", "resume_collect", "stop_collect", "reset_content_script", "resume_persist_ack"].includes(msg?.type);
+  return ["start_collect", "pause_collect", "resume_collect", "stop_collect", "reset_content_script", "resume_persist_ack", "skip_current_candidate"].includes(msg?.type);
 }
 
 function pickActiveTab(candidateTabs) {
@@ -321,6 +324,79 @@ function downloadDirectUrl(platform, data = {}, sendResponse = () => {}) {
     respondOnce({ ok: false, reason });
   }
 }
+
+// 智联下载 URL 识别（参考老 Playwright adapter._is_resume_attachment_download_url）
+const ZHILIAN_DOWNLOAD_URL_TOKENS = [
+  "downloadfiletemporary", "downloadfile", "downfile", "downloadresume",
+  "resume/download", "resumeattachment", "attachment/download",
+  "download/attachment", "file/download", "downloadurl",
+];
+function isZhilianDownloadUrl(rawUrl) {
+  if (!rawUrl) return false;
+  let url;
+  try { url = new URL(rawUrl); } catch { return false; }
+  if (url.protocol !== "https:" && url.protocol !== "http:") return false;
+  const host = url.host.toLowerCase();
+  const pq = (url.pathname + url.search).toLowerCase();
+  if (host.includes("attachment.zhaopin.com") && pq.includes("downloadfiletemporary")) return true;
+  if (!host.includes("zhaopin.com")) return false;
+  for (const t of ZHILIAN_DOWNLOAD_URL_TOKENS) { if (pq.includes(t)) return true; }
+  return false;
+}
+
+const handledZhilianTabs = new Set(); // 已捕获的 tabId，防重复处理
+
+// 智联"查看附件简历"按钮 → window.open 弹出 attachment.zhaopin.com 的 PDF 直链 tab。
+// 服务器返回的是 PDF inline（Content-Type: application/pdf，无 Content-Disposition: attachment），
+// 所以浏览器只会内嵌渲染，不会自动触发下载，onDeterminingFilename 也不会 fire。
+// 解决：URL 命中 → 主动调 chrome.downloads.download({url, filename}) 强制下载 → 关闭弹窗 tab。
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  const url = changeInfo.url || tab.url || "";
+  if (!url || !isZhilianDownloadUrl(url)) return;
+  if (handledZhilianTabs.has(tabId)) return;
+  handledZhilianTabs.add(tabId);
+  setTimeout(() => handledZhilianTabs.delete(tabId), 60000);
+  const platform = platforms.zhilian;
+  if (!platform) return;
+
+  sendToServer(platform, { type: "zhilian_attachment_tab_captured", data: { tab_id: tabId, url } });
+
+  pruneDownloadIntentQueue(platform);
+  const intent = platform.downloadIntentQueue.shift() || platform.lastDownloadIntent;
+  if (!intent) {
+    sendToServer(platform, { type: "zhilian_download_no_intent", data: { tab_id: tabId, url } });
+    setTimeout(() => { chrome.tabs.remove(tabId).catch(() => {}); }, 1500);
+    return;
+  }
+
+  const boundIntent = { ...intent, url, direct_url: url, at: Date.now(), platform_code: "zhilian", download_source: "zhilian_active_download" };
+  sendToServer(platform, { type: "zhilian_active_download_starting", data: boundIntent });
+
+  try {
+    chrome.downloads.download({
+      url,
+      filename: makeSafeDownloadFilename(boundIntent),
+      conflictAction: "uniquify",
+      saveAs: false,
+    }, (downloadId) => {
+      if (chrome.runtime.lastError || !downloadId) {
+        const reason = chrome.runtime.lastError?.message || "download_start_failed";
+        sendToServer(platform, { type: "zhilian_active_download_failed", data: { ...boundIntent, reason } });
+        notifyDownloadResult(platform, "download_failed", { ...boundIntent, reason });
+        setTimeout(() => { chrome.tabs.remove(tabId).catch(() => {}); }, 500);
+        return;
+      }
+      pendingDownloads.set(downloadId, { ...boundIntent, download_id: downloadId, started_at: Date.now(), bound_by: "zhilian_active_download" });
+      sendToServer(platform, { type: "download_created", data: { ...boundIntent, download_id: downloadId, filename: url, bound_by: "zhilian_active_download" } });
+      setTimeout(() => { chrome.tabs.remove(tabId).catch(() => {}); }, 500);
+    });
+  } catch (error) {
+    const reason = String(error);
+    sendToServer(platform, { type: "zhilian_active_download_failed", data: { ...boundIntent, reason } });
+    notifyDownloadResult(platform, "download_failed", { ...boundIntent, reason });
+    setTimeout(() => { chrome.tabs.remove(tabId).catch(() => {}); }, 500);
+  }
+});
 
 chrome.downloads.onCreated.addListener((item) => {
   if (pendingDownloads.has(item.id)) {

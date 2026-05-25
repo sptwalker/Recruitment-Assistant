@@ -494,6 +494,25 @@ with tabs[0]:
         else:
             # 2) 文本提取
             raw_text = extract_text(path)
+            # PDF 文本过短（< 200）通常是纯图像简历，尝试 PaddleOCR 回退
+            if path.suffix.lower() == ".pdf" and len(raw_text.strip()) < 200:
+                from recruitment_assistant.parsers.ocr_service import (
+                    is_paddleocr_available,
+                    ocr_pdf_to_text,
+                )
+                log(f"           🖼️ PDF 文本过短（{len(raw_text.strip())} 字符），疑似图像简历，启动 OCR 回退…")
+                if not is_paddleocr_available():
+                    log("           ⚠️ PaddleOCR 未安装（pip install paddlepaddle paddleocr），跳过 OCR")
+                else:
+                    try:
+                        ocr_text = ocr_pdf_to_text(path, log=log)
+                        if len(ocr_text.strip()) > len(raw_text.strip()):
+                            log(f"           ✅ OCR 完成，得到 {len(ocr_text)} 字符")
+                            raw_text = ocr_text
+                        else:
+                            log("           ⚠️ OCR 未识别出更多文本")
+                    except Exception as exc:
+                        log(f"           ❌ OCR 异常：{exc}")
             if len(raw_text.strip()) < 50:
                 log(f"           ⚠️ 跳过 — 提取文本过短（{len(raw_text)} 字符）")
                 results["failed_files"]["文本过短"].append(fname)

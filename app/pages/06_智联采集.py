@@ -44,7 +44,7 @@ st.markdown(
 .boss-status-pair { display:flex; flex-direction:column; gap:5px; }
 .boss-status-pair div { white-space:nowrap; }
 .stButton > button, .stLinkButton > a { min-height:32px !important; padding:6px 12px !important; font-size:12px !important; border-radius:10px !important; white-space:nowrap !important; width:100% !important; }
-.boss-status-on { color:var(--color-success); font-weight:700; font-size:12px; }
+.boss-status-on { color:#0a7d2e; font-weight:700; font-size:12px; }
 .boss-status-off { color:var(--color-text-muted); font-size:12px; }
 .boss-path { display:block; clear:both; font-family:Consolas,monospace; font-size:12px; color:var(--color-text-secondary); background:var(--color-bg-soft); border:1px solid var(--color-border); border-radius:10px; padding:8px 10px; word-break:break-all; margin-top:8px; }
 .boss-checklist { margin:0 0 0 18px; padding:0; }
@@ -56,14 +56,14 @@ st.markdown(
 .boss-candidate-table th { position:sticky; top:0; z-index:1; background:var(--color-bg-soft); color:var(--color-text-secondary); font-size:12px; text-align:left; padding:8px 7px; border-bottom:1px solid var(--color-border); }
 .boss-candidate-table td { color:var(--color-text); padding:7px; border-bottom:1px solid var(--color-border); vertical-align:top; word-break:break-all; }
 .boss-candidate-table tr:last-child td { border-bottom:0; }
-.boss-candidate-status-downloaded { color:var(--color-success); font-weight:800; white-space:nowrap; }
-.boss-candidate-status-skipped { color:var(--color-warning); font-weight:800; white-space:nowrap; }
+.boss-candidate-status-downloaded { color:#0a7d2e; font-weight:800; white-space:nowrap; }
+.boss-candidate-status-skipped { color:#b45309; font-weight:800; white-space:nowrap; }
 .boss-empty-box { height:300px; overflow-y:auto; background:var(--color-surface); border:1px solid var(--color-border); border-radius:12px; padding:9px 10px; color:var(--color-text-muted); font-size:12px; }
-.boss-log-highlight { color:var(--color-accent); font-weight:900; font-size:14px; }
+.boss-log-highlight { color:#b45309 !important; font-weight:900; font-size:14px; }
 .boss-log-info { color:var(--color-text); font-size:13px; }
-.boss-log-success { color:var(--color-success); font-weight:700; font-size:13px; }
+.boss-log-success { color:#0a7d2e !important; font-weight:700; font-size:13px; }
 .boss-log-error { color:var(--color-danger); font-weight:700; font-size:13px; }
-.boss-log-skipped { color:var(--color-warning); font-weight:700; font-size:13px; }
+.boss-log-skipped { color:#b45309 !important; font-weight:700; font-size:13px; }
 .boss-log-stat { color:var(--color-primary); font-weight:700; font-size:13px; }
 .plain-section-title { display:flex; align-items:center; justify-content:space-between; gap:12px; margin:18px 0 10px; }
 .plain-section-title h3 { margin:0; font-size:18px; line-height:1.3; color:var(--color-text); }
@@ -84,6 +84,8 @@ st.markdown(
 
 
 def classify_zhilian_log(message: str, level: str = "info") -> str:
+    if level == "success":
+        return "boss-log-success"
     if level == "highlight" or any(token in message for token in ["附件简历调试", "发现弹出页面", "成功获取以下信息", "正在记录你的操作", "成功记录到你的点击操作", "学习任务已完成", "PDF iframe", "boss-svg", "捕获下载链接"]):
         return "boss-log-highlight"
     if "附件按钮:" in message and ("unknown_resume" in message or "附件简历" in message or "开始识别弹出页面" in message):
@@ -92,7 +94,7 @@ def classify_zhilian_log(message: str, level: str = "info") -> str:
         return "boss-log-error"
     if any(token in message for token in ["跳过", "duplicate", "已索要", "索要简历", "resume_requested", "resume_request_clicked"]):
         return "boss-log-skipped"
-    if any(token in message for token in ["保存", "已下载", "下载完成"]):
+    if any(token in message for token in ["保存归档", "保存", "已下载", "下载完成"]):
         return "boss-log-success"
     if any(token in message for token in ["统计", "采集完成", "扫描完成"]):
         return "boss-log-stat"
@@ -240,7 +242,7 @@ def build_candidate_summary(runtime_state: dict) -> str:
     dedup_skipped_count = int(skip_counts.get("boss_dedup_hit") or 0)
     resume_request_count = int(runtime_state.get("resume_request_count") or 0)
     downloaded_count = int(runtime_state.get("downloaded_count") or 0)
-    return f"已记录{len(candidates)}位候选人，跳过{skipped_count}位候选人（其中去重{dedup_skipped_count}人），向{resume_request_count}位候选人索要了简历，成功下载{downloaded_count}份简历"
+    return f"已记录{len(candidates)}人，跳过{skipped_count}人（去重{dedup_skipped_count}人），向{resume_request_count}人索要了简历，成功下载{downloaded_count}份简历"
 
 
 def render_auto_scroll_html(body_html: str, anchor: str, height: int = 316) -> None:
@@ -256,14 +258,14 @@ html, body {{ margin:0; padding:0; background:transparent; font-family:Arial, 'M
 .boss-candidate-table th {{ position:sticky; top:0; z-index:1; background:var(--color-bg-soft); color:var(--color-text-secondary); font-size:12px; text-align:left; padding:8px 7px; border-bottom:1px solid var(--color-border); }}
 .boss-candidate-table td {{ color:var(--color-text); padding:7px; border-bottom:1px solid var(--color-border); vertical-align:top; word-break:break-all; font-size:12px; line-height:1.35; }}
 .boss-candidate-table tr:last-child td {{ border-bottom:0; }}
-.boss-candidate-status-downloaded {{ color:var(--color-success); font-weight:800; white-space:nowrap; }}
-.boss-candidate-status-skipped {{ color:var(--color-warning); font-weight:800; white-space:nowrap; }}
+.boss-candidate-status-downloaded {{ color:#0a7d2e; font-weight:800; white-space:nowrap; }}
+.boss-candidate-status-skipped {{ color:#b45309; font-weight:800; white-space:nowrap; }}
 .boss-empty-box {{ height:300px; overflow-y:auto; background:var(--color-surface); border:1px solid var(--color-border); border-radius:12px; padding:9px 10px; color:var(--color-text-muted); font-size:12px; box-sizing:border-box; }}
-.boss-log-highlight {{ color:var(--color-accent); font-weight:900; font-size:12px; }}
+.boss-log-highlight {{ color:#b45309 !important; font-weight:900; font-size:12px; }}
 .boss-log-info {{ color:var(--color-text); font-size:12px; }}
-.boss-log-success {{ color:var(--color-success); font-weight:700; font-size:12px; }}
+.boss-log-success {{ color:#0a7d2e !important; font-weight:700; font-size:12px; }}
 .boss-log-error {{ color:var(--color-danger); font-weight:700; font-size:12px; }}
-.boss-log-skipped {{ color:var(--color-warning); font-weight:700; font-size:12px; }}
+.boss-log-skipped {{ color:#b45309 !important; font-weight:700; font-size:12px; }}
 .boss-log-stat {{ color:var(--color-primary); font-weight:700; font-size:12px; }}
 </style>
 <div id="{anchor}-wrap">{body_html}</div>
@@ -325,7 +327,11 @@ with st.container(border=True):
         unsafe_allow_html=True,
     )
     status_cols[2].metric("扩展版本", runtime.get("extension_version") or "-")
-    status_cols[3].metric("Run ID", runtime.get("run_id") or "-")
+    try:
+        current_dedup_total = load_zhilian_dedup_record_count()
+    except Exception:
+        current_dedup_total = 0
+    status_cols[3].metric("当前去重记录数", current_dedup_total)
     status_cols[4].metric("最近事件", runtime.get("last_event_at") or "-")
 
     action_cols = st.columns([1.25, 1.25, 1.1, 1.25, 4.15], gap="medium")
@@ -353,7 +359,7 @@ with st.container(border=True):
 # --- Collection & Results ---
 section_title("采集与结果", "注意：如果要自动保存简历，请在chorm浏览器设置中关闭“下载前询问每个文件的保存位置”")
 with st.container(border=True):
-    top_cols = st.columns([1.1, 1.1, 1.1, 1.6, 3.1])
+    top_cols = st.columns([1.1, 1.1, 1.6, 3.1])
     collect_mode = top_cols[0].selectbox("采集模式", ["按数量采集", "按时间采集"])
     if collect_mode == "按时间采集":
         collect_minutes = top_cols[1].number_input("采集时间（分钟）", min_value=5, max_value=120, value=10, step=5)
@@ -361,12 +367,6 @@ with st.container(border=True):
     else:
         max_resumes = top_cols[1].number_input("目标下载份数", min_value=1, max_value=100, value=5, step=1)
         collect_minutes = 0
-    request_resume_if_missing = top_cols[2].checkbox("索要简历", value=False)
-    try:
-        current_dedup_total = load_zhilian_dedup_record_count()
-    except Exception:
-        current_dedup_total = 0
-    top_cols[3].metric("当前去重记录数", current_dedup_total)
 
     btn_cols = st.columns([1, 1, 1, 1, 1.4, 4])
     if btn_cols[0].button("开始采集", disabled=is_running or not ws_connected, type="primary", use_container_width=True):
@@ -378,7 +378,6 @@ with st.container(border=True):
             "max_resumes": effective_max,
             "collect_mode": collect_mode,
             "collect_minutes": int(collect_minutes) if collect_mode == "按时间采集" else 0,
-            "request_resume_if_missing": request_resume_if_missing,
         })
         st.rerun()
     if btn_cols[1].button("暂  停", disabled=not is_running or is_paused, use_container_width=True):

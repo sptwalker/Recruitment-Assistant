@@ -38,6 +38,10 @@ class BossWSServer:
         return self.extension_ws is not None and not getattr(self.extension_ws, "closed", False)
 
     @property
+    def event_loop(self):
+        return self._loop
+
+    @property
     def connection_snapshot(self) -> dict:
         return {
             "connected": self.is_extension_connected,
@@ -191,6 +195,10 @@ class QianchengWSServer:
         return self.extension_ws is not None and not getattr(self.extension_ws, "closed", False)
 
     @property
+    def event_loop(self):
+        return self._loop
+
+    @property
     def connection_snapshot(self) -> dict:
         return {
             "connected": self.is_extension_connected,
@@ -340,6 +348,10 @@ class ZhilianWSServer:
     @property
     def is_extension_connected(self) -> bool:
         return self.extension_ws is not None and not getattr(self.extension_ws, "closed", False)
+
+    @property
+    def event_loop(self):
+        return self._loop
 
     @property
     def connection_snapshot(self) -> dict:

@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  const CONTENT_SCRIPT_VERSION = "1.86.0";
+  const CONTENT_SCRIPT_VERSION = "2.38.0";
 
   // 平台注册表：每个平台的 hostname、WS 端口、文本标记、localStorage key 一站式声明。
   // 这是从单平台升级到多平台的核心入口——新加平台只需在此对象增加一条配置。
@@ -42,7 +42,7 @@
     },
     zhilian: {
       code: "zhilian",
-      hostnames: ["rd5.zhaopin.com"],
+      hostnames: ["rd5.zhaopin.com", "rd6.zhaopin.com"],
       ws_url: "ws://127.0.0.1:8767",
       auth_markers: ["沟通中", "联系人", "职位管理", "人才推荐", "查看附件简历"],
       page_markers: ["智联招聘", "zhaopin", "招聘", "沟通", "候选人"],
@@ -113,8 +113,6 @@
     ".base-info",
   ];
 
-  const AUTH_MARKERS = PLATFORM.auth_markers;
-  const PAGE_MARKERS = PLATFORM.page_markers;
   const RESUME_VIEW_TEXT = PLATFORM.resume_view_text;
   const RESUME_REQUESTED_TEXT = PLATFORM.resume_requested_text;
 
@@ -129,6 +127,9 @@
   let collectFinishedEmitted = false;
   const pendingDownloadWaiters = new Map();
   const pendingPersistAcks = new Map();
+  const receivedPersistAcks = new Map();
+  const persistAckCreditedRequests = new Set();
+  const persistAckCreditedSignatures = new Set();
   const candidateResourceIdMap = new Map();
   const STORAGE_KEYS = {
     learningStage: PLATFORM.storage_keys.learning_stage,
@@ -176,16 +177,6 @@
     void candidateId;
     void signature;
     void details;
-  }
-
-  function isAuthenticated() {
-    const text = document.body?.innerText || "";
-    return AUTH_MARKERS.filter((m) => text.includes(m)).length >= 2;
-  }
-
-  function isBossPageDetected() {
-    const text = `${document.title || ""} ${document.body?.innerText || ""}`;
-    return PLATFORM.hostnames.includes(location.hostname) && PAGE_MARKERS.some((m) => text.includes(m));
   }
 
   function isVisible(el) {
@@ -280,71 +271,239 @@
       .sort((a, b) => b.score - a.score)[0]?.el || null;
   }
 
-  async function clickBossChattingTab() {
-    // 在 BOSS 沟通页顶部按文本"沟通中"找标签并点击。
-    // 没有稳定 ID/class，按文本扫描可点击元素，限制范围在页面上半部分（避免误中正文里的"沟通中"字样）。
-    const candidates = [];
-    const all = document.querySelectorAll("a, button, span, li, [role='tab'], [class*='tab'], [class*='filter']");
-    for (const el of all) {
-      const text = (el.innerText || el.textContent || "").trim();
-      if (text !== "沟通中") continue;
-      const rect = el.getBoundingClientRect();
-      if (rect.width === 0 || rect.height === 0) continue;
-      if (rect.top < 0 || rect.top > window.innerHeight * 0.5) continue;
-      if (rect.width > 200) continue; // 标签通常很窄
-      candidates.push({ el, rect });
+  // 与智联 scrollZhilianCandidateList 同款锚点策略：从最后一张候选人卡片反向走 parent 找真正的虚拟滚动容器，
+  // 再走 scrollIntoView(end) 兜底推动 React/Vue 懒加载下一批。仅靠 findBestListContainer 拿到的 score 第一容器
+  // 在 BOSS 沟通页是外层 wrapper（scrollHeight 早就到底），不是真正的虚拟列表容器。
+  function scrollBossCandidateList(dy) {
+    const items = getCandidateItems();
+    const anchor = items.length ? items[items.length - 1] : null;
+    if (anchor) {
+      let node = anchor.parentElement;
+      while (node && node !== document.body) {
+        if (node.scrollHeight > node.clientHeight + 10) {
+          const before = node.scrollTop;
+          node.scrollTop = before + dy;
+          node.dispatchEvent(new Event("scroll", { bubbles: true }));
+          if (node.scrollTop !== before) return { ok: true, container: node, mode: "anchor_parent", before, after: node.scrollTop };
+          break;
+        }
+        node = node.parentElement;
+      }
+      try { anchor.scrollIntoView({ block: "end" }); return { ok: true, container: anchor.parentElement || null, mode: "scroll_into_view_end", before: 0, after: 0 }; } catch {}
     }
-    if (candidates.length === 0) {
-      emit({ type: "boss_chatting_tab_skip", data: { reason: "not_found", url: location.href } });
-      return false;
+    const fallback = findBestListContainer();
+    if (fallback) {
+      const before = fallback.scrollTop;
+      fallback.scrollTop = before + dy;
+      fallback.dispatchEvent(new Event("scroll", { bubbles: true }));
+      return { ok: fallback.scrollTop !== before, container: fallback, mode: "fallback_best_container", before, after: fallback.scrollTop };
     }
-    // 取最靠上的那个
-    candidates.sort((a, b) => a.rect.top - b.rect.top);
-    const target = candidates[0].el;
-    try {
-      clickElementReliably(target);
-      emit({ type: "boss_chatting_tab_clicked", data: { rect: candidates[0].rect, text: "沟通中" } });
-      await sleep(800);
+    return { ok: false, container: null, mode: "no_container", before: 0, after: 0 };
+  }
+
+  async function clickBossChatMenu() {
+    if (/\/web\/chat(\/|$|\?)/.test(location.pathname + location.search)) {
+      emit({ type: "boss_chat_menu_skip", data: { reason: "already_on_chat", url: location.href } });
       return true;
-    } catch (exc) {
-      emit({ type: "boss_chatting_tab_skip", data: { reason: "click_failed", error: String(exc) } });
-      return false;
     }
+    let attempts = 0;
+    for (let wave = 0; wave < 3; wave++) {
+      attempts++;
+      const candidates = [];
+      const all = document.querySelectorAll("a, button, span, li, div, [role='menuitem'], [class*='menu'], [class*='nav']");
+      for (const el of all) {
+        const text = (el.innerText || el.textContent || "").trim();
+        if (text !== "沟通") continue;
+        const rect = el.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) continue;
+        if (rect.left >= window.innerWidth * 0.3) continue;
+        if (rect.width >= 200) continue;
+        if (!isVisible(el)) continue;
+        candidates.push({ el, rect });
+      }
+      if (candidates.length > 0) {
+        candidates.sort((a, b) => a.rect.left - b.rect.left);
+        const target = candidates[0].el;
+        try {
+          clickElementDirect(target);
+          emit({ type: "boss_chat_menu_clicked", data: { rect: candidates[0].rect, attempts } });
+          await sleep(800);
+          return true;
+        } catch (exc) {
+          emit({ type: "boss_chat_menu_skip", data: { reason: "click_failed", error: String(exc), attempts } });
+          return false;
+        }
+      }
+      await sleep(500);
+    }
+    emit({ type: "boss_chat_menu_skip", data: { reason: "not_found", url: location.href, attempts } });
+    return false;
+  }
+
+  async function clickBossChattingTab() {
+    let attempts = 0;
+    for (let wave = 0; wave < 3; wave++) {
+      attempts++;
+      const candidates = [];
+      const all = document.querySelectorAll("a, button, span, li, div, [role='tab'], [class*='tab'], [class*='filter']");
+      for (const el of all) {
+        const text = (el.innerText || el.textContent || "").trim();
+        if (text !== "沟通中") continue;
+        const rect = el.getBoundingClientRect();
+        if (rect.width < 20 || rect.height < 10) continue;
+        if (!isVisible(el)) continue;
+        candidates.push({ el, rect });
+      }
+      if (candidates.length > 0) {
+        candidates.sort((a, b) => a.rect.left - b.rect.left);
+        const target = candidates[0].el;
+        try {
+          clickElementDirect(target);
+          emit({ type: "boss_chatting_tab_clicked", data: { rect: candidates[0].rect, text: "沟通中", attempts } });
+          await sleep(800);
+          return true;
+        } catch (exc) {
+          emit({ type: "boss_chatting_tab_skip", data: { reason: "click_failed", error: String(exc), attempts } });
+          return false;
+        }
+      }
+      await sleep(600);
+    }
+    emit({ type: "boss_chatting_tab_skip", data: { reason: "not_found", url: location.href, attempts } });
+    return false;
   }
 
   async function resetCandidateListScroll() {
-    const container = findBestListContainer();
-    if (container) {
-      container.scrollTop = 0;
-      container.dispatchEvent(new Event("scroll", { bubbles: true }));
+    const ANCHOR_SELECTORS = [
+      ".geek-item-wrap",
+      "[class*='geek-item']",
+      ".user-list [class*='item']",
+      ".chat-list li",
+      ".user-list li",
+      ".friend-list li",
+      "[class*='chat-list'] li",
+      "[class*='friend-list'] li",
+      "[class*='user-list'] li",
+      "[class*='conversation'] li",
+    ];
+    const anchorDiag = ANCHOR_SELECTORS.map((sel) => ({
+      sel,
+      count: document.querySelectorAll(sel).length,
+    })).filter((x) => x.count > 0);
+    const anchor = document.querySelector(ANCHOR_SELECTORS.join(", "));
+
+    const directScrollables = Array.from(document.querySelectorAll(
+      ".user-list, .chat-list, .friend-list, [class*='user-list'], [class*='chat-list'], [class*='friend-list'], [class*='b-scroll-stable']"
+    )).filter((el) => {
+      if (!isVisible(el)) return false;
+      const rect = el.getBoundingClientRect();
+      return rect.left < (window.innerWidth || 1440) * 0.55 && el.scrollHeight - el.clientHeight > 30;
+    });
+
+    const scrollables = new Set(directScrollables);
+    if (anchor) {
+      let node = anchor.parentElement;
+      while (node && node !== document.body && node !== document.documentElement) {
+        try {
+          const cs = getComputedStyle(node);
+          if (/(auto|scroll|overlay)/.test(cs.overflowY) && node.scrollHeight - node.clientHeight > 30) {
+            scrollables.add(node);
+          }
+        } catch (_) { /* ignore */ }
+        node = node.parentElement;
+      }
     }
+    const scrollList = Array.from(scrollables);
+    const anchorTopBefore = anchor ? Math.round(anchor.getBoundingClientRect().top) : null;
+    const before = scrollList.map((el) => ({
+      tag: el.tagName,
+      cls: String(el.className || "").slice(0, 80),
+      prev: el.scrollTop,
+      h: el.scrollHeight,
+      ch: el.clientHeight,
+    }));
+    for (const el of scrollList) {
+      try {
+        el.scrollTop = 0;
+        el.scrollTo?.({ top: 0, behavior: "auto" });
+        el.dispatchEvent(new Event("scroll", { bubbles: true }));
+      } catch (_) { /* ignore */ }
+    }
+    try { document.documentElement.scrollTop = 0; } catch (_) { /* ignore */ }
+    try { document.body.scrollTop = 0; } catch (_) { /* ignore */ }
     window.scrollTo(0, 0);
-    await sleep(800);
+    await sleep(900);
+    const after = scrollList.map((el) => el.scrollTop);
+    const anchorTopAfter = anchor
+      ? Math.round((document.querySelector(ANCHOR_SELECTORS.join(", ")) || anchor).getBoundingClientRect().top)
+      : null;
+    emit({
+      type: "boss_diag",
+      data: {
+        step: "scroll_reset_detail",
+        anchor_found: !!anchor,
+        anchor_selectors_hit: anchorDiag,
+        anchor_top_before: anchorTopBefore,
+        anchor_top_after: anchorTopAfter,
+        scrollable_count: scrollList.length,
+        before,
+        after,
+        doc_scrollTop: document.documentElement.scrollTop,
+        body_scrollTop: document.body?.scrollTop || 0,
+      },
+    });
   }
 
   function getCandidateItems() {
     const seen = new Set();
     const seenKeys = new Set();
     const items = [];
+    let hitContainerInfo = null;
     const containers = LIST_CONTAINER_SELECTORS
-      .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
-      .filter((el) => isVisible(el) && isInLeftCandidateArea(el));
+      .flatMap((selector) => Array.from(document.querySelectorAll(selector)).map((el) => ({ selector, el })))
+      .filter(({ el }) => isVisible(el) && isInLeftCandidateArea(el));
 
-    for (const container of containers) {
-      const nodes = container.querySelectorAll("li, [class*='item'], [class*='card'], [class*='user']");
-      for (const el of nodes) {
-        if (seen.has(el)) continue;
-        seen.add(el);
-        const score = scoreCandidateItem(el);
-        if (score < 2) continue;
-        const key = candidateKeyFromText(textOf(el));
-        if (!key || seenKeys.has(key)) continue;
-        seenKeys.add(key);
-        items.push({ el, score, top: el.getBoundingClientRect().top });
+    for (const { selector, el: container } of containers) {
+      const before = items.length;
+      // BOSS 新版聊天列表：.user-list 直接子 .geek-item-wrap 即候选人项，
+      // 卡片本身不显示年龄/学历（点击后才出现在右侧详情），
+      // 所以一旦命中已知的列表容器，就信任结构、跳过 scoring。
+      const trustedNodes = Array.from(container.querySelectorAll(".geek-item-wrap"));
+      if (trustedNodes.length > 0) {
+        // 信任分支：DOM 节点本身已是候选人唯一标识，不再做文本去重
+        // （沟通列表卡片只显示姓名+聊天预览，文本去重会把姓名相同/前缀相同的候选人误过滤掉）。
+        for (const el of trustedNodes) {
+          if (seen.has(el)) continue;
+          seen.add(el);
+          if (!isVisible(el)) continue;
+          items.push({ el, score: 5, top: el.getBoundingClientRect().top });
+        }
+      } else {
+        const nodes = container.querySelectorAll("li, [class*='item'], [class*='card'], [class*='user']");
+        for (const el of nodes) {
+          if (seen.has(el)) continue;
+          seen.add(el);
+          const score = scoreCandidateItem(el);
+          if (score < 2) continue;
+          const key = candidateKeyFromText(textOf(el));
+          if (!key || seenKeys.has(key)) continue;
+          seenKeys.add(key);
+          items.push({ el, score, top: el.getBoundingClientRect().top });
+        }
+      }
+      if (items.length > before) {
+        hitContainerInfo = {
+          selector,
+          tag: container.tagName,
+          cls: String(container.className || "").slice(0, 100),
+          rect: getRectSnapshot(container),
+          trusted: trustedNodes.length > 0,
+        };
       }
       if (items.length > 0) break;
     }
 
+    let fallbackUsed = null;
     if (items.length === 0) {
       for (const selector of CANDIDATE_SELECTORS) {
         for (const el of document.querySelectorAll(selector)) {
@@ -357,9 +516,20 @@
           seenKeys.add(key);
           items.push({ el, score, top: el.getBoundingClientRect().top });
         }
-        if (items.length > 0) break;
+        if (items.length > 0) {
+          fallbackUsed = selector;
+          break;
+        }
       }
     }
+
+    try {
+      window.__bossLastCandidateScanDiag = {
+        container: hitContainerInfo,
+        fallback_selector: fallbackUsed,
+        item_count: items.length,
+      };
+    } catch (_) { /* ignore */ }
 
     return items.sort((a, b) => a.top - b.top || b.score - a.score).map((x) => x.el);
   }
@@ -376,12 +546,6 @@
       .replace(/刚刚活跃|今日活跃|昨日活跃|活跃|在线|分钟前活跃|\d+分钟前活跃/g, " ")
       .replace(/\s+/g, " ")
       .trim();
-  }
-
-  function isInvalidCandidateNameToken(_value = "") {
-    // 完全忠实采集策略下不再过滤任何姓名 token。
-    // 保留此 stub 仅为不破坏外部调用点（如 getTopProfileTokens 路径仍可能间接调用）。
-    return false;
   }
 
   function parseContactText(text) {
@@ -723,6 +887,44 @@
     return { name: "待识别", age: "待识别", education: "待识别", raw_text: "", contact_source: "top_profile_red_boxes_not_found", contact_source_note: "未在右侧沟通页顶部红框区域识别到姓名、年龄、学历" };
   }
 
+  function extractBossTalkingPosition() {
+    const pageWidth = window.innerWidth || document.documentElement.clientWidth || 1440;
+    const rightLeft = Math.max(380, pageWidth * 0.28);
+    const re = /沟通的职位[\s\-：:—–]*([^\n\r]{1,80})/;
+    const candidates = [];
+    const nodes = document.querySelectorAll("div, span, p, header, section");
+    for (const el of nodes) {
+      if (!isVisible(el)) continue;
+      const rect = el.getBoundingClientRect();
+      if (rect.left < rightLeft) continue;
+      if (rect.top < 40 || rect.top > 320) continue;
+      if (rect.width < 100 || rect.width > pageWidth) continue;
+      const text = (el.innerText || el.textContent || "").trim();
+      if (!text || text.length > 240) continue;
+      if (!text.includes("沟通的职位")) continue;
+      const m = text.match(re);
+      if (!m) continue;
+      const raw = m[1].trim();
+      if (!raw) continue;
+      candidates.push({ el, rect, raw, top: rect.top, len: text.length });
+    }
+    if (candidates.length === 0) return "";
+    candidates.sort((a, b) => a.top - b.top || a.len - b.len);
+    return candidates[0].raw;
+  }
+
+  function simplifyBossTalkingPosition(raw) {
+    if (!raw) return "";
+    let s = String(raw).replace(/[（(][^）)]*[）)]/g, "");
+    s = s.split(/[/／]/)[0];
+    s = s.trim();
+    const chineseOnly = (s.match(/[一-龥]/g) || []).join("");
+    if (chineseOnly && chineseOnly.length > 0) {
+      return chineseOnly.length > 8 ? chineseOnly.slice(0, 8) : chineseOnly;
+    }
+    return s.length > 8 ? s.slice(0, 8) : s;
+  }
+
   async function waitForContactInfo(clickedItem = null, timeoutMs = 2200) {
     const deadline = Date.now() + timeoutMs;
     await waitForRightPanelReady(Math.min(timeoutMs * 0.4, 1500));
@@ -848,6 +1050,25 @@
     for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
       node.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, clientX: x, clientY: y, view: window }));
     }
+    return true;
+  }
+
+  function clickElementDirect(el) {
+    // 对已经精准定位到的元素派发点击 —— 不做 closest 上跳、不做 elementFromPoint 重定位。
+    // 用途：智联顶部 tab、左导菜单这种 sibling 共享外层容器的场景。
+    // clickElementReliably 会走 closest("[class*='filter']") 跳到容器，再用容器中心坐标派发，
+    // 容器中心可能落在错误兄弟 tab 上（如"已获取微信"），造成误点。这里完全锚定 el 本身。
+    if (!el) return false;
+    try { el.scrollIntoView?.({ block: "center", inline: "center" }); } catch {}
+    const rect = el.getBoundingClientRect();
+    const x = Math.max(1, Math.min(window.innerWidth - 1, rect.left + rect.width / 2));
+    const y = Math.max(1, Math.min(window.innerHeight - 1, rect.top + rect.height / 2));
+    for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+      try {
+        el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, clientX: x, clientY: y, view: window }));
+      } catch {}
+    }
+    try { el.click?.(); } catch {}
     return true;
   }
 
@@ -1716,75 +1937,83 @@
   }
 
   function findBossSvgDownloadIcon(preview = null) {
-    const roots = [];
-    const pushRoot = (el) => {
-      if (!el || isInExcludedBossDownloadArea(el)) return;
-      if (!roots.includes(el)) roots.push(el);
-    };
-    if (preview?.root) {
-      pushRoot(preview.root);
-      pushRoot(preview.root.parentElement);
-      pushRoot(preview.root.parentElement?.parentElement);
-      pushRoot(preview.root.closest?.("[role='dialog'], [class*='dialog'], [class*='modal'], [class*='preview'], [class*='viewer'], [class*='pdf'], [class*='resume'], [class*='attachment'], [class*='drawer'], [class*='popup'], [class*='pop'], [class*='layer']"));
-    }
-    for (const root of getPreviewRoots()) pushRoot(root);
-    // Also search the full document for high-confidence selectors like resume-btn-file
-    pushRoot(document.body);
-    const matches = [];
-    const selector = "[class*='attachment-resume-btns'] svg, [class*='attachment-resume-btns'] use, [class*='resume-footer'] svg, [class*='resume-footer'] use, [class*='resume-detail'] [class*='boss-svg'], [class*='resume-detail'] [class*='svg-icon'], span.card-btn, [class*='card-btn'], [class*='resume-btn-file'], a[class*='resume-btn-file']";
-    for (const root of roots) {
-      const nodes = root.matches?.(selector) ? [root, ...root.querySelectorAll(selector)] : Array.from(root.querySelectorAll?.(selector) || []);
-      for (const el of nodes) {
-        if (isInExcludedBossDownloadArea(el)) continue;
-        const clickable = getDownloadClickableNode(el);
-        if (!clickable || !isVisible(clickable) || isDisabled(clickable)) continue;
-        const elHref = el.getAttribute?.("href") || el.getAttribute?.("xlink:href") || "";
-        const isXlinkDownload = /download/i.test(elHref) && (!!el.closest?.("[class*='attachment-resume-btns']") || (preview?.root && preview.root.contains(el)));
-        if (!isXlinkDownload && !isStrictResumeActionArea(clickable, preview) && !isStrictResumeActionArea(el, preview)) continue;
-        const rect = clickable.getBoundingClientRect();
-        if (rect.width < 10 || rect.height < 10 || rect.top < 0 || rect.left < 0) continue;
-        const descriptor = `${getElementDescriptor(el)} ${getElementDescriptor(clickable)} ${getElementDescriptor(clickable.parentElement)}`;
-        const combined = descriptor.toLowerCase();
-        const inPopupContainer = !!clickable.closest?.("[class*='preview'], [class*='dialog'], [class*='modal'], [class*='drawer'], [class*='popup'], [class*='layer'], [role='dialog']");
-        const inPreviewRoot = preview?.root && preview.root.contains(clickable);
-        const isHtmlPopupDownload = /card-btn/i.test(descriptor) && /附件简历|下载/.test(descriptor) && (inPopupContainer || inPreviewRoot);
-        const isPreviewRootDownload = inPreviewRoot && /下载|download|附件简历/.test(combined) && !/关闭|close|取消|返回/i.test(combined);
-        const isResumeBtnFile = /resume-btn-file/i.test(clickable.className || "") && /附件简历|下载|download/i.test(combined);
-        if (!isXlinkDownload && !isHtmlPopupDownload && !isPreviewRootDownload && !isResumeBtnFile && !isBossSvgDownloadDescriptor(descriptor)) continue;
-        if (/关闭|close|取消|返回|back|delete|trash|更多|more|打印|print|zoom|放大|缩小|rotate|旋转|×|✕|esc/i.test(combined)) continue;
-        let score = 40;
-        if (isResumeBtnFile) score += 35;
-        if (isHtmlPopupDownload) score += 30;
-        if (isPreviewRootDownload) score += 20;
-        if (clickable.closest?.("[class*='attachment-resume-btns']")) score += 22;
-        if (clickable.closest?.("[class*='resume-footer']")) score += 14;
-        if (clickable.closest?.("[class*='icon-content']")) score += 8;
-        if (/下载|download|down/i.test(descriptor)) score += 10;
-        if (rect.left > window.innerWidth * 0.55) score += 3;
-        if (rect.left > window.innerWidth * 0.75) score += 2;
-        const finalTarget = isXlinkDownload ? (el.closest?.("span") || clickable) : clickable;
-        matches.push({ el: finalTarget, rect: finalTarget.getBoundingClientRect(), score, text: descriptor.slice(0, 160), descriptor });
+    try {
+      const roots = [];
+      const pushRoot = (el) => {
+        if (!el || isInExcludedBossDownloadArea(el)) return;
+        if (!roots.includes(el)) roots.push(el);
+      };
+      if (preview?.root) {
+        pushRoot(preview.root);
+        pushRoot(preview.root.parentElement);
+        pushRoot(preview.root.parentElement?.parentElement);
+        pushRoot(preview.root.closest?.("[role='dialog'], [class*='dialog'], [class*='modal'], [class*='preview'], [class*='viewer'], [class*='pdf'], [class*='resume'], [class*='attachment'], [class*='drawer'], [class*='popup'], [class*='pop'], [class*='layer']"));
       }
+      for (const root of getPreviewRoots()) pushRoot(root);
+      // 仅在没有任何预览根时才退化到 document.body，避免在 chat 列表 dom 上做全局
+      // [class*='card-btn'] 扫描（聊天列表里大量 card-btn + getElementDescriptor → textOf
+      // 会触发数十万 layout，卡死主线程）。
+      if (roots.length === 0) {
+        pushRoot(document.body);
+      }
+      emit({ type: "boss_svg_scan_roots_prepared", data: { roots_count: roots.length, has_preview: Boolean(preview?.root), fallback_body: roots.length === 1 && roots[0] === document.body } });
+      const matches = [];
+      const selector = "[class*='attachment-resume-btns'] svg, [class*='attachment-resume-btns'] use, [class*='resume-footer'] svg, [class*='resume-footer'] use, [class*='resume-detail'] [class*='boss-svg'], [class*='resume-detail'] [class*='svg-icon'], span.card-btn, [class*='card-btn'], [class*='resume-btn-file'], a[class*='resume-btn-file']";
+      for (const root of roots) {
+        const nodes = root.matches?.(selector) ? [root, ...root.querySelectorAll(selector)] : Array.from(root.querySelectorAll?.(selector) || []);
+        for (const el of nodes) {
+          if (isInExcludedBossDownloadArea(el)) continue;
+          const clickable = getDownloadClickableNode(el);
+          if (!clickable || !isVisible(clickable) || isDisabled(clickable)) continue;
+          const elHref = el.getAttribute?.("href") || el.getAttribute?.("xlink:href") || "";
+          const isXlinkDownload = /download/i.test(elHref) && (!!el.closest?.("[class*='attachment-resume-btns']") || (preview?.root && preview.root.contains(el)));
+          if (!isXlinkDownload && !isStrictResumeActionArea(clickable, preview) && !isStrictResumeActionArea(el, preview)) continue;
+          const rect = clickable.getBoundingClientRect();
+          if (rect.width < 10 || rect.height < 10 || rect.top < 0 || rect.left < 0) continue;
+          const descriptor = `${getElementDescriptor(el)} ${getElementDescriptor(clickable)} ${getElementDescriptor(clickable.parentElement)}`;
+          const combined = descriptor.toLowerCase();
+          const inPopupContainer = !!clickable.closest?.("[class*='preview'], [class*='dialog'], [class*='modal'], [class*='drawer'], [class*='popup'], [class*='layer'], [role='dialog']");
+          const inPreviewRoot = preview?.root && preview.root.contains(clickable);
+          const isHtmlPopupDownload = /card-btn/i.test(descriptor) && /附件简历|下载/.test(descriptor) && (inPopupContainer || inPreviewRoot);
+          const isPreviewRootDownload = inPreviewRoot && /下载|download|附件简历/.test(combined) && !/关闭|close|取消|返回/i.test(combined);
+          const isResumeBtnFile = /resume-btn-file/i.test(clickable.className || "") && /附件简历|下载|download/i.test(combined);
+          if (!isXlinkDownload && !isHtmlPopupDownload && !isPreviewRootDownload && !isResumeBtnFile && !isBossSvgDownloadDescriptor(descriptor)) continue;
+          if (/关闭|close|取消|返回|back|delete|trash|更多|more|打印|print|zoom|放大|缩小|rotate|旋转|×|✕|esc/i.test(combined)) continue;
+          let score = 40;
+          if (isResumeBtnFile) score += 35;
+          if (isHtmlPopupDownload) score += 30;
+          if (isPreviewRootDownload) score += 20;
+          if (clickable.closest?.("[class*='attachment-resume-btns']")) score += 22;
+          if (clickable.closest?.("[class*='resume-footer']")) score += 14;
+          if (clickable.closest?.("[class*='icon-content']")) score += 8;
+          if (/下载|download|down/i.test(descriptor)) score += 10;
+          if (rect.left > window.innerWidth * 0.55) score += 3;
+          if (rect.left > window.innerWidth * 0.75) score += 2;
+          const finalTarget = isXlinkDownload ? (el.closest?.("span") || clickable) : clickable;
+          matches.push({ el: finalTarget, rect: finalTarget.getBoundingClientRect(), score, text: descriptor.slice(0, 160), descriptor });
+        }
+      }
+      matches.sort((a, b) => b.score - a.score || b.rect.left - a.rect.left || a.rect.top - b.rect.top);
+      if (matches.length) {
+        emit({
+          type: "download_button_candidates_detailed",
+          data: {
+            candidates: matches.slice(0, 8).map((item) => ({
+              score: item.score,
+              text: item.text,
+              descriptor: (item.descriptor || item.text || "").slice(0, 220),
+              path: getElementDomPath(item.el),
+              rect: getRectSnapshot(item.el),
+              svg_hints: getElementSvgHints(item.el).slice(0, 5),
+            })),
+          },
+        });
+      }
+      return matches[0]?.el || null;
+    } catch (err) {
+      emit({ type: "boss_svg_scan_error", data: { message: String(err?.message || err), stack: String(err?.stack || "").slice(0, 800) } });
+      return null;
     }
-    matches.sort((a, b) => b.score - a.score || b.rect.left - a.rect.left || a.rect.top - b.rect.top);
-    if (matches.length) {
-      emit({
-        type: "download_button_candidates_detailed",
-        data: {
-          candidate_id: candidateId,
-          candidate_signature: signature,
-          candidates: matches.slice(0, 8).map((item) => ({
-            score: item.score,
-            text: item.text,
-            descriptor: (item.descriptor || item.text || "").slice(0, 220),
-            path: getElementDomPath(item.el),
-            rect: getRectSnapshot(item.el),
-            svg_hints: getElementSvgHints(item.el).slice(0, 5),
-          })),
-        },
-      });
-    }
-    return matches[0]?.el || null;
   }
 
   function _extractVueHref(vm) {
@@ -1994,6 +2223,16 @@
         if (primaryKey) pendingPersistAcks.delete(primaryKey);
         if (fallbackKey && fallbackKey !== primaryKey) pendingPersistAcks.delete(fallbackKey);
       };
+      // 先消费早到的 ack（race: 桥侧 ack 可能在扩展进入 await 之前就到了）
+      const earlyByPrimary = primaryKey ? receivedPersistAcks.get(primaryKey) : null;
+      const earlyByFallback = (!earlyByPrimary && fallbackKey && fallbackKey !== primaryKey) ? receivedPersistAcks.get(fallbackKey) : null;
+      const early = earlyByPrimary || earlyByFallback;
+      if (early) {
+        if (primaryKey) receivedPersistAcks.delete(primaryKey);
+        if (fallbackKey) receivedPersistAcks.delete(fallbackKey);
+        resolve(early);
+        return;
+      }
       const timer = setTimeout(() => {
         cleanup();
         resolve({ ok: false, status: "persist_ack_timeout", reason: "ack 等待超时" });
@@ -2008,16 +2247,36 @@
     });
   }
 
+  function creditPersistCompletion(downloadRequestId, signature, source) {
+    const reqKey = downloadRequestId || "";
+    const sigKey = signature || "";
+    if (reqKey && persistAckCreditedRequests.has(reqKey)) return false;
+    if (!reqKey && sigKey && persistAckCreditedSignatures.has(sigKey)) return false;
+    if (reqKey) persistAckCreditedRequests.add(reqKey);
+    if (sigKey) persistAckCreditedSignatures.add(sigKey);
+    results.completed++;
+    emit({ type: "persist_completion_credited", data: { candidate_signature: sigKey, download_request_id: reqKey, source, completed: results.completed } });
+    emitProgress();
+    return true;
+  }
+
   async function finalizeDownloadWithPersistAck(candidateId, signature, downloadRequestId, strategy) {
-    const persist = await waitForPersistAck(downloadRequestId, signature, 12000);
+    if (downloadRequestId) persistAckCreditedRequests.delete(downloadRequestId);
+    if (signature) persistAckCreditedSignatures.delete(signature);
+    const persist = await waitForPersistAck(downloadRequestId, signature, 8000);
     if (persist.ok) {
-      results.completed++;
+      creditPersistCompletion(downloadRequestId, signature, "ack_ok");
       emit({ type: "resume_persist_confirmed", data: { candidate_id: candidateId, candidate_signature: signature, download_request_id: downloadRequestId, strategy, ...(persist.data || {}) } });
-      emitProgress();
       await sleep(Math.min(Math.max(config.interval_ms || 0, 300), 900));
       return true;
     }
     emit({ type: "resume_persist_rejected", data: { candidate_id: candidateId, candidate_signature: signature, download_request_id: downloadRequestId, strategy, status: persist.status || "unknown", reason: persist.reason || "", ...(persist.data || {}) } });
+    // ack 超时 ≠ 下载失败：桥侧的 resume_saved 事件会在 onMessage 链路里补回 completed 计数（见 creditPersistCompletion）。
+    // 此处保底再补一次：桥侧无论 saved/timeout 都已经落盘，跑完上层应直接结束本候选人，避免重复点击下载。
+    if (persist.status === "persist_ack_timeout") {
+      creditPersistCompletion(downloadRequestId, signature, "ack_timeout_fallback");
+      return true;
+    }
     return false;
   }
 
@@ -2866,6 +3125,54 @@
     return info;
   }
 
+  function extractQianchengTalkingPosition() {
+    // 51 沟通页"沟通职位"元素已确认：<div id="sensor_Bchatinfo_switch" class="change-position">游戏策划</div>
+    // 元素 textContent.trim() 直接就是职位文本（不带"沟通职位："标签前缀）。
+    // 主策略：单 selector 直命中；兜底：少量容器 innerText 严格正则（防 51 改版）。
+    try {
+      const el = document.querySelector("#sensor_Bchatinfo_switch")
+              || document.querySelector(".change-position");
+      if (el) {
+        const text = (el.textContent || "").trim();
+        if (text && /[一-龥a-zA-Z0-9]/.test(text) && !/^沟通职位[：:\s]*$/.test(text)) {
+          return text;
+        }
+      }
+      const fallbackContainers = [
+        ".chat-user-info", ".info-main", ".user-info-main",
+        ".user-info", ".candidate-info", ".right-content",
+      ];
+      const STRICT_RE = /沟通职位[\s\-—–]*[：:]\s*([^\n\r│|｜·、/／]{2,50})/;
+      for (const sel of fallbackContainers) {
+        const c = document.querySelector(sel);
+        if (!c) continue;
+        const m = (c.innerText || "").match(STRICT_RE);
+        if (m && m[1] && /[一-龥a-zA-Z0-9]/.test(m[1])) {
+          return m[1].trim();
+        }
+      }
+      return "";
+    } catch (e) {
+      try { console.warn("[qiancheng] extractTalkingPosition error", e); } catch (_e) {}
+      return "";
+    }
+  }
+
+  function simplifyQianchengTalkingPosition(raw) {
+    // 对齐 bridge 端 _simplify_talking_position 规则：剥括号 + 首段 + 限 8 字符。
+    // 防御：纯标点 / 空白 / 单冒号必须返回空串，不能进入文件名。
+    if (!raw) return "";
+    const s0 = String(raw).trim();
+    if (!s0) return "";
+    if (!/[一-龥a-zA-Z0-9]/.test(s0)) return ""; // 纯标点 / 空白 / 单冒号 → 拒绝
+    let s = s0.replace(/[（(][^）)]*[）)]/g, "");
+    s = s.split(/[/／、|｜・·]/)[0];
+    s = s.trim();
+    if (!s || !/[一-龥a-zA-Z0-9]/.test(s)) return "";
+    if (s.length > 8) s = s.slice(0, 8);
+    return s;
+  }
+
   function getQianchengCandidateItems() {
     const container = document.querySelector(QIANCHENG_SELECTORS.candidate_list_container);
     if (!container) return [];
@@ -2900,6 +3207,26 @@
     return null;
   }
 
+  async function waitForQianchengCandidateDetailReady(prevName, timeoutMs = 1800) {
+    // 点击候选人后右侧详情区从上一个候选人切换需要时间；
+    // 在 .info-main 姓名节点的文本与 prevName 不同时认为已切换。
+    // prevName 为空（首个候选人）则等到任意非空姓名出现即返回。
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const root = document.querySelector(QIANCHENG_SELECTORS.profile_info_container);
+      const nameEl = root
+        ? (root.querySelector(QIANCHENG_SELECTORS.profile_name) || root.querySelector(".username-text"))
+        : null;
+      const currName = nameEl ? (nameEl.innerText || nameEl.textContent || "").trim() : "";
+      if (currName) {
+        if (!prevName) return currName;
+        if (currName !== prevName) return currName;
+      }
+      await sleep(120);
+    }
+    return "";
+  }
+
   function findQianchengDownloadButton() {
     const sensor = document.querySelector(QIANCHENG_SELECTORS.download_btn_sensor);
     if (sensor) return sensor;
@@ -2910,19 +3237,84 @@
     return document.querySelector(QIANCHENG_SELECTORS.close_preview);
   }
 
+  function isQianchengTabActive(el) {
+    // 51 ehire 顶部 tab 选中态可能是以下任一 class（按改版历史扩展）。
+    if (!el) return false;
+    const cls = (el.className || "") + " " + ((el.parentElement && el.parentElement.className) || "");
+    return /\b(active|current|selected|checked|on)\b/i.test(cls)
+        || el.getAttribute?.("aria-selected") === "true";
+  }
+
+  function looksLikeQianchengChattingRoute() {
+    // URL / 标题 / 面包屑任一项含沟通中关键词即认为已在沟通中页面（用于辅助判定）。
+    try {
+      const url = String(location.href || "");
+      if (/talent[-_]?communicate|chat|communication|chatting/i.test(url)) return true;
+    } catch {}
+    try {
+      const title = String(document.title || "");
+      if (title.includes("沟通中") || title.includes("人才沟通")) return true;
+    } catch {}
+    try {
+      const breadcrumb = document.querySelector(".breadcrumb, .crumbs, .ant-breadcrumb");
+      if (breadcrumb && (breadcrumb.innerText || "").includes("沟通中")) return true;
+    } catch {}
+    return false;
+  }
+
   async function ensureQianchengOnChattingPage() {
-    if (document.querySelector(QIANCHENG_SELECTORS.candidate_list_container)) return true;
+    // v2.30.0：不再以"列表容器存在"作为短路条件 —— 因为 51 SPA 结构下"全部候选人"页面
+    // 也可能存在同名容器，导致函数判定"已在沟通中"而跳过导航。改为每次都强制点击
+    // 「人才沟通」菜单 → 「沟通中」tab，确保一定落在沟通中。重复点击对已在沟通中的
+    // 用户只是无害的二次激活。
+    try { console.log("[qiancheng nav] enter ensureQianchengOnChattingPage", { url: location.href, title: document.title }); } catch {}
+
     const navMenu = document.querySelector(QIANCHENG_SELECTORS.nav_menu_chat);
     if (navMenu) {
-      clickElementReliably(navMenu);
-      await sleep(1500);
+      try { console.log("[qiancheng nav] click talent menu #sensor_talentcommunicate"); } catch {}
+      clickElementDirect(navMenu);
+      await sleep(900);
+    } else {
+      try { console.warn("[qiancheng nav] talent menu (#sensor_talentcommunicate) not found"); } catch {}
     }
-    const tab = document.querySelector(QIANCHENG_SELECTORS.tab_chatting);
+
+    let tab = document.querySelector(QIANCHENG_SELECTORS.tab_chatting);
     if (tab) {
-      clickElementReliably(tab);
-      await sleep(800);
+      try { console.log("[qiancheng nav] click chat tab #sensor_Bchat_communication; activeBefore=", isQianchengTabActive(tab)); } catch {}
+      clickElementDirect(tab);
+      await sleep(700);
+    } else {
+      try { console.warn("[qiancheng nav] chat tab (#sensor_Bchat_communication) not found, will wait"); } catch {}
     }
-    return Boolean(document.querySelector(QIANCHENG_SELECTORS.candidate_list_container));
+
+    // 等到目标 tab 可见且呈激活态 + 列表容器渲染出来才算就绪。最长等 6 秒。
+    const deadline = Date.now() + 6000;
+    while (Date.now() < deadline) {
+      tab = tab || document.querySelector(QIANCHENG_SELECTORS.tab_chatting);
+      const active = isQianchengTabActive(tab);
+      const listContainer = document.querySelector(QIANCHENG_SELECTORS.candidate_list_container);
+      const items = listContainer ? listContainer.querySelectorAll(QIANCHENG_SELECTORS.candidate_card).length : 0;
+      const routeHint = looksLikeQianchengChattingRoute();
+      // 任意两条同时成立即视为已就绪（防 51 改版破坏单一信号）：
+      //   1) tab 激活
+      //   2) 列表容器内有 list-item
+      //   3) URL/标题/面包屑命中沟通中关键词
+      const signals = (active ? 1 : 0) + (items > 0 ? 1 : 0) + (routeHint ? 1 : 0);
+      if (signals >= 2) {
+        try { console.log("[qiancheng nav] on chatting page", { active, items, routeHint, url: location.href }); } catch {}
+        emit({ type: "qiancheng_navigation_status", data: { status: "on_chatting_page", route: location.pathname || location.href, tab_active: active, list_items: items, route_hint: routeHint } });
+        return true;
+      }
+      await sleep(250);
+    }
+
+    const finalTab = document.querySelector(QIANCHENG_SELECTORS.tab_chatting);
+    const finalActive = isQianchengTabActive(finalTab);
+    const finalListContainer = document.querySelector(QIANCHENG_SELECTORS.candidate_list_container);
+    const finalItems = finalListContainer ? finalListContainer.querySelectorAll(QIANCHENG_SELECTORS.candidate_card).length : 0;
+    try { console.warn("[qiancheng nav] navigation_failed", { tabFound: !!finalTab, active: finalActive, list_items: finalItems, url: location.href }); } catch {}
+    emit({ type: "qiancheng_navigation_status", data: { status: "navigation_failed", reason: "timeout_waiting_chatting_page", tab_found: !!finalTab, tab_active: finalActive, list_items: finalItems, route: location.pathname || location.href } });
+    return Boolean(finalListContainer);
   }
 
   function buildQianchengCandidateKey(info) {
@@ -2953,6 +3345,7 @@
     const seenSignatures = new Set();
     const dedupSignatures = new Set(Array.isArray(config.boss_candidate_signatures) ? config.boss_candidate_signatures : []);
     const dedupKeys = new Set(Array.isArray(config.boss_candidate_keys) ? config.boss_candidate_keys : []);
+    let prevCandidateName = "";
 
     for (let i = 0; i < items.length && results.completed < config.max_resumes; i++) {
       if (state === "stopped") break;
@@ -2974,11 +3367,34 @@
         continue;
       }
 
+      // 等右侧详情面板真正切换到本候选人，再去取联系信息和沟通职位（前轮日志显示
+      // 没等待时会抓到上一个候选人的"沟通职位"，且姓名仍是"待识别"）。
+      const switchedName = await waitForQianchengCandidateDetailReady(prevCandidateName, 1800);
+      // 给 Vue/React 子节点（沟通职位行常常异步加载）再补 350ms 渲染窗口。
+      await sleep(350);
+
       const info = extractQianchengContactInfo();
       const signature = `${info.name}/${info.age}/${info.education}`;
       const candidateId = `${activeRunId || "run"}_${i}_${signature}`;
+      if (info.name && info.name !== "待识别") {
+        prevCandidateName = info.name;
+      } else if (switchedName) {
+        prevCandidateName = switchedName;
+      }
 
-      emit({ type: "candidate_clicked", data: { ...info, candidate_id: candidateId, candidate_signature: signature, index: i } });
+      const talkingRaw = extractQianchengTalkingPosition();
+      const talkingSimplified = simplifyQianchengTalkingPosition(talkingRaw);
+      if (talkingSimplified) {
+        emit({ type: "qiancheng_talking_position", data: { candidate_signature: signature, raw: talkingRaw, simplified: talkingSimplified } });
+      } else {
+        // 静默退出问题：raw 抓到但简化掉 / 完全没抓到都走这里，console.log 便于排查 DOM 结构。
+        try { console.log("[qiancheng] talking_position not found", { sig: signature, raw: talkingRaw }); } catch (_e) {}
+        emit({ type: "qiancheng_talking_position_skip", data: { candidate_signature: signature, raw: talkingRaw || "", reason: talkingRaw ? "simplified_empty" : "not_found" } });
+      }
+      info.talking_position = talkingSimplified;
+      info.talking_position_raw = talkingRaw;
+
+      emit({ type: "candidate_clicked", data: { ...info, candidate_id: candidateId, candidate_signature: signature, talking_position: talkingSimplified, talking_position_raw: talkingRaw, index: i } });
 
       if (signature === "待识别/待识别/待识别") {
         emit({ type: "candidate_skipped", data: { candidate_id: candidateId, candidate_signature: signature, reason: "candidate_info_unrecognized", raw_text: info.raw_text } });
@@ -3078,85 +3494,40 @@
   }
 
   function getZhilianCandidateTargets(seenSet) {
+    // 智联沟通中候选人卡片 DOM 真实样本（DevTools console 采样 2026-05-23）：
+    //   <div class="im-session-list__virtual--box">  L=180 T=226 W=247 H=4296（虚拟滚动容器, 30 子节点）
+    //     <div class="im-session-item km-list__item">  L=180 T=226 W=247 H=72  ← 真候选人卡片
+    //       <div class="im-session-item__box">          内含头像/姓名/职位/最近消息预览
+    //         <div class="km-list-item__avatar">         L=188 W=40 H=40 内嵌未读红点
+    //           <div class="km-badge im-session-item__unread">
+    //             <sup class="km-badge__item km-badge__item--fixed">  数字角标
+    //         <div class="km-list-item__title">         姓名 + 职位（最稳定文本）
+    //   <div class="greeting-new-entry">  L=180 T=146  ← noise，"快速处理新招呼"卡片，靠 skip 正则排除
+    //
+    // 旧版基于 [class*="session"]/[class*="item"] 通配 + bbox 几何过滤，命中率脆弱；
+    // 现在 class 已知，直接精确锚定 + 视口可见性判断即可。
     const viewportH = window.innerHeight || document.documentElement.clientHeight || 0;
-    const minTop = 220;
-    const maxBottom = Math.max(minTop + 80, viewportH - 12);
-    const inViewport = (rect) => rect.top >= minTop && rect.bottom <= maxBottom;
     const skip = (text) => /快速处理|新招呼|99\+人|全部职位|筛选|批量/.test(text);
     const normalize = (text) => (text || "").replace(/\s+/g, " ").trim();
 
-    const cardAt = (x, y) => {
-      const stack = document.elementsFromPoint(x, y);
-      let best = null;
-      for (const el of stack) {
-        if (!zhilianIsVisible(el)) continue;
-        const rect = el.getBoundingClientRect();
-        const text = normalize(el.innerText || el.textContent);
-        if (
-          rect.left >= 170 && rect.left <= 440 && rect.top >= 220 &&
-          rect.top <= y && rect.bottom >= y &&
-          rect.width >= 200 && rect.width <= 280 &&
-          rect.height >= 45 && rect.height <= 130 &&
-          text.length >= 2 && text.length <= 260 && !skip(text)
-        ) {
-          if (!best || rect.width * rect.height > best.getBoundingClientRect().width * best.getBoundingClientRect().height) {
-            best = el;
-          }
-        }
-      }
-      return best;
-    };
-
-    // Strategy 1: find red badge markers (unread indicators) and locate cards near them
-    const redMarkers = Array.from(document.querySelectorAll("*"))
-      .filter((el) => zhilianIsVisible(el))
-      .map((el) => ({ el, rect: el.getBoundingClientRect(), style: window.getComputedStyle(el), text: normalize(el.innerText || el.textContent) }))
-      .filter((item) => {
-        const rect = item.rect;
-        if (rect.left < 170 || rect.left > 215 || rect.top < 220 || rect.width > 34 || rect.height > 34 || !inViewport(rect)) return false;
-        const className = String(item.el.className || "").toLowerCase();
-        const color = `${item.style.backgroundColor} ${item.style.color} ${item.style.borderColor}`;
-        return /badge|dot|unread|red|count|notice|num/.test(className) || /rgb\( ?(2[0-5][0-5]|1[5-9][0-9])[, ]+([0-9]{1,3})[, ]+([0-9]{1,3})/.test(color) || /^\d{1,3}$/.test(item.text);
-      })
-      .sort((a, b) => a.rect.top - b.rect.top);
-
-    const targets = [];
-    for (const marker of redMarkers) {
-      const y = marker.rect.top + marker.rect.height / 2;
-      const card = cardAt(300, y) || cardAt(260, y) || cardAt(220, y) || cardAt(390, y);
-      if (card && !targets.includes(card)) targets.push(card);
-    }
-
-    // Strategy 2: find list-like elements in the left panel area
-    const rows = Array.from(document.querySelectorAll('li, article, section, div[role="listitem"], div[role="button"], [class*="conversation"], [class*="session"], [class*="item"], [class*="card"]'))
-      .filter((el) => zhilianIsVisible(el))
-      .map((el) => ({ el, rect: el.getBoundingClientRect(), text: normalize(el.innerText || el.textContent) }))
-      .filter((item) =>
-        item.rect.left >= 170 && item.rect.left <= 440 && item.rect.top >= 220 && inViewport(item.rect) &&
-        item.rect.width >= 200 && item.rect.width <= 280 &&
-        item.rect.height >= 45 && item.rect.height <= 130 &&
-        item.text.length >= 2 && item.text.length <= 260 && !skip(item.text)
-      )
-      .sort((a, b) => a.rect.top - b.rect.top);
-
-    for (const row of rows) {
-      if (!targets.includes(row.el)) targets.push(row.el);
-    }
-
-    // Build output, filtering already-seen candidates
+    const cards = Array.from(document.querySelectorAll(".im-session-item.km-list__item"));
     const output = [];
     const used = new Set();
-    for (const target of targets) {
-      const rect = target.getBoundingClientRect();
-      const signature = normalize(target.innerText || target.textContent).slice(0, 220);
-      const positionKey = `pos:${Math.round(rect.left)}:${Math.round(rect.top)}:${Math.round(rect.width)}:${Math.round(rect.height)}`;
-      const key = `${positionKey}:${signature}`;
-      if (!signature || seenSet.has(signature) || used.has(key) || skip(signature) || !inViewport(rect)) continue;
-      const clickX = Math.min(410, Math.max(230, rect.left + rect.width * 0.55));
+
+    for (const el of cards) {
+      if (!zhilianIsVisible(el)) continue;
+      const rect = el.getBoundingClientRect();
+      // 仅扫描视口内可见的卡片（虚拟滚动下方未渲染的卡片 rect.top > viewportH，跳过）。
+      if (rect.bottom < 100 || rect.top > viewportH - 12) continue;
+      const signature = normalize(el.innerText || el.textContent).slice(0, 220);
+      if (!signature || signature.length < 4) continue;
+      if (skip(signature)) continue;
+      if (seenSet.has(signature) || used.has(signature)) continue;
+      used.add(signature);
+      // clickX 偏右一点（0.55），避开左侧头像区，落到主信息块。
+      const clickX = rect.left + rect.width * 0.55;
       const clickY = rect.top + rect.height / 2;
-      if (clickY < minTop || clickY > maxBottom) continue;
-      used.add(key);
-      output.push({ element: target, name: signature, index: output.length, clickX, clickY });
+      output.push({ element: el, name: signature, index: output.length, clickX, clickY });
       if (output.length >= 24) break;
     }
     return output;
@@ -3239,73 +3610,92 @@
     // Extract phone
     const phoneMatch = merged.match(/(?<!\d)(1[3-9]\d(?:\s*\d){8})(?!\d)/);
     if (phoneMatch) info.phone = phoneMatch[1].replace(/\s/g, "");
+    const jobTitleEl = document.querySelector(".im-three-list__panel--job--title");
+    info.talking_position = jobTitleEl
+      ? (jobTitleEl.getAttribute("title") || jobTitleEl.textContent || "").trim()
+      : "";
     return info;
   }
 
-  function getZhilianAttachmentButtonState() {
-    const viewportW = window.innerWidth || document.documentElement.clientWidth || 0;
-    const viewportH = window.innerHeight || document.documentElement.clientHeight || 0;
-    const chatLeft = Math.max(420, Math.round(viewportW * 0.34));
-    const bottomTop = Math.max(70, Math.round(viewportH * 0.50));
-    const normalize = (text) => (text || "").replace(/\s+/g, " ").trim();
-    const allText = (el) => normalize([el.innerText, el.textContent, el.getAttribute("title"), el.getAttribute("aria-label")].filter(Boolean).join(" "));
-    const disabledLike = (el) => {
-      const cls = String(el.className || "").toLowerCase();
-      const style = window.getComputedStyle(el);
-      return el.disabled === true || el.getAttribute("disabled") !== null || el.getAttribute("aria-disabled") === "true" || cls.includes("is-disabled") || /(^|[-_\s])disabled($|[-_\s])/.test(cls) || style.pointerEvents === "none";
-    };
-    const inRightBottom = (rect) => rect.left > chatLeft && rect.top > bottomTop && rect.top < viewportH - 8 && rect.width <= 900 && rect.height <= 320;
-    const classify = (text) => {
-      if (/查看附件简历|查看简历附件|下载附件简历|下载简历附件/.test(text)) return "view";
-      if (/已向对方要附件简历|已要附件简历|已索要|附件简历索要中/.test(text)) return "already_requested";
-      if (/要附件简历|索要附件简历|请求附件简历|获取附件简历|要简历/.test(text)) return "request";
-      return "";
-    };
+  function findZhilianAttachmentButton() {
+    // hover 链 + DOM 采样确认（2026-05-23）的两个稳定 class：
+    //   首选：.session-new-action a.km-button —— 底部固定 footer 的"查看附件简历"按钮。
+    //         位置稳定（永远在右下角 footer 工具栏），不会随聊天滚动消失。
+    //   兜底：.im-attachment-card__button —— 聊天气泡内附件卡片按钮，会随聊天滚动浮动甚至滚出视口。
+    // 旧版 getZhilianAttachmentButtonState 用 `[class*="button"], [class*="btn"], [class*="attach"]` 通配
+    // 接近全 DOM 扫描，每节点 getComputedStyle + getBoundingClientRect，智联重 DOM 下耗时 30+s 卡死无 emit。
+    const footerBtns = Array.from(document.querySelectorAll(".session-new-action a.km-button, .session-new-action button, .session-new-action--left a, .session-new-action--left button"));
+    const cardBtns = Array.from(document.querySelectorAll(".im-attachment-card__button"));
+    const all = [...footerBtns, ...cardBtns];
 
-    const nodes = document.querySelectorAll('button, a, [role="button"], [tabindex], span, div, [class*="button"], [class*="btn"], [class*="attach"], [class*="resume"]');
-    const candidates = [];
-    for (const el of nodes) {
+    let best = null;
+    const priority = { view: 3, already_requested: 2, request: 1 };
+
+    for (const el of all) {
       if (!zhilianIsVisible(el)) continue;
-      const rect = el.getBoundingClientRect();
-      if (!inRightBottom(rect)) continue;
-      const text = allText(el);
-      const kind = classify(text);
+      const text = (el.innerText || el.textContent || "").trim();
+      let kind = "";
+      if (/查看附件简历|查看简历附件|下载附件简历|下载简历附件/.test(text)) kind = "view";
+      else if (/已向对方要附件简历|已要附件简历|已索要|附件简历索要中/.test(text)) kind = "already_requested";
+      else if (/要附件简历|索要附件简历|请求附件简历|获取附件简历|要简历/.test(text)) kind = "request";
       if (!kind) continue;
-      candidates.push({ kind, disabled: disabledLike(el), top: rect.top, left: rect.left, area: rect.width * rect.height });
-    }
-    candidates.sort((a, b) => b.top - a.top || a.area - b.area || a.left - b.left);
-    const item = candidates[0];
-    if (!item) return "missing";
-    if (item.kind === "view") return item.disabled ? "missing" : "view";
-    if (item.kind === "already_requested") return "already_requested";
-    return item.disabled ? "missing" : "request";
-  }
 
-  function clickZhilianTextButton(patterns) {
-    const viewportW = window.innerWidth || document.documentElement.clientWidth || 0;
-    const chatLeft = Math.max(420, Math.round(viewportW * 0.34));
-    const nodes = document.querySelectorAll('button, a, [role="button"], span, div, [class*="btn"], [class*="button"], [class*="attach"], [class*="resume"]');
-    for (const el of nodes) {
-      if (!zhilianIsVisible(el)) continue;
-      const rect = el.getBoundingClientRect();
-      if (rect.left < chatLeft || rect.width > 900) continue;
-      const text = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
-      for (const pat of patterns) {
-        if (text.includes(pat)) {
-          el.click();
-          return true;
-        }
+      // 内层 button / a 是 React onClick 真实挂载点；DIV.im-attachment-card__button 是包装层。
+      const inner = el.matches("button, a") ? el : el.querySelector("button, a");
+      const target = inner || el;
+
+      if (!best || priority[kind] > priority[best.state]) {
+        best = { element: target, state: kind, text: text.slice(0, 40), wrapperCls: String(el.className || "").slice(0, 60) };
       }
     }
-    return false;
+    return best;
+  }
+
+  function getZhilianAttachmentButtonState() {
+    const found = findZhilianAttachmentButton();
+    if (!found) return "missing";
+    const el = found.element;
+    const cls = String(el.className || "").toLowerCase();
+    const style = getComputedStyle(el);
+    const disabled =
+      el.disabled === true ||
+      el.getAttribute("disabled") !== null ||
+      el.getAttribute("aria-disabled") === "true" ||
+      cls.includes("is-disabled") ||
+      /(^|[-_\s])disabled($|[-_\s])/.test(cls) ||
+      style.pointerEvents === "none";
+    if (disabled && (found.state === "view" || found.state === "request")) return "missing";
+    emit({
+      type: "zhilian_attachment_button_found",
+      data: {
+        state: found.state,
+        text: found.text,
+        wrapper_cls: found.wrapperCls,
+        target_tag: el.tagName,
+        target_cls: String(el.className || "").slice(0, 60),
+      },
+    });
+    return found.state;
   }
 
   function clickZhilianViewAttachment() {
-    return clickZhilianTextButton(["查看附件简历", "查看简历附件", "下载附件简历", "下载简历附件"]);
+    const found = findZhilianAttachmentButton();
+    if (!found || found.state !== "view") return false;
+    // 用 Direct 派发完整事件序列；clickElementReliably 会 closest 跳出，对气泡内/footer tab 群都是误触陷阱。
+    clickElementDirect(found.element);
+    return true;
   }
 
-  function clickZhilianRequestAttachment() {
-    return clickZhilianTextButton(["要附件简历", "索要附件简历", "请求附件简历", "获取附件简历", "要简历"]);
+  function clickZhilianViewAttachmentButton() {
+    // 智联"查看附件简历"按钮的 React onClick 会 window.open 弹出 attachment.zhaopin.com/...downloadFileTemporary
+    // 新 tab，该 tab 的 URL 本身就是 PDF 直链。content.js 只负责点按钮 + 提前发 download_intent 占座，
+    // background.js 用 chrome.tabs.onUpdated 监听新 tab URL，命中后调 chrome.downloads.download 直接下载。
+    // 浏览器需在"允许弹出式窗口和重定向"白名单里加 rd5/rd6.zhaopin.com，否则弹窗被拦。
+    const found = findZhilianAttachmentButton();
+    if (!found || found.state !== "view") return { clicked: false };
+    clickElementDirect(found.element);
+    emit({ type: "zhilian_view_attachment_clicked", data: { wrapper_cls: found.wrapperCls, text: found.text } });
+    return { clicked: true };
   }
 
   function clickZhilianAttachmentCard() {
@@ -3326,38 +3716,285 @@
   }
 
   function scrollZhilianCandidateList(dy) {
-    const viewportW = window.innerWidth || document.documentElement.clientWidth || 0;
-    const panelRight = Math.min(440, Math.round(viewportW * 0.35));
-    const midX = Math.round(panelRight / 2 + 85);
-    const midY = Math.round((window.innerHeight || 600) / 2);
-    const els = document.elementsFromPoint(midX, midY);
-    for (const el of els) {
-      if (el.scrollHeight > el.clientHeight + 10) {
-        el.scrollBy({ top: dy, behavior: "smooth" });
+    // 虚拟滚动列表：从最后一张卡片反向走 parent 找真正的滚动容器（与 scrollZhilianCandidateListToTop 同款锚点），
+    // 避免 elementsFromPoint 误命中外层 wrapper。即时滚动 + 兜底 scrollIntoView(end) 推动 React 懒加载下一批。
+    const cards = document.querySelectorAll(".im-session-item.km-list__item");
+    const anchor = cards.length ? cards[cards.length - 1] : null;
+    if (!anchor) return false;
+    let node = anchor.parentElement;
+    while (node && node !== document.body) {
+      if (node.scrollHeight > node.clientHeight + 10) {
+        node.scrollTop = node.scrollTop + dy;
         return true;
       }
+      node = node.parentElement;
+    }
+    try { anchor.scrollIntoView({ block: "end" }); return true; } catch {}
+    return false;
+  }
+
+  function scrollZhilianCandidateListToTop() {
+    const firstCard = document.querySelector(".im-session-item.km-list__item");
+    let node = firstCard ? firstCard.parentElement : null;
+    while (node && node !== document.body) {
+      if (node.scrollHeight > node.clientHeight + 10) {
+        node.scrollTop = 0;
+        return true;
+      }
+      node = node.parentElement;
     }
     return false;
   }
 
   async function waitZhilianDetailSwitch(previousName, timeoutMs) {
     const deadline = Date.now() + (timeoutMs || 3000);
+    let lastInfo = null;
     while (Date.now() < deadline) {
-      const info = extractZhilianContactInfo();
-      if (info.name && info.name !== previousName && info.name !== "未知") return info.name;
-      await sleep(200);
+      lastInfo = extractZhilianContactInfo();
+      const nameOk = lastInfo.name && lastInfo.name !== previousName && lastInfo.name !== "未知";
+      const ageOk = lastInfo.age && lastInfo.age !== "未知";
+      if (nameOk && ageOk) return lastInfo;
+      await sleep(80);
     }
-    return null;
+    return lastInfo;
+  }
+
+  function findDeepestClickable(el) {
+    // 智联左导菜单是 li > div > a > span 多层嵌套，外层 div 没有 React click handler。
+    // 优先点最深的 a / button / [role=button]，否则回落到 el 本身。
+    if (!el) return el;
+    const inner = el.querySelector('a, button, [role="button"], [role="menuitem"]');
+    return inner || el;
+  }
+
+  function findZhilianLeftNavChatEntry() {
+    // 端口自老 Playwright `_click_sidebar_chat_entry`：
+    // 文字用 /聊天/ 子串匹配（叶子 span 文字精确等于"聊天"，但外层 a/li innerText 常带"99+"角标，
+    // 精确等于会全军覆没）；几何约束 left<95、top>60、宽<=200、高 24-80 锁定左导窄条；
+    // 长度上限 length<=16 防整段侧边栏文本（多菜单拼接）误命中。
+    const NOISE = /(微信沟通|已获取微信|获取微信|打招呼)/;
+    const candidates = [];
+    const all = document.querySelectorAll("a, button, span, li, div, [role='menuitem'], [class*='menu'], [class*='nav'], [class*='side']");
+    for (const el of all) {
+      const ownText = (el.innerText || el.textContent || "").trim();
+      const compact = ownText.replace(/\s/g, "");
+      const label = (el.getAttribute("aria-label") || "").trim();
+      const title = (el.getAttribute("title") || "").trim();
+      const hit = /聊天/.test(compact) || /聊天/.test(label) || /聊天/.test(title);
+      if (!hit) continue;
+      if (compact.length > 16) continue;
+      if (NOISE.test(ownText) || NOISE.test(label) || NOISE.test(title)) continue;
+      const rect = el.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) continue;
+      if (!(rect.left < 95 && rect.top > 60)) continue;
+      if (!(rect.height >= 24 && rect.height <= 80)) continue;
+      if (!(rect.width <= 200)) continue;
+      candidates.push({ el, rect, ownText, label, title });
+    }
+    if (!candidates.length) {
+      emit({ type: "zhilian_nav", data: { step: "left_chat_menu_search", found: 0 } });
+      return null;
+    }
+    // 排序与老 Playwright 一致：left → width → top，最贴左、最窄、最靠上的优先。
+    candidates.sort((a, b) => a.rect.left - b.rect.left || a.rect.width - b.rect.width || a.rect.top - b.rect.top);
+    emit({
+      type: "zhilian_nav",
+      data: {
+        step: "left_chat_menu_search",
+        found: candidates.length,
+        sample: candidates.slice(0, 3).map((c) => ({
+          tag: c.el.tagName,
+          text: c.ownText.slice(0, 20),
+          aria: c.label.slice(0, 20),
+          title: c.title.slice(0, 20),
+          rect: { left: Math.round(c.rect.left), top: Math.round(c.rect.top), w: Math.round(c.rect.width), h: Math.round(c.rect.height) },
+        })),
+      },
+    });
+    return candidates[0].el;
+  }
+
+  function findZhilianTopChattingTab() {
+    // hover 链采样确认：tab class 为 .im-custom-filter__item，文本"沟通中"。
+    // 优先 class 锚定，bbox 仅作 sanity check（防 class 名漂移时整页搜出无关元素）。
+    const NOISE = /(微信沟通|已获取微信|获取微信|打招呼)/;
+    const candidates = [];
+    const all = document.querySelectorAll(".im-custom-filter__item, [class*='filter__item']");
+    for (const el of all) {
+      const text = (el.textContent || "").trim();
+      if (!text) continue;
+      if (NOISE.test(text)) continue;
+      const compact = text.replace(/\s/g, "");
+      if (!/沟通中/.test(compact)) continue;
+      if (compact.length > 8) continue;
+      const rect = el.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) continue;
+      candidates.push({ el, rect, text });
+    }
+    if (!candidates.length) {
+      emit({ type: "zhilian_nav", data: { step: "top_chatting_tab_search", found: 0 } });
+      return null;
+    }
+    candidates.sort((a, b) => a.rect.top - b.rect.top || a.rect.left - b.rect.left);
+    emit({
+      type: "zhilian_nav",
+      data: {
+        step: "top_chatting_tab_search",
+        found: candidates.length,
+        sample: candidates.slice(0, 3).map((c) => ({
+          tag: c.el.tagName,
+          cls: String(c.el.className || "").slice(0, 60),
+          text: c.text.slice(0, 20),
+          rect: { left: Math.round(c.rect.left), top: Math.round(c.rect.top), w: Math.round(c.rect.width), h: Math.round(c.rect.height) },
+        })),
+      },
+    });
+    return candidates[0].el;
+  }
+
+  function isZhilianChattingTabActive() {
+    // hover 链采样确认：当前激活 tab 的 class 为 "im-custom-filter__item im-custom-filter__item--active"。
+    // 只有当 --active 节点的文本含"沟通中"，才能视为已在正确 tab。
+    const actives = document.querySelectorAll(".im-custom-filter__item--active, [class*='filter__item--active']");
+    for (const el of actives) {
+      const text = (el.textContent || "").trim();
+      if (/沟通中/.test(text)) return true;
+    }
+    return false;
+  }
+
+  function isOnZhilianChatPage() {
+    // 端口自老 Playwright `_is_probably_chat_page`：靠正文文本特征判断已进入聊天/沟通中视图。
+    const t = (document.body && document.body.innerText) || "";
+    return /要附件简历|查看附件简历|未联系|未读|在线沟通|候选人沟通|请从左侧列表中选择/.test(t);
+  }
+
+  function clickAtCoord(x, y) {
+    // 兜底坐标点击：仅用于左侧聊天菜单（老 Playwright 验证过 (46, 146) 命中率高）。
+    const el = document.elementFromPoint(x, y);
+    if (!el) return null;
+    const target = findDeepestClickable(el);
+    try { target.scrollIntoView({ block: "center" }); } catch {}
+    try { target.click(); } catch {}
+    return target;
+  }
+
+  async function waitForZhilianCandidateListStable(timeoutMs = 3500) {
+    // 智联 tab 切换：--active class 同步切，但 .im-session-list__virtual--box 列表数据是异步拉取/重渲染。
+    // 期间扫描会拿到前一个 tab 残留的虚拟节点（虚拟滚动复用 DOM），导致 50% 概率点错人。
+    // 解决：等"两次连续扫描签名列表完全相同"才视为稳定。
+    const startedAt = Date.now();
+    let prevSignatures = "";
+    let stableHits = 0;
+    while (Date.now() - startedAt < timeoutMs) {
+      const targets = getZhilianCandidateTargets(new Set());
+      const sigs = targets.slice(0, 8).map((t) => t.name).join("|");
+      if (sigs && sigs === prevSignatures) {
+        stableHits++;
+        if (stableHits >= 1) {
+          emit({ type: "zhilian_nav", data: { step: "candidate_list_stable", count: targets.length, elapsed_ms: Date.now() - startedAt } });
+          return true;
+        }
+      } else {
+        stableHits = 0;
+        prevSignatures = sigs;
+      }
+      await sleep(350);
+    }
+    emit({ type: "zhilian_nav", data: { step: "candidate_list_stable_timeout", elapsed_ms: Date.now() - startedAt } });
+    return false;
+  }
+
+  async function ensureZhilianOnChattingPage() {
+    // 幂等：若已经在「聊天 → 沟通中」（active class + 候选人可见 + 文本特征），跳过整个导航。
+    if (
+      isZhilianChattingTabActive() &&
+      getZhilianCandidateTargets(new Set()).length > 0 &&
+      isOnZhilianChatPage()
+    ) {
+      emit({ type: "zhilian_nav", data: { step: "already_on_chat", action: "skip" } });
+      return true;
+    }
+
+    // 第 1 步：点击左侧「聊天」菜单。
+    const navEntry = findZhilianLeftNavChatEntry();
+    if (navEntry) {
+      const clickTarget = findDeepestClickable(navEntry);
+      try { clickTarget.scrollIntoView({ block: "center" }); } catch {}
+      // 用 Direct 而非 Reliably：智联左导是 li/a/span 兄弟拼装的菜单组，closest 上跳会跳到整个 nav 容器，
+      // 再用容器中心坐标派发会落到错误菜单项上。Direct 完全锚定 clickTarget 自己。
+      clickElementDirect(clickTarget);
+      emit({ type: "zhilian_nav", data: { step: "left_chat_menu_clicked", target_tag: clickTarget.tagName } });
+      await sleep(1800);
+    } else {
+      // DOM 扫描失败时启用坐标兜底（仅对左侧聊天菜单，顶部 tab 不允许兜底）。
+      emit({ type: "zhilian_nav", data: { step: "left_chat_menu_missing", fallback: "coord_click" } });
+      const fallback = clickAtCoord(46, 146);
+      emit({
+        type: "zhilian_nav",
+        data: {
+          step: "left_chat_menu_coord_fallback",
+          hit_tag: fallback ? fallback.tagName : null,
+          hit_text: fallback ? (fallback.textContent || "").trim().slice(0, 16) : null,
+        },
+      });
+      await sleep(1800);
+    }
+
+    // 双确认：active tab 必须是「沟通中」才能跳过 tab 点击；
+    // 仅候选人可见 + 文本特征不够——智联未联系/已获取微信 tab 下候选人列表 DOM 一样能扫到，class 区分不出来。
+    // 等列表稳定再判定，否则虚拟滚动复用的旧节点会让 candidates_visible 假阳。
+    await waitForZhilianCandidateListStable(2000);
+    const afterLeft = {
+      tab_active_is_chatting: isZhilianChattingTabActive(),
+      candidates_visible: getZhilianCandidateTargets(new Set()).length > 0,
+      chat_page_text: isOnZhilianChatPage(),
+    };
+    emit({ type: "zhilian_nav", data: { step: "after_left_click_check", ...afterLeft } });
+    if (afterLeft.tab_active_is_chatting && afterLeft.candidates_visible) {
+      emit({ type: "zhilian_nav", data: { step: "ensure_done_after_left", candidates_visible: true } });
+      return true;
+    }
+
+    // 第 2 步：点击顶部「沟通中」tab（绝不允许坐标兜底，找不到就放弃这一步）。
+    const tab = findZhilianTopChattingTab();
+    if (tab) {
+      try { tab.scrollIntoView({ block: "center" }); } catch {}
+      // 用 Direct：tab 是 filter-tabs 容器内的兄弟节点，clickElementReliably 的 closest("[class*='filter']")
+      // 会跳到外层 filter-tabs 容器，容器中心坐标常常落在默认 active 的"已获取微信"上，造成误点。
+      clickElementDirect(tab);
+      emit({ type: "zhilian_nav", data: { step: "top_chatting_tab_clicked", target_tag: tab.tagName } });
+      await sleep(1200);
+      // tab 切换是异步的：active class 同步，但虚拟滚动列表数据异步重渲染——等列表稳定后再扫，
+      // 否则扫到的可能是前一个 tab 残留的虚拟节点。
+      await waitForZhilianCandidateListStable(3500);
+    } else {
+      emit({ type: "zhilian_nav", data: { step: "top_chatting_tab_missing", fallback: "skip_no_coord" } });
+    }
+
+    await sleep(400);
+    const finalCheck = {
+      tab_active_is_chatting: isZhilianChattingTabActive(),
+      candidates_visible: getZhilianCandidateTargets(new Set()).length > 0,
+      chat_page_text: isOnZhilianChatPage(),
+    };
+    const finalReady = finalCheck.tab_active_is_chatting && finalCheck.candidates_visible;
+    emit({ type: "zhilian_nav", data: { step: "ensure_done", ...finalCheck, ready: finalReady } });
+    return finalReady;
   }
 
   async function zhilianCollectLoop() {
-    if (!isAuthenticated()) {
-      emit({ type: "error", data: { message: "未检测到智联招聘登录态", stage: "pre_check" } });
-      state = "idle";
-      return;
-    }
+    // 智联 rd5/rd6 子域本身受平台认证保护，未登录的浏览器无法到达——
+    // 移除继承自 BOSS 的 isAuthenticated() 文本标记探测，避免误报"未检测到登录态"。
     emit({ type: "page_ready", data: { url: location.href } });
-    emit({ type: "boss_content_script_collect_started", data: { content_script_version: CONTENT_SCRIPT_VERSION, key_count: preDedup.keys.size, signature_count: preDedup.signatures.size } });
+
+    // 采集前先点「聊天」菜单 + 「沟通中」tab，确保候选人列表已渲染再开始扫描。
+    await ensureZhilianOnChattingPage();
+    scrollZhilianCandidateListToTop();
+    await sleep(500);
+    const dedupKeys = new Set(Array.isArray(config.boss_candidate_keys) ? config.boss_candidate_keys : []);
+    const dedupSignatures = new Set(Array.isArray(config.boss_candidate_signatures) ? config.boss_candidate_signatures : []);
+    emit({ type: "boss_content_script_collect_started", data: { content_script_version: CONTENT_SCRIPT_VERSION, key_count: dedupKeys.size, signature_count: dedupSignatures.size } });
 
     const seenSet = new Set();
     let scrollRetries = 0;
@@ -3369,6 +4006,8 @@
       if (state === "stopped") break;
 
       let targets = getZhilianCandidateTargets(seenSet);
+      // diag: outer_scan
+      emit({ type: "zhilian_loop_diag", data: { stage: "outer_scan", targets_count: targets.length, seen_size: seenSet.size, scroll_retries: scrollRetries, completed: results.completed, target_signatures_preview: targets.slice(0, 3).map(t => (t.name || "").slice(0, 30)), seen_size_at: Date.now() } });
       emit({ type: "candidate_list_scanned", data: { count: targets.length, scanned: results.scanned } });
 
       if (targets.length === 0) {
@@ -3378,6 +4017,8 @@
           state = "idle";
           return;
         }
+        // diag: empty_retry
+        emit({ type: "zhilian_loop_diag", data: { stage: "empty_retry", scroll_retries: scrollRetries, max_retries: MAX_SCROLL_RETRIES, seen_size: seenSet.size } });
         scrollZhilianCandidateList(400);
         await sleep(1200);
         continue;
@@ -3394,12 +4035,18 @@
         results.scanned++;
         results.currentIndex = target.index;
         const stepStart = Date.now();
+        const phaseTimes = { iter_start: Date.now() }; // diag: iter phase timestamps
 
         try {
           target.element.scrollIntoView({ block: "center" });
           await sleep(100);
-          target.element.click();
-          await sleep(600);
+          phaseTimes.scroll_done = Date.now(); // diag
+          // 智联候选人卡片是 React 组件，handler 挂在 .im-session-item.km-list__item 本身，
+          // 直接 .click() 在 production React 下偶尔哑火（无 pointerdown/mouseup 完整事件链）。
+          // 用 clickElementDirect 派发完整事件序列 + 锚定卡片自身（不 closest 上跳到 virtual--box 容器）。
+          clickElementDirect(target.element);
+          await sleep(150);
+          phaseTimes.click_done = Date.now(); // diag
         } catch (err) {
           emit({ type: "candidate_skipped", data: { candidate_signature: target.name || `idx_${target.index}`, reason: "click_failed", error: String(err) } });
           results.skipped++;
@@ -3407,15 +4054,15 @@
           continue;
         }
 
-        const newName = await waitZhilianDetailSwitch(previousDetailName, 4000);
-        const info = extractZhilianContactInfo();
-        const candidateName = info.name || newName || target.name || "未知";
+        const info = await waitZhilianDetailSwitch(previousDetailName, 4000);
+        phaseTimes.wait_done = Date.now(); // diag
+        const candidateName = info.name || target.name || "未知";
         const candidateAge = info.age || "未知";
         const candidateEdu = info.education || "未知";
         const candidateSig = `${candidateName}/${candidateAge}/${candidateEdu}`;
         previousDetailName = candidateName;
 
-        emit({ type: "candidate_clicked", data: { name: candidateName, age: candidateAge, education: candidateEdu, job_title: info.job_title || "", index: target.index, elapsed_ms: Date.now() - stepStart } });
+        emit({ type: "candidate_clicked", data: { name: candidateName, age: candidateAge, education: candidateEdu, job_title: info.job_title || "", talking_position: info.talking_position || "", index: target.index, elapsed_ms: Date.now() - stepStart } });
 
         if (candidateName === "未知" && candidateAge === "未知" && candidateEdu === "未知") {
           emit({ type: "candidate_skipped", data: { candidate_signature: candidateSig, reason: "candidate_info_unrecognized" } });
@@ -3424,9 +4071,13 @@
           continue;
         }
 
-        const dedupResult = checkPreDedup(candidateSig, info);
-        if (dedupResult.hit) {
-          emit({ type: "candidate_skipped", data: { candidate_signature: candidateSig, reason: "boss_dedup_hit", candidate_key: dedupResult.key } });
+        const normalizedSig = normalizeBossCandidateSignature(candidateSig);
+        const dedupKey = await buildBossCandidateKey(candidateSig, info);
+        const sigHit = dedupSignatures.has(candidateSig) || dedupSignatures.has(normalizedSig);
+        const keyHit = Boolean(dedupKey && dedupKeys.has(dedupKey));
+        if (sigHit || keyHit) {
+          phaseTimes.branch = "dedup_hit"; // diag
+          emit({ type: "candidate_skipped", data: { candidate_signature: candidateSig, reason: "boss_dedup_hit", candidate_key: dedupKey } });
           results.skipped++;
           emitProgress();
           continue;
@@ -3437,8 +4088,32 @@
         emit({ type: "zhilian_attachment_button_state", data: { candidate_signature: candidateSig, state: btnState } });
 
         if (btnState === "view") {
-          const clicked = clickZhilianViewAttachment();
-          if (!clicked) {
+          phaseTimes.branch = "download"; // diag
+          // 智联流程：先发 download_intent 占座（背带 candidate_info / download_request_id），
+          // 再点"查看附件简历"按钮；按钮触发 window.open 弹出 attachment.zhaopin.com 的 PDF 直链 tab，
+          // background.js 用 chrome.tabs.onUpdated 监听该 tab，URL 命中后由 onDeterminingFilename
+          // 劫持文件名 + 绑定到 pendingDownloads，下载完成通过 download_completed/download_failed
+          // 消息回到 waitForDownloadResult。
+          const downloadRequestId = makeDownloadRequestId("", candidateSig);
+
+          chrome.runtime.sendMessage({
+            target: "background",
+            event: {
+              type: "download_intent",
+              data: {
+                candidate_signature: candidateSig,
+                candidate_info: info,
+                download_request_id: downloadRequestId,
+                platform_code: "zhilian",
+                run_id: activeRunId,
+              },
+            },
+          });
+
+          const resultPromise = waitForDownloadResult(downloadRequestId, 30000);
+
+          const clickResult = clickZhilianViewAttachmentButton();
+          if (!clickResult.clicked) {
             const cardClicked = clickZhilianAttachmentCard();
             if (!cardClicked) {
               emit({ type: "candidate_skipped", data: { candidate_signature: candidateSig, reason: "download_button_not_found" } });
@@ -3447,78 +4122,54 @@
               continue;
             }
           }
-          await sleep(1500);
 
-          const downloadRequestId = `zhilian_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-          const downloadWaiter = registerDownloadWaiter(downloadRequestId);
+          const downloadResult = await resultPromise;
+          const downloadData = downloadResult && downloadResult.data ? downloadResult.data : {};
 
-          chrome.runtime.sendMessage({
-            type: "download_intent",
-            data: {
-              candidate_signature: candidateSig,
-              candidate_info: info,
-              download_request_id: downloadRequestId,
-              platform_code: "zhilian",
-            },
-          });
-
-          const downloadResult = await Promise.race([downloadWaiter, sleep(30000).then(() => null)]);
-
-          if (downloadResult && downloadResult.download_path) {
-            emit({
-              type: "resume_downloaded",
-              data: {
-                candidate_signature: candidateSig,
-                candidate_info: info,
-                filename: downloadResult.filename || "",
-                download_path: downloadResult.download_path,
-                url: downloadResult.url || "",
-                download_request_id: downloadRequestId,
-              },
-            });
-            const ack = await waitForPersistAck(candidateSig, 15000);
-            if (ack && ack.status === "saved") {
+          if (downloadResult && downloadResult.ok && downloadData.download_path) {
+            const ack = await waitForPersistAck(downloadRequestId, candidateSig, 15000);
+            if (ack && ack.ok) {
               results.completed++;
             } else {
               results.skipped++;
             }
           } else {
-            emit({ type: "candidate_skipped", data: { candidate_signature: candidateSig, reason: "download_failed" } });
+            emit({ type: "candidate_skipped", data: { candidate_signature: candidateSig, reason: "download_failed", error: downloadResult && downloadResult.reason ? downloadResult.reason : "" } });
             results.skipped++;
           }
         } else if (btnState === "request") {
-          if (config.request_resume_if_missing) {
-            const requestClicked = clickZhilianRequestAttachment();
-            if (requestClicked) {
-              await sleep(1000);
-              emit({ type: "zhilian_resume_request_clicked", data: { candidate_signature: candidateSig } });
-              emit({ type: "resume_request_success", data: { candidate_signature: candidateSig, request_sent: true } });
-              emit({ type: "candidate_skipped", data: { candidate_signature: candidateSig, reason: "resume_requested_by_user" } });
-            } else {
-              emit({ type: "candidate_skipped", data: { candidate_signature: candidateSig, reason: "no_resume_attachment" } });
-            }
-            results.skipped++;
-          } else {
-            emit({ type: "candidate_skipped", data: { candidate_signature: candidateSig, reason: "need_request_resume" } });
-            results.skipped++;
-          }
+          phaseTimes.branch = "no_attachment_request"; // diag
+          emit({ type: "candidate_skipped", data: { candidate_signature: candidateSig, reason: "no_resume_attachment" } });
+          results.skipped++;
         } else if (btnState === "already_requested") {
+          phaseTimes.branch = "no_attachment_other"; // diag
           emit({ type: "candidate_skipped", data: { candidate_signature: candidateSig, reason: "resume_request_already_sent" } });
           results.skipped++;
         } else {
+          phaseTimes.branch = "no_attachment_other"; // diag
           emit({ type: "candidate_skipped", data: { candidate_signature: candidateSig, reason: "no_resume_attachment" } });
           results.skipped++;
         }
 
         emitProgress();
+        phaseTimes.iter_end = Date.now(); // diag
+        // diag: iter phase summary — 仅在慢迭代或 download 分支回报
+        const iterTotalMs = phaseTimes.iter_end - phaseTimes.iter_start;
+        if (iterTotalMs > 5000 || phaseTimes.branch === "download") {
+          emit({ type: "zhilian_iter_diag", data: { candidate_signature: candidateSig, branch: phaseTimes.branch || "unknown", iter_total_ms: iterTotalMs, scroll_ms: (phaseTimes.scroll_done || 0) - phaseTimes.iter_start, click_ms: (phaseTimes.click_done || 0) - (phaseTimes.scroll_done || 0), wait_ms: (phaseTimes.wait_done || 0) - (phaseTimes.click_done || 0), post_wait_ms: phaseTimes.iter_end - (phaseTimes.wait_done || 0), element_still_in_dom: document.body.contains(target.element) } });
+        }
         const interval = config.scan_interval_ms || config.interval_ms || 2000;
         await sleep(interval + Math.random() * 500);
       }
 
+      // diag: inner_loop_finished
+      emit({ type: "zhilian_loop_diag", data: { stage: "inner_loop_finished", processed_in_batch: targets.length, seen_size: seenSet.size, completed: results.completed, target_completed: config.max_resumes } });
       scrollZhilianCandidateList(300);
       await sleep(800);
     }
 
+    // diag: outer_loop_exit
+    emit({ type: "zhilian_loop_diag", data: { stage: "outer_loop_exit", state: state, completed: results.completed, target_completed: config.max_resumes, seen_size: seenSet.size, scroll_retries: scrollRetries } });
     const stopped = state === "stopped";
     state = "idle";
     emit({ type: "collect_finished", data: { completed: results.completed, skipped: results.skipped, stopped } });
@@ -3541,18 +4192,49 @@
         await zhilianCollectLoop();
         return;
       }
-      if (!isAuthenticated()) {
-      emit({ type: "error", data: { message: "未检测到登录态", stage: "pre_check" } });
-      state = "idle";
-      return;
-    }
+      // BOSS chat 页本身受平台认证保护，未登录会被 302 到登录页（content.js 也就不会被注入），
+      // 历史上保留过基于 body.innerText 文本标记的 isAuthenticated() 检查作为兜底，
+      // 但 React 异步渲染 + BOSS 时不时调整文案，会在已登录的真页面误报"未检测到登录态"，
+      // 让 collect 立刻 fail（参考 2026-05-23 第一轮 BOSS 测试日志）。智联 v2.14.0 已移除同样的检查，
+      // BOSS v2.15.0 一致跟进，依靠 manifest 路径匹配 + 平台 302 兜底足够保证只有已登录页才会进入采集。
+      emit({ type: "page_ready", data: { url: location.href } });
 
-    emit({ type: "page_ready", data: { url: location.href } });
-
+    await clickBossChatMenu();
+    await sleep(900);
     const chattingTabResult = await clickBossChattingTab();
+    await sleep(900);
     emit({ type: "boss_diag", data: { step: "chatting_tab", result: chattingTabResult, url: location.href } });
 
+    await resetCandidateListScroll();
+    emit({ type: "boss_diag", data: { step: "scroll_reset", url: location.href } });
+
     let items = getCandidateItems();
+    {
+      const sample = items.slice(0, 5).map((el, idx) => {
+        const r = el.getBoundingClientRect();
+        const t = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 50);
+        return {
+          idx,
+          top: Math.round(r.top),
+          left: Math.round(r.left),
+          w: Math.round(r.width),
+          h: Math.round(r.height),
+          tag: el.tagName,
+          cls: String(el.className || "").slice(0, 60),
+          text: t,
+        };
+      });
+      emit({
+        type: "boss_diag",
+        data: {
+          step: "candidate_scan",
+          count: items.length,
+          sample,
+          hit: window.__bossLastCandidateScanDiag || null,
+          viewport: { w: window.innerWidth, h: window.innerHeight },
+        },
+      });
+    }
     if (items.length === 0) {
       // Retry: wait for DOM to render after tab click
       for (let retry = 0; retry < 3 && items.length === 0; retry++) {
@@ -3623,7 +4305,15 @@
 
       const candidateId = `${activeRunId || "run"}_${i}_${signature}`;
 
-      emit({ type: "candidate_clicked", data: { ...info, candidate_id: candidateId, candidate_signature: signature, index: i, elapsed_ms: infoElapsedMs } });
+      const talkingRaw = extractBossTalkingPosition();
+      const talkingSimplified = simplifyBossTalkingPosition(talkingRaw);
+      if (talkingSimplified) {
+        emit({ type: "boss_talking_position", data: { candidate_signature: signature, raw: talkingRaw, simplified: talkingSimplified } });
+      } else {
+        emit({ type: "boss_talking_position_skip", data: { candidate_signature: signature, reason: "not_found" } });
+      }
+
+      emit({ type: "candidate_clicked", data: { ...info, candidate_id: candidateId, candidate_signature: signature, talking_position: talkingSimplified, talking_position_raw: talkingRaw, index: i, elapsed_ms: infoElapsedMs } });
 
       if (signature === "待识别/待识别/待识别") {
         emit({ type: "candidate_skipped", data: { candidate_id: candidateId, candidate_signature: signature, reason: "candidate_info_unrecognized", raw_text: info.raw_text || "" } });
@@ -3719,34 +4409,58 @@
         ...attachmentClickSnapshot,
       } });
       await sleep(350);
-      const preview = await startResumePreviewRecognition(candidateId, signature, info, btn, beforeUrl, stalePreview.closed, beforePreviewFingerprint);
-      if (shouldAbortAsyncStep()) break;
-      if (!preview) {
-        await skipCandidate(candidateId, signature, "resume_preview_not_found");
-        continue;
-      }
+      try {
+        const preview = await startResumePreviewRecognition(candidateId, signature, info, btn, beforeUrl, stalePreview.closed, beforePreviewFingerprint);
+        if (shouldAbortAsyncStep()) break;
+        if (!preview) {
+          await skipCandidate(candidateId, signature, "resume_preview_not_found");
+          continue;
+        }
 
-      await tryDownloadResume(candidateId, signature, info, preview, true);
-      await closeExistingResumePreview(candidateId, signature);
+        await tryDownloadResume(candidateId, signature, info, preview, true);
+        await closeExistingResumePreview(candidateId, signature);
+        forceRemoveStalePdfPreviewFrames(signature);
+      } catch (perCandidateErr) {
+        emit({ type: "candidate_processing_error", data: { candidate_id: candidateId, candidate_signature: signature, message: String(perCandidateErr?.message || perCandidateErr), stack: String(perCandidateErr?.stack || "").slice(0, 800) } });
+        await skipCandidate(candidateId, signature, "per_candidate_exception");
+      }
     }
 
     while (results.completed < config.max_resumes && state !== "stopped" && scrollRetries < MAX_SCROLL_RETRIES) {
-      const container = findBestListContainer();
-      if (!container) break;
-      const prevScrollTop = container.scrollTop;
-      const scrollStep = container.clientHeight * 0.8;
-      container.scrollTop = prevScrollTop + scrollStep;
-      container.dispatchEvent(new Event("scroll", { bubbles: true }));
+      // 反向锚点滚动 + scrollIntoView(end) 兜底，触发虚拟列表懒加载（参照智联同类修复）。
+      const beforeCount = getCandidateItems().length;
+      const scrollResult = scrollBossCandidateList(Math.max(400, Math.floor((findBestListContainer()?.clientHeight || 600) * 0.8)));
+      emit({ type: "boss_list_scroll_attempt", data: { mode: scrollResult.mode, ok: scrollResult.ok, before_count: beforeCount, before_scroll_top: scrollResult.before, after_scroll_top: scrollResult.after, retries: scrollRetries } });
+      if (!scrollResult.ok) {
+        // 容器都没找到，再试一次 scrollIntoView 把最后一张推到底
+        const items = getCandidateItems();
+        const last = items[items.length - 1];
+        try { last?.scrollIntoView({ block: "end" }); } catch {}
+      }
       await sleep(1500);
       const newItems = getCandidateItems();
       const freshItems = newItems.filter((el) => !processedElements.has(el));
       if (freshItems.length === 0) {
-        if (Math.abs(container.scrollTop - prevScrollTop) < 10) break;
-        scrollRetries++;
-        continue;
+        // 没有新候选人就再尝试一次 scrollIntoView 兜底，等多一拍。两次都没动静才退出。
+        const items = getCandidateItems();
+        const last = items[items.length - 1];
+        try { last?.scrollIntoView({ block: "end" }); } catch {}
+        await sleep(1500);
+        const retryItems = getCandidateItems();
+        const retryFresh = retryItems.filter((el) => !processedElements.has(el));
+        if (retryFresh.length === 0) {
+          if (newItems.length === beforeCount && scrollRetries >= MAX_SCROLL_RETRIES - 1) {
+            emit({ type: "boss_list_scroll_exhausted", data: { total_items: newItems.length, retries: scrollRetries } });
+            break;
+          }
+          scrollRetries++;
+          continue;
+        }
+        items = retryFresh;
+      } else {
+        items = freshItems;
       }
       scrollRetries = 0;
-      items = freshItems;
       for (let i = 0; i < items.length && results.completed < config.max_resumes; i++) {
         if (state === "stopped") break;
         await waitForPause();
@@ -3834,15 +4548,21 @@
         const clickOk = clickElementReliably(btn.el);
         emit({ type: "resume_attachment_click_dispatched", data: { candidate_id: candidateId, candidate_signature: signature, click_ok: clickOk, button_state: btn.state } });
         await sleep(350);
-        const preview = await startResumePreviewRecognition(candidateId, signature, info, btn, beforeUrl, stalePreview.closed, beforePreviewFingerprint);
-        if (shouldAbortAsyncStep()) break;
-        if (!preview) {
-          await skipCandidate(candidateId, signature, "resume_preview_not_found");
-          continue;
-        }
+        try {
+          const preview = await startResumePreviewRecognition(candidateId, signature, info, btn, beforeUrl, stalePreview.closed, beforePreviewFingerprint);
+          if (shouldAbortAsyncStep()) break;
+          if (!preview) {
+            await skipCandidate(candidateId, signature, "resume_preview_not_found");
+            continue;
+          }
 
-        await tryDownloadResume(candidateId, signature, info, preview, true);
-        await closeExistingResumePreview(candidateId, signature);
+          await tryDownloadResume(candidateId, signature, info, preview, true);
+          await closeExistingResumePreview(candidateId, signature);
+          forceRemoveStalePdfPreviewFrames(signature);
+        } catch (perCandidateErr) {
+          emit({ type: "candidate_processing_error", data: { candidate_id: candidateId, candidate_signature: signature, message: String(perCandidateErr?.message || perCandidateErr), stack: String(perCandidateErr?.stack || "").slice(0, 800) } });
+          await skipCandidate(candidateId, signature, "per_candidate_exception");
+        }
       }
     }
 
@@ -3863,17 +4583,18 @@
   }
 
   function emitPageStatus(trigger = "auto") {
-    const authenticated = isAuthenticated();
-    const detected = isBossPageDetected();
+    // BOSS / 51 / 智联三平台的 chat 路径本身受平台认证保护，能注入 content.js 即视为已登录已就绪，
+    // 不再依赖 body.innerText 的文本标记（容易因平台改文案 / 异步渲染时机被误判，
+    // 参考 2026-05-23 第一轮 BOSS 测试日志里的 "未检测到登录态" 误报）。
+    const hostnameMatch = PLATFORM.hostnames.includes(location.hostname);
     emit({
-      type: authenticated || detected ? "page_ready" : "page_detected",
+      type: hostnameMatch ? "page_ready" : "page_detected",
       data: {
         url: location.href,
         title: document.title,
-        authenticated,
-        detected,
+        authenticated: hostnameMatch,
+        detected: hostnameMatch,
         trigger,
-        text_sample: (document.body?.innerText || "").replace(/\s+/g, " ").slice(0, 200),
       },
     });
   }
@@ -3969,6 +4690,31 @@
         pendingPersistAcks.clear();
         if (pauseResolve) { pauseResolve(); pauseResolve = null; }
         break;
+      case "skip_current_candidate": {
+        const data = msg.data || {};
+        const targetCid = data.candidate_id || "";
+        const reason = data.reason || "watchdog";
+        emit({
+          type: "watchdog_skip_received",
+          data: { candidate_id: targetCid, reason, run_id: activeRunId, content_script_version: CONTENT_SCRIPT_VERSION },
+        });
+        // 让所有 pending await 立刻解开，collectLoop 的当前迭代会自然走到下一个候选人
+        pendingDownloadWaiters.forEach((resolve) => resolve({ ok: false, reason: "watchdog_skip" }));
+        pendingDownloadWaiters.clear();
+        pendingPersistAcks.forEach((resolve) => resolve({ ok: false, status: "watchdog_skip" }));
+        pendingPersistAcks.clear();
+        // 主动 emit candidate_skipped，桥端 WatchdogState 凭此把该 cid 标记为终态
+        emit({
+          type: "candidate_skipped",
+          data: {
+            candidate_id: targetCid,
+            candidate_signature: "",
+            reason: "watchdog_timeout",
+            watchdog_reason: reason,
+          },
+        });
+        break;
+      }
       case "download_completed":
       case "download_failed": {
         const data = msg.data || {};
@@ -3983,11 +4729,40 @@
       }
       case "resume_persist_ack": {
         const data = msg.data || {};
+        const received_at_ms = Date.now();  // diag: persist ack timing
+        const ack_sent_at_ms = Number(data.ack_sent_at_ms) || 0;
+        const ws_chain_ms = ack_sent_at_ms > 0 ? (received_at_ms - ack_sent_at_ms) : -1;
+        emit({
+          type: "persist_ack_timing",
+          data: {
+            candidate_signature: data.candidate_signature || "",
+            download_request_id: data.download_request_id || "",
+            save_duration_ms: Number(data.save_duration_ms) || -1,
+            ack_sent_at_ms,
+            received_at_ms,
+            ws_chain_ms,
+            status: data.status || "",
+          },
+        });
         const key = data.download_request_id || data.candidate_signature || "";
+        const ackResult = { ok: data.status === "saved", status: data.status || "unknown", reason: data.reason || "", data };
         const resolver = pendingPersistAcks.get(key);
         if (resolver) {
           pendingPersistAcks.delete(key);
-          resolver({ ok: data.status === "saved", status: data.status || "unknown", reason: data.reason || "", data });
+          resolver(ackResult);
+        } else {
+          // ack 早于 waiter 到达：缓存供后续 waitForPersistAck 入口消费（同时落 sig 副本，因为 finalize 同时挂双键）
+          if (data.download_request_id) receivedPersistAcks.set(data.download_request_id, ackResult);
+          if (data.candidate_signature) receivedPersistAcks.set(data.candidate_signature, ackResult);
+          // 缓存自动过期（45s 内若没人消费就丢弃，防止内存泄漏）
+          setTimeout(() => {
+            if (data.download_request_id) receivedPersistAcks.delete(data.download_request_id);
+            if (data.candidate_signature) receivedPersistAcks.delete(data.candidate_signature);
+          }, 45000);
+        }
+        // 桥侧 saved 是权威信号；finalizeDownloadWithPersistAck 已超时返回时这里兜底回写。
+        if (data.status === "saved") {
+          creditPersistCompletion(data.download_request_id || "", data.candidate_signature || "", "ack_late");
         }
         break;
       }

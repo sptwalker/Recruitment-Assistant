@@ -1,5 +1,76 @@
 # 开发日志
 
+## 2026-05-23
+
+### 智联采集闭环：扩展 v1.88.0 → v2.14.0，bridge v1.1.0 → v1.21.0
+
+本日围绕智联采集页面（沟通中聊天页）做了一整轮迭代，从"附件下载失败 / 30s 超时"一路改到"10/10 全成功 + 文件名带简化沟通职位 + 日志精简琥珀化"。
+
+**核心 bug 修复链路**
+
+- **附件主动下载**（`chrome_extension/background.js`）：内联 PDF 服务器不下发 `Content-Disposition: attachment`，`chrome.downloads.onDeterminingFilename` 被动监听永不触发。改为在 `chrome.tabs.onUpdated` 捕获 `attachment.zhaopin.com/.../downloadFileTemporary?file=...` 后主动调 `chrome.downloads.download({url, filename, conflictAction: "uniquify"})` 强制保存，再 500ms 关闭弹出 tab。
+- **列表滚顶**（`chrome_extension/content.js::scrollZhilianCandidateListToTop`）：`zhilianCollectLoop` 进入扫描前找到 `.im-session-item.km-list__item` 向上首个可滚父节点，`scrollTop = 0`，确保从列表真正首位开始采集。
+- **冗余去重清理**（`recruitment_assistant/services/zhilian_ws_bridge.py::_save_resume`）：删除下载成功后再跑一次 `candidate_key in self._seen_candidate_records` 的判定（11 行），下载前 dedup 已经拦截过，重复判定还会在第一份归档完成 + 源文件 unlink 后让第二次走 `_save_resume` 报 "未找到可归档文件"。同时去掉 content.js 内 `notifyDownloadResult` 回执后重复 emit `resume_downloaded` 的代码块（BOSS/前程无忧没这层重复 emit）。
+- **识别耗时跳变**：上游版本中 `extractZhilianContactInfo` 用 `document.querySelectorAll("aside, section, header, article, div")` 全文档遍历 + 节点 `.innerText` / `getBoundingClientRect`，详情面板首次填充后 1k+ 节点强制 layout flush 把单次 extract 推到 1.5–3.5s；`waitZhilianDetailSwitch` 200ms 轮询累计放大到 33s / 74s。
+  - **B（去冗余）**：`waitZhilianDetailSwitch` 改成返回完整 info 对象（超时也返回最近一次 lastInfo），调用方一次 await 拿到 name/age/education/job_title 全字段，删除循环结束后多余的二次 extract 调用。
+  - **C 第一次尝试（已回滚）**：把 selector 收窄成 `[class*="candidate-info"]` 等 5 个模糊候选 → 命中错误的 placeholder 容器，所有姓名都变 "待识别"，立即回退。
+  - **C 第二次（v2.14.0 固化）**：用户提供真实 outerHTML `<div class="im-three-list__panel--job--title" title="...">...`，改用 O(1) 精确 selector `document.querySelector(".im-three-list__panel--job--title")` 拿 `title` 属性（CSS ellipsis 下仍是完整文本）做沟通职位提取；删除上一轮加的 banner 全文档扫描循环。
+- **文件名加沟通职位**（`zhilian_ws_bridge.py::_save_resume`）：在 stem 拼装处插入 `simplified_position = self._simplify_talking_position(...)`，规则：去括号 → 取 `/` 前 → trim → ≤8 字符。非空时 append 进 `stem_parts`，空时跳过避免出现 "--"。新文件名格式：`{姓名}-{年龄}-{学历}-{沟通职位简化}-智联招聘-{YYYYMMDD}-{HHMMSS}-{NNN}{后缀}`。
+
+**UI/日志规范化**
+
+- 实时日志区新增 `boss-log-success` 绿色 class（`#0a7d2e`，AA 对比度）+ font-weight:700；归档成功 `已归档简历: {签名} → {文件名}` 用该 class。
+- "黄色"高亮 `.boss-log-highlight` 改琥珀 `#b45309 !important`（替换原 `var(--color-accent)`）。
+- 删除蓝色沟通职位日志（同信息已固化进文件名，UI 日志不再赘述），同步删除 `boss-log-blue` CSS + `classify_zhilian_log` 路由分支。
+- 删除冗余事件日志：`zhilian_nav` 全部 step、`zhilian_attachment_button_found`、`zhilian_view_attachment_clicked`、`zhilian_attachment_tab_captured` 改为 `pass`（事件统计 / runtime_state 不动）。
+- 任务初始化块去掉 `执行日期：...`、`当前会话：扩展已连接 ...`（已在版本信息行）、`扫描间隔：默认`（仅非默认时输出）。
+- 重复 echo `内容脚本已启动采集 v2.14.0` 去重：bridge 新增 `_last_content_script_ready_signature: str | None`，相同 `version|key_count|signature_count` 不再重复打。
+- 删除 `下载前去重命中，跳过附件识别: {签名}`（前一条 `跳过: {签名} (去重命中...)` 已表达）。
+
+**索要简历彻底清理**
+
+智联沟通中页基本都已聊起来，"识别到没附件就索要简历"分支无业务价值。删除：
+
+- `app/pages/06_智联采集.py` 复选框 + collect_start payload 字段
+- `zhilian_ws_bridge.py` payload 读取 + "配置：request_resume_if_missing=..." 日志 + event_log 字段 + `case "zhilian_resume_request_clicked"`
+- `chrome_extension/content.js` 智联流程中 `btnState === "request"` 分支的索要简历点击代码块 + `clickZhilianRequestAttachment()` 函数
+- BOSS / 前程无忧的同名字段全部保留（未受影响）
+
+**页面布局调整**
+
+- 去重 banner 从底部独立卡片移到"运行状态"区 `status_cols[3]`，复用 `st.metric` 与扩展版本/最近事件同尺寸；Run ID metric 已废弃。
+- 删除已无用 `.zhilian-dedup-banner` CSS（5 行）。
+
+**沟通职位识别**
+
+- content.js `extractZhilianContactInfo` 新增 `info.talking_position`（精确 selector + `title` 属性优先）。
+- emit `candidate_clicked` 把字段透传到 `candidate_info`，事件链经 `download_intent` → background.js `pendingDownloads` 展开 → bridge `resume_downloaded` data，bridge 端 `_save_resume` 拿 `candidate_info["talking_position"]` 直接用，无需新增独立事件。
+- bridge 新增 `_simplify_talking_position(raw) -> str` 静态方法用于文件名和（已删除的）日志输出。
+
+**版本号最终态**
+
+- `chrome_extension/manifest.json` `2.14.0`
+- `chrome_extension/content.js` `CONTENT_SCRIPT_VERSION = "2.14.0"`
+- `recruitment_assistant/services/zhilian_ws_bridge.py` `ZHILIAN_BRIDGE_VERSION = "1.21.0"`，`ZHILIAN_EXTENSION_EXPECTED_VERSION = "2.14.0"`，`ZHILIAN_CONTENT_SCRIPT_EXPECTED_VERSION = "2.14.0"`
+
+**测试结果**
+
+`#164` 批次目标 10 份：识别耗时全程稳定 ~2s（之前 33–74s 抖动彻底消失）、10/10 下载 + 归档成功、文件名样本：
+
+```
+许高健-38岁-本科-资深产品策划-智联招聘-20260523-220551-001.pdf
+周江超-37岁-本科-Golang后台-智联招聘-20260523-220607-002.doc
+姚朝芳-32岁-本科-用户及市场调研经-智联招聘-20260523-220638-005.pdf
+李首亿-22岁-本科-UI设计师-智联招聘-20260523-220710-008.pdf
+```
+
+总耗时 123s / avg 12.4s/份，Chrome 下载目录与归档目录对账无遗漏。
+
+### 周边修复（同日批次）
+
+- `app/main.py` + `recruitment_assistant/services/crawl_task_service.py`：新增 `CrawlTaskService.reap_stale_running_tasks(platform_code=None)`，Streamlit 启动时 `@st.cache_resource` 跑一次，把 `status='running'` 但进程已死的孤儿 CrawlTask 收尾为 `cancelled`，避免首页"运行中"误报。
+- `recruitment_assistant/services/boss_ws_bridge.py` / `qiancheng_ws_bridge.py`：跟智联同步小幅调整（与本日主线弱相关，详见 diff）。
+
 ## 2026-05-22
 
 ### V2.50 主题接管深度补全 + WS 桥接自愈 + 采集页 UI 对齐
@@ -2372,3 +2443,181 @@ python -c "import ast; [ast.parse(open(p, encoding='utf-8').read()) for p in ['r
 - `recruitment_assistant/services/resume_ai_service.py`
   - `parse_resume_text` 调用 LLM 时加 `response_format={"type": "json_object"}`，强约束 DeepSeek / OpenAI 兼容端点返回合法 JSON 对象，减少 markdown 代码块剥离的边界情况。
   - `match_candidates` 也试加过 `json_object` 模式，但因为返回的是 JSON **数组**（`json_object` 只支持顶层 object），已回滚并加注释说明。
+
+## 2026-05-25
+
+### 简历解析鲁棒性：docx 文本框 XML 兜底 + PaddleOCR 图像 PDF 回退
+
+本日围绕"简历自动解析"链路里两类长期落入"AI 解析异常 / 文本不足"失败桶的场景做了根因修复 + 兜底通路：
+
+| 失败样本 | 提取结果（修复前） | 失败原因 | 修复后 |
+|---|---|---|---|
+| 任珮瑜-25 岁-本科-电商运营经理-智联招聘-...002.docx | 0 字符 | 全部正文塞在 `<w:txbxContent>` 文本框，python-docx 不下钻 | 3177 字符（XML 兜底） |
+| 文国斌-31 岁-本科-UI 设计师-智联招聘-...005.pdf | 86 字符 | 纯图像 PDF，pypdf/pymupdf 抽不出文字 | 977 字符（PaddleOCR） |
+| 周辉-29 岁-本科-UI 设计师-智联招聘-...003.pdf | — | 单页 539×13177 pt 屏滚长图，OpenCV warpPerspective 触发 SHRT_MAX 断言 | 直接跳过该页（阈值 8000pt）|
+
+---
+
+#### A. docx 文本框排版兜底
+
+**根因**：python-docx 的 `Document().paragraphs` / `tables` 只遍历 body 顶层段落和表格，**不下钻** `<w:txbxContent>`（Word 文本框）/ `<w:sdt>`（内容控件）/ `<w:pict>` / `<w:drawing>`。设计感强的简历模板（智联/前程模板尤其常见）经常把全部正文塞进文本框做版式，结果 `paragraphs/tables` 全空 → 外层 `is_empty_or_corrupted` 因 `< 50` 字符把文件误判为"空白/损坏"，整份简历直接归入失败桶。
+
+任珮瑜.docx 验证：zip 完整、`Document()` 能打开、`word/document.xml` 196 KB、`<w:txbxContent>` × 22、`<w:t>` 标签数百个 —— 但 paragraphs/tables 都为 0，全部 3058 字符正文在文本框里。
+
+**修复**：
+
+新增 `recruitment_assistant/utils/docx_utils.py::docx_xml_text_fallback`，直接用 `zipfile` 打开 docx，读 `word/document.xml` + 所有 `word/header*.xml` / `word/footer*.xml`，正则 `<w:t(?:\s[^>]*)?>([^<]*)</w:t>` 抓全部文本节点拼接。**3 处** docx 提取函数统一接入兜底（常规提取 `< 50` 字符时自动回退到 XML 兜底，取更长者）：
+
+- `recruitment_assistant/utils/docx_utils.py::extract_docx_text`
+- `recruitment_assistant/parsers/pdf_resume_parser.py::extract_docx_text`（L177）
+- `recruitment_assistant/parsers/pdf_resume_parser.py::extract_text_from_docx`（L676，归档落档路径）
+
+**设计取舍**：
+
+- 不替换 python-docx —— paragraphs/tables 在有标题/表格的常规简历下输出更干净；XML 兜底用于"常规提取产能不足"时
+- 不对 `<w:t>` 做 namespace-aware XML 解析 —— 简历模板的 namespace prefix 经常被工具改写（`<w:t>` / `<w14:t>` / 带 `xml:space`），正则比 ElementTree 更鲁棒
+- 阈值 50 字符 —— 真正的空 docx 会落到 0–10 字符，有标题但无正文的会落到 30–50；阈值 50 能区分"几乎空"和"全文本"
+
+---
+
+#### B. PaddleOCR 图像 PDF 回退
+
+**根因**：智联 / BOSS 部分简历是"截屏拼接型" PDF（HTML 简历转 PDF 时把页面整体渲染成位图嵌入），pypdf/pymupdf 抽不出文本，进入 AI 解析时整份 prompt 都是无内容字段，AI 输出 nullable 全空 → pydantic 校验失败 → 失败桶。
+
+**修复**：
+
+新增 `recruitment_assistant/parsers/ocr_service.py`，作为**可选模块**通过 `pip install ".[ocr]"` 启用。核心结构：
+
+| 函数 | 作用 |
+|---|---|
+| `is_paddleocr_available()` | 延迟检查 + 缓存，未安装时不抛错只返回 False |
+| `_get_ocr()` | PaddleOCR 单例懒加载，逐级尝试 4 套构造参数兼容 2.x / 3.x |
+| `_cache_path(pdf)` | `<pdf>.ocr.txt` 同目录缓存路径 |
+| `_extract_text_from_paddle_result()` | 兼容 3.x `OCRResult.rec_texts` + 2.x 嵌套 list `[[box, (text, conf)], ...]` |
+| `ocr_pdf_to_text(pdf, log, use_cache, dpi=200)` | 主入口：命中缓存直接返回；否则 pymupdf 渲染每页 → PaddleOCR.predict → 拼接 + 写回 `.ocr.txt` |
+
+`app/pages/07_简历管理.py` 在 `raw_text = extract_text(path)` 后加 OCR 回退分支（PDF 且 `< 200` 字符时触发）：
+
+```python
+if path.suffix.lower() == ".pdf" and len(raw_text.strip()) < 200:
+    from recruitment_assistant.parsers.ocr_service import (
+        is_paddleocr_available, ocr_pdf_to_text,
+    )
+    log(f"           🖼️ PDF 文本过短（{len(raw_text.strip())} 字符），疑似图像简历，启动 OCR 回退…")
+    if not is_paddleocr_available():
+        log("           ⚠️ PaddleOCR 未安装（pip install paddlepaddle paddleocr），跳过 OCR")
+    else:
+        try:
+            ocr_text = ocr_pdf_to_text(path, log=log)
+            if len(ocr_text.strip()) > len(raw_text.strip()):
+                log(f"           ✅ OCR 完成，得到 {len(ocr_text)} 字符")
+                raw_text = ocr_text
+            else:
+                log("           ⚠️ OCR 未识别出更多文本")
+        except Exception as exc:
+            log(f"           ❌ OCR 异常：{exc}")
+```
+
+**Windows 部署痛点（已沉淀到 memory）**：
+
+- `paddlepaddle` 3.3.x 系列（含 3.3.1）在 Windows 上有 PIR/OneDNN 不兼容 bug：`NotImplementedError: ConvertPirAttribute2RuntimeAttribute not support [pir::ArrayAttribute<pir::DoubleAttribute>]`。环境变量 `FLAGS_use_mkldnn=0` / `FLAGS_enable_pir_in_executor=0` 不能绕过。
+- 强制锁定 `paddlepaddle==3.0.0`，并补装 `decorator>=5.3.0`、`astor>=0.8.1`（3.3.x 自带这两个间接依赖，3.0.0 需要显式装）。
+- `pyproject.toml` 新增 `[project.optional-dependencies.ocr]`：
+
+```toml
+ocr = [
+    "paddlepaddle==3.0.0",
+    "paddleocr>=3.5.0",
+    "decorator>=5.3.0",
+    "astor>=0.8.1",
+]
+```
+
+模型首次自动下载到 `C:\Users\<user>\.paddlex\official_models\`（PP-OCRv5_server_det + rec + textline_ori + UVDoc + doc_ori，合计约 200 MB+）。单页 CPU 模式 20–100 秒（首次含模型加载），后续 < 30 秒；命中 `.ocr.txt` 缓存直接读，二次扫描 0 秒。
+
+---
+
+#### C. 超长图简历跳过策略
+
+**问题**：周辉.pdf 实测物理尺寸 539 × 13177 pt（约 4.65 米高的屏滚截图）。dpi=200 渲染 → 1498 × 36604 像素，触发 OpenCV warpPerspective 的 `dst.cols < SHRT_MAX` (32767) 断言。中间尝试过 `text_det_limit_side_len=8000` 放宽 PaddleOCR 内置 4000 上限 + 自适应 dpi + 分段 OCR，但**这类长图本身识别价值低**：PaddleOCR 强缩放后行高失真，输出准确率掉到几乎不可用。
+
+**修复**：
+
+`ocr_service.py` 设 `SKIP_LONG_PAGE_PT = 8000`（标准 A4 仅 595 × 842 pt，阈值已经很宽松），超过直接跳过该页 + log 提示：
+
+```python
+SKIP_LONG_PAGE_PT = 8000
+for idx, page in enumerate(doc, 1):
+    max_pt = max(page.rect.width, page.rect.height)
+    if max_pt > SKIP_LONG_PAGE_PT:
+        skipped += 1
+        if log:
+            log(f"           ⏭️ 第 {idx}/{page_count} 页物理尺寸过大（最长边 {max_pt:.0f}pt > {SKIP_LONG_PAGE_PT}pt），跳过 OCR")
+        continue
+    ...
+if skipped == page_count and page_count > 0 and log:
+    log(f"           ⚠️ {page_count} 页全部因尺寸过大被跳过，OCR 未产出文本")
+```
+
+周辉.pdf 实测：单页判定耗时 4.2 秒（仅 pymupdf 打开 + 量尺寸），不进入渲染 → 不触发 OpenCV 断言 → 优雅降级回失败桶。
+
+---
+
+#### D. PaddleOCR 2.x / 3.x 双兼容
+
+PaddleOCR 在 3.x 重写了 API，参数名和返回结构都变了：
+
+| 方面 | 2.x | 3.x |
+|---|---|---|
+| 方向检测开关 | `use_angle_cls=True` | `use_textline_orientation=True` |
+| 日志开关 | `show_log=False` | 已移除（传入会 `ValueError`）|
+| 调用方法 | `ocr.ocr(arr, cls=True)` | `ocr.predict(arr)` |
+| 返回结构 | 嵌套 list `[[ [box, (text, conf)], ... ]]` | `OCRResult` 对象，`rec_texts` / `rec_scores` / `rec_polys` 键 |
+| 长边限制 | 内部默认 4000 | `text_det_limit_side_len=8000` 可放宽 |
+
+`_get_ocr()` 用 4 套 kwargs 逐级 try 兼容：
+
+```python
+for kwargs in (
+    {"lang": "ch", "use_textline_orientation": True, "text_det_limit_side_len": 8000},  # 3.x 放宽长边
+    {"lang": "ch", "use_textline_orientation": True},                                    # 3.x 标准
+    {"lang": "ch", "use_angle_cls": True, "show_log": False},                            # 2.x
+    {"lang": "ch"},                                                                       # minimal
+):
+    try:
+        _ocr_instance = PaddleOCR(**kwargs)
+        return _ocr_instance
+    except (TypeError, ValueError):
+        continue
+```
+
+`_extract_text_from_paddle_result()` 同样两路兼容 —— 优先尝试 `page["rec_texts"]` / `getattr(page, "rec_texts", None)`（3.x），否则 fallback 到 `isinstance(page, list)` 走嵌套 tuple 拆解（2.x）。
+
+---
+
+#### 同批次扩展端 v2.37.0 → v2.38.0（三联升版）
+
+借这次发版顺手做了一轮扩展端日志降噪 + 死代码清理：
+
+- `chrome_extension/content.js` 2.37.0 → 2.38.0：UI 重复 log demote 到 debug（`console.debug` 仅 stderr 不进采集面板）；删除 `isInvalidCandidateNameToken` stub（早期占位函数，从未被调用）。
+- `chrome_extension/manifest.json` 同步 bump。
+- `recruitment_assistant/services/extension_contract.py::EXPECTED_CONTENT_SCRIPT_VERSION` 同步 `"2.38.0"`，保证 bridge `_check_content_script_version` 启动时不打 mismatch warning。
+- `recruitment_assistant/services/boss_ws_bridge.py` v2.03.0 → v2.04.0：UI 日志分级修正（info → UI、debug → stderr only），降低 BOSS 沟通中页面长时间运行时的重复回放噪音。
+
+> 三联升版机制（content.js + manifest + extension_contract）是从早期"Chrome 不重载扩展导致版本不一致 + bridge 不输出 mismatch warning"的事故沉淀下来的硬规则 —— 任一文件改动都必须升对应版本号常量。
+
+---
+
+### 验证
+
+- 任珮瑜.docx → 重跑 07 简历管理扫描，从"空白/损坏"桶 → "AI 解析成功"。
+- 文国斌.pdf → 第一次 OCR 70 秒（含 PaddleOCR 模型加载 + 单页识别）→ 0.95 秒命中 `.ocr.txt` 缓存。
+- 周辉.pdf → 单页 4.2 秒判定为超长跳过，输出 `⏭️ 第 1/1 页物理尺寸过大（最长边 13177pt > 8000pt），跳过 OCR` + `⚠️ 1 页全部因尺寸过大被跳过`，降级回失败桶不污染。
+- 三平台 bridge 启动均无 content script version mismatch warning。
+
+### 设计取舍
+
+- **OCR 做成可选模块（`pip install ".[ocr]"`）而不是必装**：paddlepaddle 体积 600 MB+，模型再 200 MB+，纯文本简历用户不应被强制下载。`is_paddleocr_available()` 优雅降级 + UI 日志明确提示安装命令。
+- **OCR 阈值定 200 字符（不是 50）**：50 字符是 docx 兜底阈值（区分"几乎空"和"有正文"）；OCR 触发阈值要更宽松一些，因为 pypdf 偶尔从图像 PDF 里抠出十几个字符的水印/页眉，仍然属于"识别失败"应进 OCR。200 字符约等于一份正常简历前两行（姓名+联系方式+教育起始）的长度。
+- **OCR 缓存写到 PDF 同目录而不是 `data/cache/`**：用户手动管理简历文件时缓存跟随，删除 PDF 时缓存随之消失，不需要额外清理任务。
+- **超长图阈值 8000pt（不是按像素）**：物理尺寸是 PaddleOCR 输入前就能拿到的稳定信号，不依赖 dpi；像素阈值会随 dpi 浮动需要复杂换算。8000pt ≈ 2.82 米，已经远超任何合理简历版面。

@@ -5,10 +5,15 @@
 等 Phase 4 学习模式起来后再补 qiancheng 专属事件 case。
 """
 
+import asyncio
 import json
+import re
 import shutil
+import subprocess
+import sys
 import threading
 from collections import Counter
+from concurrent.futures import Future
 from datetime import datetime
 from hashlib import sha256
 from pathlib import Path
@@ -24,10 +29,14 @@ from recruitment_assistant.storage.models import CrawlTask
 from recruitment_assistant.utils.hash_utils import text_hash
 from recruitment_assistant.utils.snapshot_utils import safe_filename
 
+from recruitment_assistant.services.test_run_watchdog import WatchdogState
+from recruitment_assistant.services.extension_contract import (
+    EXPECTED_EXTENSION_VERSION as QIANCHENG_EXTENSION_EXPECTED_VERSION,
+    EXPECTED_CONTENT_SCRIPT_VERSION as QIANCHENG_CONTENT_SCRIPT_EXPECTED_VERSION,
+)
 
-QIANCHENG_BRIDGE_VERSION = "1.8.0"
-QIANCHENG_EXTENSION_EXPECTED_VERSION = "1.86.0"
-QIANCHENG_CONTENT_SCRIPT_EXPECTED_VERSION = "1.86.0"
+
+QIANCHENG_BRIDGE_VERSION = "1.16.0"
 
 
 class QianchengWSBridge:
@@ -39,7 +48,11 @@ class QianchengWSBridge:
         self._seen_skip_records: set[str] = set()
         self._recent_ui_log_keys: dict[str, float] = {}
         self._saved_resume_hash_signatures: dict[str, str] = {}
+        self._talking_position_by_sig: dict[str, str] = {}
         self._collect_timer: threading.Timer | None = None
+        self._watchdog: WatchdogState = WatchdogState()
+        self._watchdog_task: "Future[None] | None" = None  # concurrent.futures.Future from run_coroutine_threadsafe
+        self._watchdog_poll_interval: float = 5.0
 
         self.runtime_state: dict[str, Any] = {
             "running": False,
@@ -85,6 +98,9 @@ class QianchengWSBridge:
         self._seen_skip_records.clear()
         self._recent_ui_log_keys.clear()
         self._saved_resume_hash_signatures.clear()
+        self._talking_position_by_sig.clear()
+        self._stop_watchdog_loop()
+        self._watchdog.reset()
         self.runtime_state.update({
             "running": False,
             "paused": False,
@@ -252,6 +268,7 @@ class QianchengWSBridge:
     def _on_task_finished(self, status: str) -> None:
         """采集任务收尾钩子：关闭弹窗、对账 Chrome 下载目录、输出本轮指标。"""
         self._cancel_collect_timer()
+        self._stop_watchdog_loop()
         run_id = self.runtime_state.get("run_id", "")
 
         # 1) 通知扩展关闭所有简历预览弹窗（扩展端 1.67.0 暂不识别此指令，待后续放开扩展限制时落地）
@@ -443,6 +460,7 @@ class QianchengWSBridge:
         self._create_crawl_task(config)
         self._log_task_initialization(config, collect_mode, collect_minutes)
         command = {"type": "start_collect", "config": config, "run_id": self.runtime_state.get("run_id", "")}
+        self._start_watchdog_loop()
         self.ws_server.send_command(command)
         self._write_event_log("command_sent", command)
         self._log("info", f"下载前去重数据已下发: key={len(config['boss_candidate_keys'])} 条；签名={len(config['boss_candidate_signatures'])} 条")
@@ -506,6 +524,7 @@ class QianchengWSBridge:
         self.ws_server.send_command(command)
         self._write_event_log("command_sent", command)
         self._log("info", "停止指令已下发")
+        self._stop_watchdog_loop()
 
     def probe_page(self) -> None:
         command = {"type": "probe_page", "run_id": self.runtime_state.get("run_id", "")}
@@ -585,6 +604,12 @@ class QianchengWSBridge:
         if event_type not in noisy_events:
             self._write_event_log("extension_event", {"type": event_type, "data": data})
 
+        candidate_id = str(data.get("candidate_id") or "")
+        misroute_events = self._watchdog.on_event(event_type, candidate_id, data)
+        for me in misroute_events:
+            self._log("error", f"⚠️ 学习模式误进 [{me['kind']}]：{me.get('candidate_signature', '?')} — {me['note']}")
+            self._write_event_log("learning_misroute_detected", me)
+
         match event_type:
             case "boss_content_script_collect_started":
                 version = data.get("content_script_version", "?")
@@ -656,6 +681,28 @@ class QianchengWSBridge:
                     self._log("highlight", "🎉 7 步学习完成。请在 Chrome F12 → Application → Local Storage → ehire.51job.com 复制 8 个 qiancheng_* key 的 JSON 值发给开发者。")
                 else:
                     self._log("warning", "学习结束但部分 key 未捕获，建议在 ehire 页 F12 Console 手动删除 qiancheng_* localStorage key 后重做。")
+            case "qiancheng_navigation_status":
+                # 内容脚本 v2.30.0：每轮采集启动强制点击「人才沟通」→「沟通中」后回报状态。
+                # 关键词用「已进入沟通中页面」/「导航失败」，避开「沟通职位」以免日志混色。
+                status = data.get("status", "?")
+                route = data.get("route", "")
+                if status == "on_chatting_page":
+                    tab_active = bool(data.get("tab_active"))
+                    items = data.get("list_items", 0)
+                    route_hint = bool(data.get("route_hint"))
+                    self._log(
+                        "info",
+                        f"已进入沟通中页面：route={route}；tab_active={tab_active}；list_items={items}；route_hint={route_hint}",
+                    )
+                else:
+                    reason = data.get("reason", "unknown")
+                    tab_found = bool(data.get("tab_found"))
+                    tab_active = bool(data.get("tab_active"))
+                    items = data.get("list_items", 0)
+                    self._log(
+                        "warning",
+                        f"导航失败（未确认进入沟通中页面）：reason={reason}；route={route}；tab_found={tab_found}；tab_active={tab_active}；list_items={items}",
+                    )
             case "extension_disconnected":
                 self.runtime_state["extension_connected"] = False
                 self.runtime_state["page_ready"] = False
@@ -683,6 +730,24 @@ class QianchengWSBridge:
                 elapsed = data.get("elapsed_ms")
                 elapsed_text = f"；识别耗时={elapsed}ms" if elapsed is not None else ""
                 self._log("info", f"点击候选人: {sig} (#{data.get('index', 0)}){elapsed_text}")
+            case "qiancheng_talking_position":
+                sig = data.get("candidate_signature", "?")
+                raw = (data.get("raw") or "").strip()
+                simplified = (data.get("simplified") or "").strip()
+                if sig and simplified:
+                    self._talking_position_by_sig[sig] = simplified
+                self._log("info", f"识别沟通职位: {sig}；原文={raw}；简化={simplified}")
+            case "qiancheng_talking_position_skip":
+                sig = data.get("candidate_signature", "?")
+                reason = data.get("reason", "?")
+                raw = (data.get("raw") or "").strip()
+                # selector 已确认为 #sensor_Bchatinfo_switch（v2.29.0），默认静默到 debug；
+                # 仅当 raw 抓到但 simplify 后清空这种逻辑异常仍打 info 级，便于发现简化函数 bug。
+                raw_preview = raw[:30] if raw else "(空)"
+                if reason == "raw_empty_after_simplify":
+                    self._log("info", f"沟通职位简化后为空: {sig}；raw={raw_preview}")
+                else:
+                    logger.debug("沟通职位识别跳过: sig={} reason={} raw={}", sig, reason, raw_preview)
             case "resume_downloaded":
                 self._save_resume(data)
             case "candidate_skipped":
@@ -1008,6 +1073,7 @@ class QianchengWSBridge:
                         self._log("info", f"采集结束：{reason_text}；共下载 {total} 份简历；本次新增去重 {self.runtime_state.get('dedup_record_count', 0)} 位")
                 self.get_run_summary()
                 self._on_task_finished(final_status)
+                self._spawn_analyze_test_run()
             case "error":
                 if self.runtime_state.get("running"):
                     self._finish_crawl_task("failed", error_message=str(data.get("message", "未知错误")))
@@ -1053,6 +1119,17 @@ class QianchengWSBridge:
         if not text or text == "待识别":
             text = fallback
         return safe_filename(text, max_length=24)
+
+    @staticmethod
+    def _simplify_talking_position(raw: str) -> str:
+        if not raw:
+            return ""
+        s = re.sub(r"[（(][^）)]*[）)]", "", raw)
+        s = re.split(r"[/／]", s, maxsplit=1)[0]
+        s = s.strip()
+        if len(s) > 8:
+            s = s[:8]
+        return s
 
     def _build_boss_candidate_key(self, candidate_sig: str, candidate_info: dict[str, Any]) -> str:
         raw_name = candidate_info.get("name") or ""
@@ -1194,8 +1271,20 @@ class QianchengWSBridge:
                 name = self._normalize_resume_filename_part(candidate_info.get("name"), "未知姓名")
                 age = self._normalize_resume_filename_part(candidate_info.get("age"), "未知年龄")
                 education = self._normalize_resume_filename_part(candidate_info.get("education"), "未知学历")
+                talking_position_raw = (
+                    candidate_info.get("talking_position")
+                    or self._talking_position_by_sig.get(candidate_sig)
+                    or candidate_info.get("job_title")
+                    or ""
+                ).strip()
+                simplified_position = self._simplify_talking_position(talking_position_raw)
+                position_part = self._normalize_resume_filename_part(simplified_position, simplified_position) if simplified_position else ""
                 seq = self.runtime_state["downloaded_count"] + 1
-                filename_stem = f"{name}-{age}-{education}-51前程无忧-{now.strftime('%Y%m%d')}-{now.strftime('%H%M%S')}-{seq:03d}"
+                stem_parts = [name, age, education]
+                if position_part:
+                    stem_parts.append(position_part)
+                stem_parts.extend(["51前程无忧", now.strftime("%Y%m%d"), now.strftime("%H%M%S"), f"{seq:03d}"])
+                filename_stem = "-".join(stem_parts)
                 filename = f"{filename_stem}{suffix}"
 
                 target = target_dir / filename
@@ -1245,6 +1334,7 @@ class QianchengWSBridge:
                 final_filename = target.name
                 logger.debug("简历已保存: {}", final_filename)
                 self.runtime_state["downloaded_count"] = seq
+                self._log("success", f"文件下载成功并保存归档: {final_filename}")
                 record = {
                     "signature": candidate_sig,
                     "info": candidate_info,
@@ -1399,3 +1489,96 @@ class QianchengWSBridge:
                 f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
         except Exception as exc:
             logger.warning("写入 Qiancheng Extension 测试日志失败: {}", exc)
+
+    def _start_watchdog_loop(self) -> None:
+        """在 ws_server 的 asyncio loop 上启动看门狗巡检任务。"""
+        loop = self.ws_server.event_loop
+        if loop is None:
+            self._log("warning", "看门狗未启动：ws_server 事件循环未就绪")
+            return
+        # 总是刷新全局起点：避免 start_collect 被重复调用时残留旧时间戳触发误判
+        self._watchdog.global_last_event_at = datetime.now()
+        if self._watchdog_task is not None and not self._watchdog_task.done():
+            return
+
+        bridge = self
+
+        async def _watch():
+            try:
+                while bridge.runtime_state.get("running"):
+                    await asyncio.sleep(bridge._watchdog_poll_interval)
+                    bridge._poll_watchdog()
+            except asyncio.CancelledError:
+                pass
+
+        try:
+            self._watchdog_task = asyncio.run_coroutine_threadsafe(_watch(), loop)
+            self._write_event_log("watchdog_started", {
+                "candidate_timeout_s": self._watchdog.candidate_timeout,
+                "global_timeout_s": self._watchdog.global_timeout,
+            })
+        except Exception as exc:
+            self._log("warning", f"看门狗启动失败: {exc}")
+            self._watchdog_task = None
+
+    def _stop_watchdog_loop(self) -> None:
+        task = self._watchdog_task
+        if task is not None:
+            try:
+                task.cancel()
+            except Exception:
+                pass
+        self._watchdog_task = None
+
+    def _poll_watchdog(self) -> None:
+        # 候选人级超时
+        for to in self._watchdog.check_candidates():
+            self._log(
+                "highlight",
+                f"⚠️ 看门狗：候选人 {to.candidate_id} 已 {to.elapsed_seconds:.0f}s 无事件"
+                f"（最后事件 {to.last_event_type}），强制跳过",
+            )
+            self._write_event_log("watchdog_candidate_timeout", {
+                "candidate_id": to.candidate_id,
+                "last_event_type": to.last_event_type,
+                "elapsed_seconds": round(to.elapsed_seconds, 1),
+            })
+            command = {
+                "type": "skip_current_candidate",
+                "data": {"candidate_id": to.candidate_id, "reason": "watchdog"},
+                "run_id": self.runtime_state.get("run_id", ""),
+            }
+            try:
+                self.ws_server.send_command(command)
+            except Exception as exc:
+                self._log("warning", f"看门狗 skip 指令下发失败: {exc}")
+        # 全局级超时
+        idle = self._watchdog.check_global()
+        if idle is not None:
+            self._log("error", f"⚠️ 看门狗：全局 {idle:.0f}s 无事件，已强制终止采集")
+            self._write_event_log("watchdog_global_idle_timeout", {"elapsed_seconds": round(idle, 1)})
+            try:
+                self._finish_crawl_task("failed", error_message="global_idle_timeout")
+            except Exception as exc:
+                self._log("warning", f"看门狗终止采集失败: {exc}")
+            self.runtime_state["running"] = False
+            self._stop_watchdog_loop()
+
+    def _spawn_analyze_test_run(self) -> None:
+        log_file = self.runtime_state.get("log_file", "")
+        if not log_file:
+            return
+        script_path = Path("scripts/analyze_test_run.py")
+        if not script_path.exists():
+            self._write_event_log("analyze_test_run_skipped", {"reason": "script_not_found", "expected_path": str(script_path)})
+            return
+        try:
+            subprocess.Popen(
+                [sys.executable, str(script_path), log_file],
+                cwd=str(Path.cwd()),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            self._write_event_log("analyze_test_run_spawned", {"log_file": log_file})
+        except Exception as exc:
+            self._log("warning", f"启动 analyze_test_run.py 失败: {exc}")

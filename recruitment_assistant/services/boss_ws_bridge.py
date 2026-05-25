@@ -1,9 +1,14 @@
 """Bridge between WebSocket events and Boss business logic."""
 
+import asyncio
 import json
+import re
 import shutil
+import subprocess
+import sys
 import threading
 from collections import Counter
+from concurrent.futures import Future
 from datetime import datetime
 from hashlib import sha256
 from pathlib import Path
@@ -19,10 +24,14 @@ from recruitment_assistant.storage.models import CrawlTask
 from recruitment_assistant.utils.hash_utils import text_hash
 from recruitment_assistant.utils.snapshot_utils import safe_filename
 
+from recruitment_assistant.services.test_run_watchdog import WatchdogState
+from recruitment_assistant.services.extension_contract import (
+    EXPECTED_EXTENSION_VERSION as BOSS_EXTENSION_EXPECTED_VERSION,
+    EXPECTED_CONTENT_SCRIPT_VERSION as BOSS_CONTENT_SCRIPT_EXPECTED_VERSION,
+)
 
-BOSS_BRIDGE_VERSION = "1.94.0"
-BOSS_EXTENSION_EXPECTED_VERSION = "1.86.0"
-BOSS_CONTENT_SCRIPT_EXPECTED_VERSION = "1.86.0"
+
+BOSS_BRIDGE_VERSION = "2.04.0"
 
 
 class BossWSBridge:
@@ -34,7 +43,11 @@ class BossWSBridge:
         self._seen_skip_records: set[str] = set()
         self._recent_ui_log_keys: dict[str, float] = {}
         self._saved_resume_hash_signatures: dict[str, str] = {}
+        self._talking_position_by_sig: dict[str, str] = {}
         self._collect_timer: threading.Timer | None = None
+        self._watchdog: WatchdogState = WatchdogState()
+        self._watchdog_task: "Future[None] | None" = None  # concurrent.futures.Future from run_coroutine_threadsafe
+        self._watchdog_poll_interval: float = 5.0
 
         self.runtime_state: dict[str, Any] = {
             "running": False,
@@ -46,6 +59,7 @@ class BossWSBridge:
             "downloaded_count": 0,
             "skipped_count": 0,
             "dedup_record_count": 0,
+            "dedup_record_count_baseline": 0,
             "resume_request_count": 0,
             "current_index": 0,
             "scanned_count": 0,
@@ -80,6 +94,9 @@ class BossWSBridge:
         self._seen_skip_records.clear()
         self._recent_ui_log_keys.clear()
         self._saved_resume_hash_signatures.clear()
+        self._talking_position_by_sig.clear()
+        self._stop_watchdog_loop()
+        self._watchdog.reset()
         self.runtime_state.update({
             "running": False,
             "paused": False,
@@ -101,6 +118,8 @@ class BossWSBridge:
             "task_status": "pending",
         })
         self._seen_candidate_records.update(self._load_boss_candidate_keys())
+        # 初始化"本轮新增"基线为当前 DB 总数；UI 计算 added = 当前总数 - baseline
+        self.runtime_state["dedup_record_count_baseline"] = self._load_boss_dedup_record_count()
         self._write_event_log("run_started", {"run_id": run_id})
         self._log("info", f"新测试轮次已创建: {run_id}")
         self._log(
@@ -247,6 +266,7 @@ class BossWSBridge:
     def _on_task_finished(self, status: str) -> None:
         """采集任务收尾钩子：关闭弹窗、对账 Chrome 下载目录、输出本轮指标。"""
         self._cancel_collect_timer()
+        self._stop_watchdog_loop()
         run_id = self.runtime_state.get("run_id", "")
 
         # 1) 通知扩展关闭所有简历预览弹窗（扩展端 1.67.0 暂不识别此指令，待后续放开扩展限制时落地）
@@ -414,9 +434,12 @@ class BossWSBridge:
         self.runtime_state["candidates"] = []
         self.runtime_state["skip_reason_counts"] = {}
         self.runtime_state["task_id"] = None
-        self.runtime_state["task_started_at"] = ""
+        # 任务开始时间保底：先用当前时间，后续 _create_crawl_task 成功后会覆盖为 DB 任务 started_at
+        self.runtime_state["task_started_at"] = datetime.now().isoformat(timespec="seconds")
         self.runtime_state["task_planned_count"] = 0
         self.runtime_state["task_status"] = "pending"
+        # 本轮新增基线 = 启动时 DB 总记录数；UI 计算 added = current - baseline
+        self.runtime_state["dedup_record_count_baseline"] = self._load_boss_dedup_record_count()
         boss_candidate_keys = self._load_boss_candidate_keys()
         boss_candidate_signatures = self._load_boss_candidate_signatures()
         self._seen_candidate_records.update(boss_candidate_keys)
@@ -438,6 +461,7 @@ class BossWSBridge:
         self._create_crawl_task(config)
         self._log_task_initialization(config, collect_mode, collect_minutes)
         command = {"type": "start_collect", "config": config, "run_id": self.runtime_state.get("run_id", "")}
+        self._start_watchdog_loop()
         self.ws_server.send_command(command)
         self._write_event_log("command_sent", command)
         self._log("info", f"BOSS 下载前去重数据已下发: key={len(config['boss_candidate_keys'])} 条；签名={len(config['boss_candidate_signatures'])} 条")
@@ -501,6 +525,7 @@ class BossWSBridge:
         self.ws_server.send_command(command)
         self._write_event_log("command_sent", command)
         self._log("info", "停止指令已下发")
+        self._stop_watchdog_loop()
 
     def probe_page(self) -> None:
         command = {"type": "probe_page", "run_id": self.runtime_state.get("run_id", "")}
@@ -535,6 +560,11 @@ class BossWSBridge:
             payload["data"].update(extra)
         self.ws_server.send_command(payload)
         self._write_event_log("resume_persist_ack_sent", payload["data"])
+        # 链路诊断保留进 JSONL，UI 不再打扰
+        logger.debug(
+            "持久化 ack 已下发: sig={} 状态={} request_id={}",
+            candidate_sig, status, download_request_id or "(空)",
+        )
 
     def get_run_summary(self) -> dict[str, Any]:
         candidates = self.runtime_state.get("candidates", [])
@@ -576,9 +606,26 @@ class BossWSBridge:
             "resume_attachment_clicked",
             "resume_preview_detected",
             "resume_preview_info_extract_success",
+            "boss_talking_position",
+            "boss_talking_position_skip",
+            "dom_text_download_url_scan_started",
+            "dom_text_download_url_not_found",
+            "boss_svg_download_icon_scan_started",
+            "boss_svg_download_icon_not_found",
+            "download_button_candidates_detailed",
+            "boss_diag",
+            "stale_pdf_preview_frame_removed",
+            "pdf_iframe_resource_id_claimed",
+            "persist_completion_credited",
         }
         if event_type not in noisy_events:
             self._write_event_log("extension_event", {"type": event_type, "data": data})
+
+        candidate_id = str(data.get("candidate_id") or "")
+        misroute_events = self._watchdog.on_event(event_type, candidate_id, data)
+        for me in misroute_events:
+            self._log("error", f"⚠️ 学习模式误进 [{me['kind']}]：{me.get('candidate_signature', '?')} — {me['note']}")
+            self._write_event_log("learning_misroute_detected", me)
 
         match event_type:
             case "boss_content_script_collect_started":
@@ -590,21 +637,24 @@ class BossWSBridge:
                     self._log("warning", f"BOSS 内容脚本版本不匹配: 当前={version}；期望={BOSS_CONTENT_SCRIPT_EXPECTED_VERSION}，请刷新 BOSS 页面")
             case "boss_pre_dedup_checked":
                 sig = data.get("candidate_signature", "未知")
-                key_count = data.get("key_count", 0)
-                signature_count = data.get("signature_count", 0)
                 key_hit = bool(data.get("key_hit"))
                 signature_hit = bool(data.get("signature_hit"))
                 elapsed = data.get("elapsed_ms")
-                elapsed_text = f"；耗时={elapsed}ms" if elapsed is not None else ""
                 hit = key_hit or signature_hit
-                self._log("info", f"BOSS 下载前去重检查: {sig}；结果={'命中' if hit else '未命中'}{elapsed_text}")
+                # 命中走 _record_skip → "跳过: X (BOSS 去重命中...)" 已覆盖；未命中则候选人会进入下一步处理，自然有后续日志。
+                # 这一行去重检查本身降为 debug，避免每位候选人额外占一行 UI。
+                logger.debug("BOSS 下载前去重检查: sig={} 结果={} 耗时={}ms", sig, "命中" if hit else "未命中", elapsed)
             case "boss_resume_button_lookup_started":
                 pass
             case "extension_connected":
                 version = data.get("version", "")
                 self.runtime_state["extension_connected"] = True
                 self.runtime_state["extension_version"] = version
-                self._log("info", f"扩展已连接 v{version or '?'}；期望版本={BOSS_EXTENSION_EXPECTED_VERSION}")
+                self.runtime_state["last_disconnect_reason"] = ""
+                last_state = self.runtime_state.get("_last_connection_log_state")
+                if last_state != "connected":
+                    self._log("info", f"扩展已连接 v{version or '?'}；期望版本={BOSS_EXTENSION_EXPECTED_VERSION}")
+                    self.runtime_state["_last_connection_log_state"] = "connected"
                 if version and version != BOSS_EXTENSION_EXPECTED_VERSION:
                     self._log("warning", f"扩展版本不匹配: 当前={version}；期望={BOSS_EXTENSION_EXPECTED_VERSION}，请在 chrome://extensions/ 重新加载扩展")
             case "heartbeat":
@@ -615,12 +665,28 @@ class BossWSBridge:
             case "extension_disconnected":
                 self.runtime_state["extension_connected"] = False
                 self.runtime_state["page_ready"] = False
+                self.runtime_state["last_disconnect_reason"] = str(data.get("reason", "unknown") or "unknown")
                 was_running = bool(self.runtime_state.get("running"))
                 self.runtime_state["running"] = False
                 self.runtime_state["paused"] = False
                 if was_running:
                     self._finish_crawl_task("failed", error_message=f"扩展连接已断开: {data.get('reason', 'unknown')}")
-                self._log("error", f"扩展连接已断开: {data.get('reason', 'unknown')}")
+                last_state = self.runtime_state.get("_last_connection_log_state")
+                if last_state != "disconnected":
+                    self._log("error", f"扩展连接已断开: {data.get('reason', 'unknown')}")
+                    self.runtime_state["_last_connection_log_state"] = "disconnected"
+            case "settings_precheck_failed":
+                reason = data.get("reason", "unknown")
+                hint = data.get("hint", "")
+                popups_setting = data.get("popups_setting", "")
+                self._log("error", f"采集前置检查失败：{reason}（popups={popups_setting}）。{hint}")
+                self.runtime_state["running"] = False
+                self.runtime_state["paused"] = False
+                self._finish_crawl_task("failed", error_message=f"settings_precheck_failed: {reason}")
+            case "download_prompt_suspected":
+                hint = data.get("hint", "")
+                waited = data.get("waited_ms", 0)
+                self._log("error", f"疑似下载前询问保存位置（已等 {waited}ms 未落盘）。{hint}")
 
             case "page_ready":
                 self.runtime_state["page_ready"] = True
@@ -639,6 +705,17 @@ class BossWSBridge:
                 elapsed = data.get("elapsed_ms")
                 elapsed_text = f"；识别耗时={elapsed}ms" if elapsed is not None else ""
                 self._log("info", f"点击候选人: {sig} (#{data.get('index', 0)}){elapsed_text}")
+            case "boss_talking_position":
+                sig = data.get("candidate_signature", "?")
+                raw = (data.get("raw") or "").strip()
+                simplified = (data.get("simplified") or "").strip()
+                if sig and simplified:
+                    self._talking_position_by_sig[sig] = simplified
+                logger.debug("沟通职位: sig={} 原文={} 简化={}", sig, raw, simplified)
+            case "boss_talking_position_skip":
+                sig = data.get("candidate_signature", "?")
+                reason = data.get("reason", "?")
+                logger.debug("沟通职位未找到: sig={} reason={}", sig, reason)
             case "resume_downloaded":
                 self._save_resume(data)
             case "candidate_skipped":
@@ -781,14 +858,14 @@ class BossWSBridge:
                 self._log("info", f"跳过 iframe 直接下载: {sig}；原因={data.get('reason', '')}")
             case "dom_text_download_url_scan_started":
                 sig = data.get("candidate_signature", "未知")
-                self._log("info", f"扫描 dom_text 弹窗下载链接: {sig}")
+                logger.debug("扫描 dom_text 弹窗下载链接: sig={}", sig)
             case "dom_text_download_url_found":
                 sig = data.get("candidate_signature", "未知")
                 source = data.get("source", "")
                 self._log("highlight", f"dom_text 弹窗发现下载链接: {sig}；来源={source}")
             case "dom_text_download_url_not_found":
                 sig = data.get("candidate_signature", "未知")
-                self._log("info", f"dom_text 弹窗未发现下载链接: {sig}；锚标签={data.get('anchor_count', 0)}；Vue 元素={data.get('vue_element_count', 0)}")
+                logger.debug("dom_text 弹窗未发现下载链接: sig={} 锚={} vue={}", sig, data.get("anchor_count", 0), data.get("vue_element_count", 0))
             case "dom_text_direct_download_failed":
                 sig = data.get("candidate_signature", "未知")
                 self._log("error", f"dom_text 直接下载失败: {sig}；原因={data.get('reason', '')}")
@@ -815,14 +892,14 @@ class BossWSBridge:
                 self._log("error", f"Chrome 后台直接下载启动失败: {sig}；原因={data.get('reason', '')}")
             case "boss_svg_download_icon_scan_started":
                 sig = data.get("candidate_signature", "未知")
-                self._log("info", f"扫描 boss-svg 下载组件: {sig}")
+                logger.debug("扫描 boss-svg 下载组件: sig={}", sig)
             case "boss_svg_download_icon_found":
                 sig = data.get("candidate_signature", "未知")
                 path = str(data.get("component_path", ""))[:160]
                 self._log("highlight", f"命中 boss-svg 下载组件: {sig}；路径={path}")
             case "boss_svg_download_icon_not_found":
                 sig = data.get("candidate_signature", "未知")
-                self._log("info", f"boss-svg 下载组件未命中，尝试其他策略: {sig}")
+                logger.debug("boss-svg 下载组件未命中，尝试其他策略: sig={}", sig)
             case "boss_svg_download_icon_clicked":
                 sig = data.get("candidate_signature", "未知")
                 self._log("highlight", f"已点击 boss-svg 下载组件，等待 Chrome 下载事件: {sig}")
@@ -831,9 +908,9 @@ class BossWSBridge:
                 candidates = data.get("candidates") or []
                 if candidates:
                     top = candidates[0] or {}
-                    self._log("info", f"下载按钮候选: {sig}；数量={len(candidates)}；首选score={top.get('score', '')}；描述={str(top.get('text', ''))[:100]}")
+                    logger.debug("下载按钮候选: sig={} 数量={} 首选score={} 描述={}", sig, len(candidates), top.get("score", ""), str(top.get("text", ""))[:100])
                 else:
-                    self._log("info", f"下载按钮候选: {sig}；数量=0")
+                    logger.debug("下载按钮候选: sig={} 数量=0", sig)
             case "download_click_post_diagnostics":
                 sig = data.get("candidate_signature", "未知")
                 diagnostics = data.get("diagnostics") or {}
@@ -977,6 +1054,7 @@ class BossWSBridge:
                         self._log("info", f"采集结束：{reason_text}；共下载 {total} 份简历；本次新增去重 {self.runtime_state.get('dedup_record_count', 0)} 位")
                 self.get_run_summary()
                 self._on_task_finished(final_status)
+                self._spawn_analyze_test_run()
             case "error":
                 diag = data.get("diag")
                 diag_suffix = ""
@@ -993,17 +1071,17 @@ class BossWSBridge:
             case "boss_diag":
                 step = data.get("step", "")
                 if step == "chatting_tab":
-                    self._log("info", f"诊断: 沟通中标签点击结果={data.get('result')}；URL={data.get('url', '')}")
+                    logger.debug("诊断: 沟通中标签点击结果={} URL={}", data.get("result"), data.get("url", ""))
                 elif step == "retry_scan":
-                    self._log("info", f"诊断: 重试扫描 #{data.get('retry')}，找到候选人={data.get('found', 0)}")
+                    logger.debug("诊断: 重试扫描 #{} 找到候选人={}", data.get("retry"), data.get("found", 0))
                 else:
-                    self._log("info", f"诊断: {data}")
+                    logger.debug("诊断: {}", data)
             case "resume_persist_confirmed":
                 sig = data.get("candidate_signature", "未知")
                 strategy = data.get("strategy") or "?"
                 file_name = data.get("file") or ""
-                tail = f"；文件={file_name}" if file_name else ""
-                self._log("info", f"持久化确认: {sig}；策略={strategy}{tail}")
+                # 链路确认；"文件下载成功并保存归档"已在 success 级输出，UI 不再重复
+                logger.debug("持久化确认: sig={} 策略={} 文件={}", sig, strategy, file_name)
             case "resume_persist_rejected":
                 sig = data.get("candidate_signature", "未知")
                 status = data.get("status") or "?"
@@ -1016,7 +1094,7 @@ class BossWSBridge:
                 sig = data.get("candidate_signature") or "?"
                 owner = data.get("owner_signature") or "无归属"
                 rid = data.get("resource_id") or "(无ID)"
-                self._log("info", f"已强制移除旧 PDF iframe: 触发候选={sig}；资源ID={rid}；原归属={owner}")
+                logger.debug("已强制移除旧 PDF iframe: 触发候选={} 资源ID={} 原归属={}", sig, rid, owner)
             case "stale_pdf_preview_frame_remove_error":
                 self._log("warning", f"强制移除旧 PDF iframe 失败: {data.get('error', '未知错误')}")
             case "pdf_iframe_preview_skipped_owned_by_other":
@@ -1027,7 +1105,7 @@ class BossWSBridge:
             case "pdf_iframe_resource_id_claimed":
                 sig = data.get("candidate_signature") or "?"
                 rid = data.get("resource_id") or "?"
-                self._log("info", f"已绑定 iframe 资源ID: {sig} → {rid}")
+                logger.debug("已绑定 iframe 资源ID: {} → {}", sig, rid)
             case _:
                 logger.debug("未处理的扩展事件: {}", event_type)
 
@@ -1036,6 +1114,17 @@ class BossWSBridge:
         if not text or text == "待识别":
             text = fallback
         return safe_filename(text, max_length=24)
+
+    @staticmethod
+    def _simplify_talking_position(raw: str) -> str:
+        if not raw:
+            return ""
+        s = re.sub(r"[（(][^）)]*[）)]", "", raw)
+        s = re.split(r"[/／]", s, maxsplit=1)[0]
+        s = s.strip()
+        if len(s) > 8:
+            s = s[:8]
+        return s
 
     def _build_boss_candidate_key(self, candidate_sig: str, candidate_info: dict[str, Any]) -> str:
         raw_name = candidate_info.get("name") or ""
@@ -1059,6 +1148,14 @@ class BossWSBridge:
         except Exception as exc:
             self._log("warning", f"读取 BOSS 去重记录失败: {exc}")
             return set()
+
+    def _load_boss_dedup_record_count(self) -> int:
+        try:
+            with create_session() as session:
+                return BossCandidateRecordService(session).count_records("boss")
+        except Exception as exc:
+            self._log("warning", f"读取 BOSS 去重记录总数失败: {exc}")
+            return 0
 
     def _normalize_boss_candidate_signature(self, signature: str) -> str:
         parts = [part.strip() for part in str(signature or "").split("/")]
@@ -1098,6 +1195,12 @@ class BossWSBridge:
         gender = candidate_info.get("gender") if candidate_info.get("gender") not in {"", "待识别"} else None
         job_title = candidate_info.get("job_title") if candidate_info.get("job_title") not in {"", "待识别"} else None
         phone = candidate_info.get("phone") if candidate_info.get("phone") not in {"", "待识别"} else None
+        talking_position_raw = (
+            candidate_info.get("talking_position")
+            or self._talking_position_by_sig.get(candidate_sig)
+            or ""
+        ).strip()
+        talking_position = self._simplify_talking_position(talking_position_raw) or None
 
         with create_session() as session:
             service = BossCandidateRecordService(session)
@@ -1109,6 +1212,7 @@ class BossWSBridge:
                 name=name if name != "待识别" else None,
                 gender=gender,
                 job_title=job_title,
+                talking_position=talking_position,
                 phone=phone,
                 resume_file_name=file_name,
                 source_url=source_url,
@@ -1177,8 +1281,15 @@ class BossWSBridge:
                 name = self._normalize_resume_filename_part(candidate_info.get("name"), "未知姓名")
                 age = self._normalize_resume_filename_part(candidate_info.get("age"), "未知年龄")
                 education = self._normalize_resume_filename_part(candidate_info.get("education"), "未知学历")
+                talking_position_raw = (candidate_info.get("talking_position") or self._talking_position_by_sig.get(candidate_sig) or "").strip()
+                simplified_position = self._simplify_talking_position(talking_position_raw)
+                position_part = self._normalize_resume_filename_part(simplified_position, simplified_position) if simplified_position else ""
                 seq = self.runtime_state["downloaded_count"] + 1
-                filename_stem = f"{name}-{age}-{education}-BOSS直聘-{now.strftime('%Y%m%d')}-{now.strftime('%H%M%S')}-{seq:03d}"
+                stem_parts = [name, age, education]
+                if position_part:
+                    stem_parts.append(position_part)
+                stem_parts.extend(["BOSS直聘", now.strftime("%Y%m%d"), now.strftime("%H%M%S"), f"{seq:03d}"])
+                filename_stem = "-".join(stem_parts)
                 filename = f"{filename_stem}{suffix}"
 
                 target = target_dir / filename
@@ -1228,6 +1339,7 @@ class BossWSBridge:
                 final_filename = target.name
                 logger.debug("简历已保存: {}", final_filename)
                 self.runtime_state["downloaded_count"] = seq
+                self._log("success", f"文件下载成功并保存归档: {final_filename}")
                 record = {
                     "signature": candidate_sig,
                     "info": candidate_info,
@@ -1309,7 +1421,8 @@ class BossWSBridge:
         elif reason == "no_resume_attachment":
             pass
         if reason == "boss_dedup_hit":
-            self._log("info", f"BOSS 下载前去重命中，跳过附件识别: {candidate_sig}")
+            # "跳过: X (BOSS 去重命中, 已有简历记录)" 已由 _record_skip 输出，UI 无需再追打
+            logger.debug("BOSS 下载前去重命中，跳过附件识别: {}", candidate_sig)
         self._write_event_log("candidate_skipped_seen", {
             "signature": candidate_sig,
             "reason": reason,
@@ -1382,3 +1495,96 @@ class BossWSBridge:
                 f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
         except Exception as exc:
             logger.warning("写入 Boss Extension 测试日志失败: {}", exc)
+
+    def _start_watchdog_loop(self) -> None:
+        """在 ws_server 的 asyncio loop 上启动看门狗巡检任务。"""
+        loop = self.ws_server.event_loop
+        if loop is None:
+            self._log("warning", "看门狗未启动：ws_server 事件循环未就绪")
+            return
+        # 总是刷新全局起点：避免 start_collect 被重复调用时残留旧时间戳触发误判
+        self._watchdog.global_last_event_at = datetime.now()
+        if self._watchdog_task is not None and not self._watchdog_task.done():
+            return
+
+        bridge = self
+
+        async def _watch():
+            try:
+                while bridge.runtime_state.get("running"):
+                    await asyncio.sleep(bridge._watchdog_poll_interval)
+                    bridge._poll_watchdog()
+            except asyncio.CancelledError:
+                pass
+
+        try:
+            self._watchdog_task = asyncio.run_coroutine_threadsafe(_watch(), loop)
+            self._write_event_log("watchdog_started", {
+                "candidate_timeout_s": self._watchdog.candidate_timeout,
+                "global_timeout_s": self._watchdog.global_timeout,
+            })
+        except Exception as exc:
+            self._log("warning", f"看门狗启动失败: {exc}")
+            self._watchdog_task = None
+
+    def _stop_watchdog_loop(self) -> None:
+        task = self._watchdog_task
+        if task is not None:
+            try:
+                task.cancel()
+            except Exception:
+                pass
+        self._watchdog_task = None
+
+    def _poll_watchdog(self) -> None:
+        # 候选人级超时
+        for to in self._watchdog.check_candidates():
+            self._log(
+                "highlight",
+                f"⚠️ 看门狗：候选人 {to.candidate_id} 已 {to.elapsed_seconds:.0f}s 无事件"
+                f"（最后事件 {to.last_event_type}），强制跳过",
+            )
+            self._write_event_log("watchdog_candidate_timeout", {
+                "candidate_id": to.candidate_id,
+                "last_event_type": to.last_event_type,
+                "elapsed_seconds": round(to.elapsed_seconds, 1),
+            })
+            command = {
+                "type": "skip_current_candidate",
+                "data": {"candidate_id": to.candidate_id, "reason": "watchdog"},
+                "run_id": self.runtime_state.get("run_id", ""),
+            }
+            try:
+                self.ws_server.send_command(command)
+            except Exception as exc:
+                self._log("warning", f"看门狗 skip 指令下发失败: {exc}")
+        # 全局级超时
+        idle = self._watchdog.check_global()
+        if idle is not None:
+            self._log("error", f"⚠️ 看门狗：全局 {idle:.0f}s 无事件，已强制终止采集")
+            self._write_event_log("watchdog_global_idle_timeout", {"elapsed_seconds": round(idle, 1)})
+            try:
+                self._finish_crawl_task("failed", error_message="global_idle_timeout")
+            except Exception as exc:
+                self._log("warning", f"看门狗终止采集失败: {exc}")
+            self.runtime_state["running"] = False
+            self._stop_watchdog_loop()
+
+    def _spawn_analyze_test_run(self) -> None:
+        log_file = self.runtime_state.get("log_file", "")
+        if not log_file:
+            return
+        script_path = Path("scripts/analyze_test_run.py")
+        if not script_path.exists():
+            self._write_event_log("analyze_test_run_skipped", {"reason": "script_not_found", "expected_path": str(script_path)})
+            return
+        try:
+            subprocess.Popen(
+                [sys.executable, str(script_path), log_file],
+                cwd=str(Path.cwd()),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            self._write_event_log("analyze_test_run_spawned", {"log_file": log_file})
+        except Exception as exc:
+            self._log("warning", f"启动 analyze_test_run.py 失败: {exc}")

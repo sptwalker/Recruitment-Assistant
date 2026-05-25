@@ -124,6 +124,10 @@ class BossCandidateRecordService:
 
     def ensure_table(self) -> None:
         BossCandidateRecord.__table__.create(bind=engine, checkfirst=True)
+        # 启动自适应迁移：旧表可能没有 talking_position 列；幂等地补齐。
+        from recruitment_assistant.storage.db import _ensure_boss_candidate_record_columns
+
+        _ensure_boss_candidate_record_columns()
 
     def list_candidate_keys(self, platform_code: str = "boss") -> set[str]:
         self.ensure_table()
@@ -146,6 +150,63 @@ class BossCandidateRecordService:
         self.session.commit()
         return int(result.rowcount or 0)
 
+    def list_records_for_display(self, platform_code: str = "boss", limit: int = 5000) -> list[dict]:
+        """读取指定平台的全部 boss_candidate_record，按 first_seen_at 升序，返回 UI 渲染所需结构。
+
+        UI 列：序号 / 姓名 / 年龄 / 学历 / 沟通职位 / 电话 / 归档时间 / 简历文件名。
+        """
+        self.ensure_table()
+        stmt = (
+            select(BossCandidateRecord)
+            .where(BossCandidateRecord.platform_code == platform_code)
+            .order_by(BossCandidateRecord.first_seen_at.asc(), BossCandidateRecord.id.asc())
+            .limit(limit)
+        )
+        rows = list(self.session.scalars(stmt).all())
+
+        records: list[dict] = []
+        for index, row in enumerate(rows, start=1):
+            sig = row.candidate_signature or ""
+            parts = sig.split("/") if sig else []
+            age = parts[1] if len(parts) > 1 and parts[1] else "—"
+            education = parts[2] if len(parts) > 2 and parts[2] else "—"
+            first_seen = ""
+            if row.first_seen_at:
+                try:
+                    first_seen = row.first_seen_at.strftime("%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    first_seen = str(row.first_seen_at)
+            records.append({
+                "id": int(row.id),
+                "序号": index,
+                "姓名": row.name or "—",
+                "年龄": age,
+                "学历": education,
+                "沟通职位": row.talking_position or "—",
+                "电话": row.phone or "—",
+                "归档时间": first_seen,
+                "简历文件名": row.resume_file_name or "—",
+            })
+        return records
+
+    def delete_record_by_id(self, record_id: int) -> bool:
+        """按主键删除单条 boss_candidate_record。返回是否实际删除。"""
+        self.ensure_table()
+        result = self.session.execute(
+            delete(BossCandidateRecord).where(BossCandidateRecord.id == int(record_id))
+        )
+        self.session.commit()
+        return int(result.rowcount or 0) > 0
+
+    def delete_all_by_platform(self, platform_code: str) -> int:
+        """删除指定平台的全部已入库候选人记录。返回删除条数。"""
+        self.ensure_table()
+        result = self.session.execute(
+            delete(BossCandidateRecord).where(BossCandidateRecord.platform_code == platform_code)
+        )
+        self.session.commit()
+        return int(result.rowcount or 0)
+
     def upsert_candidate_record(
         self,
         *,
@@ -156,6 +217,7 @@ class BossCandidateRecordService:
         name: str | None = None,
         gender: str | None = None,
         job_title: str | None = None,
+        talking_position: str | None = None,
         phone: str | None = None,
         resume_file_name: str | None = None,
         source_url: str | None = None,
@@ -176,6 +238,7 @@ class BossCandidateRecordService:
             existing.name = existing.name or name
             existing.gender = existing.gender or gender
             existing.job_title = existing.job_title or job_title
+            existing.talking_position = existing.talking_position or talking_position
             existing.phone = existing.phone or phone
             existing.resume_file_name = existing.resume_file_name or resume_file_name
             existing.source_url = existing.source_url or source_url
@@ -195,6 +258,7 @@ class BossCandidateRecordService:
                 name=name,
                 gender=gender,
                 job_title=job_title,
+                talking_position=talking_position,
                 phone=phone,
                 resume_file_name=resume_file_name,
                 source_url=source_url,

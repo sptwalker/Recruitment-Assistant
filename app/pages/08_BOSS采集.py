@@ -46,6 +46,11 @@ st.markdown(
 .stButton > button, .stLinkButton > a { min-height:32px !important; padding:6px 12px !important; font-size:12px !important; border-radius:10px !important; white-space:nowrap !important; width:100% !important; }
 .boss-status-on { color:#0a7d2e; font-weight:700; font-size:12px; }
 .boss-status-off { color:var(--color-text-muted); font-size:12px; }
+.boss-status-banner.is-listening .boss-status-value { color:#0a7d2e; }
+.boss-status-banner.is-error .boss-status-value { color:#b91c1c; }
+.boss-status-banner.is-idle .boss-status-value { color:#4b5563; }
+.boss-status-ext-disconnected { color:#b91c1c; font-weight:800; font-size:12px; }
+.boss-status-ext-error-code { color:#b91c1c; font-size:11px; opacity:.85; line-height:1.1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .boss-path { display:block; clear:both; font-family:Consolas,monospace; font-size:12px; color:var(--color-text-secondary); background:var(--color-bg-soft); border:1px solid var(--color-border); border-radius:10px; padding:8px 10px; word-break:break-all; margin-top:8px; }
 .boss-checklist { margin:0 0 0 18px; padding:0; }
 .boss-checklist li { margin:4px 0; line-height:1.38; font-size:12px; }
@@ -147,7 +152,6 @@ def load_boss_history_rows() -> tuple[list[dict], int, int]:
             {
                 "批次ID": row.id,
                 "时间": row.started_at.strftime("%Y-%m-%d %H:%M:%S") if row.started_at else "",
-                "目标网站": "BOSS直聘",
                 "目标数量": row.planned_count or 0,
                 "获取数量": row.success_count,
                 "跳过数量": row.failed_count,
@@ -167,6 +171,16 @@ def load_boss_dedup_record_count() -> int:
         return BossCandidateRecordService(session).count_records("boss")
 
 
+def load_boss_records_for_display() -> list[dict]:
+    """读取 BOSS 平台已归档候选人记录，按首次归档时间升序，供 UI 表格渲染。"""
+    try:
+        with create_session() as session:
+            return BossCandidateRecordService(session).list_records_for_display("boss")
+    except Exception as exc:
+        st.warning(f"已获取候选人列表读取失败：{exc}")
+        return []
+
+
 def render_boss_history_task_table() -> None:
     try:
         task_rows, success_task_count, success_resume_count = load_boss_history_rows()
@@ -176,17 +190,15 @@ def render_boss_history_task_table() -> None:
         success_task_count = 0
         success_resume_count = 0
 
-    st.markdown(
-        '<div class="plain-section-title"><h3>BOSS直聘历史批次任务列表</h3><div class="collect-panel-stat">已成功执行{}次任务，共获取了{}份简历。</div></div>'.format(
-            success_task_count,
-            success_resume_count,
-        ),
-        unsafe_allow_html=True,
+    render_result_title(
+        "历史批次任务",
+        f"已成功执行{success_task_count}次任务，共获取了{success_resume_count}份简历。",
     )
     st.dataframe(
         task_rows,
         use_container_width=True,
         hide_index=True,
+        height=300,
     )
 
 
@@ -212,7 +224,7 @@ def boss_run_elapsed_seconds(runtime_state: dict) -> float:
     if not started_at:
         return 0
     try:
-        return max(0, (datetime.now() - datetime.fromisoformat(started_at)).total_seconds())
+        return max(0, datetime.now().timestamp() - datetime.fromisoformat(started_at).timestamp())
     except ValueError:
         return 0
 
@@ -289,9 +301,28 @@ def build_log_summary(runtime_state: dict) -> str:
     progress_scanned = int(runtime_state.get("scanned_count") or 0)
     fallback_scanned = current_index + 1 if candidates else 0
     scanned_count = max(progress_scanned, fallback_scanned, len(candidates))
-    elapsed_seconds = boss_run_elapsed_seconds(runtime_state)
-    avg_seconds = elapsed_seconds / scanned_count if scanned_count else 0
-    return f"已扫描{scanned_count}位候选人，已扫描{format_boss_duration(elapsed_seconds)}，每人平均耗时{avg_seconds:.1f}秒"
+    downloaded_count = int(runtime_state.get("downloaded_count") or 0)
+    elapsed_seconds = boss_task_elapsed_seconds(runtime_state)
+    avg_seconds = int(round(elapsed_seconds / scanned_count)) if scanned_count else 0
+    return (
+        f"已扫描{scanned_count}位候选人，已成功下载{downloaded_count}简历，"
+        f"已扫描{format_boss_duration(elapsed_seconds)}，平均每人耗时{avg_seconds}秒"
+    )
+
+
+def boss_task_elapsed_seconds(runtime_state: dict) -> float:
+    started_at = runtime_state.get("task_started_at") or runtime_state.get("run_started_at") or ""
+    if not started_at:
+        return 0
+    try:
+        return max(0, datetime.now().timestamp() - datetime.fromisoformat(started_at).timestamp())
+    except ValueError:
+        return 0
+
+
+def build_candidate_summary_db(current_total: int, baseline: int) -> str:
+    added = max(0, int(current_total or 0) - int(baseline or 0))
+    return f"当前记录{int(current_total or 0)}人，本轮增加记录{added}人。"
 
 
 def build_candidate_summary(runtime_state: dict) -> str:
@@ -367,22 +398,30 @@ with st.container(border=True):
     if ws_listening:
         ws_value = "监听中"
         ws_sub = f"{bridge.ws_server.host}:{bridge.ws_server.port}"
+        ws_state_class = "is-listening"
     elif startup_error:
         ws_value = "启动失败"
         ws_sub = startup_error
+        ws_state_class = "is-error"
     else:
         ws_value = "未监听"
         ws_sub = f"{bridge.ws_server.host}:{bridge.ws_server.port}"
+        ws_state_class = "is-idle"
     status_cols[0].markdown(
-        f'<div class="boss-status-banner one-line"><span class="boss-status-label">WebSocket</span><span class="boss-status-value">{html.escape(ws_value)}</span><span class="boss-status-sub">{html.escape(ws_sub)}</span></div>',
+        f'<div class="boss-status-banner one-line {ws_state_class}"><span class="boss-status-label">WebSocket</span><span class="boss-status-value">{html.escape(ws_value)}</span><span class="boss-status-sub">{html.escape(ws_sub)}</span></div>',
         unsafe_allow_html=True,
     )
-    ext_text = "● 扩展已连接" if ws_connected else "○ 扩展未连接"
+    last_disconnect_reason = runtime.get("last_disconnect_reason") or ""
+    if ws_connected:
+        ext_main_html = '<div class="boss-info-text boss-status-on">● 扩展已连接</div>'
+    else:
+        ext_main_html = '<div class="boss-info-text boss-status-ext-disconnected">○ 未连接</div>'
+        if last_disconnect_reason:
+            ext_main_html += f'<div class="boss-status-ext-error-code">{html.escape(last_disconnect_reason)}</div>'
     page_text = "● Boss页面就绪" if page_ready else "○ 等待沟通页"
-    ext_class = "boss-status-on" if ws_connected else "boss-status-off"
     page_class = "boss-status-on" if page_ready else "boss-status-off"
     status_cols[1].markdown(
-        f'<div class="boss-status-banner"><div class="boss-status-pair"><div class="boss-info-text {ext_class}">{ext_text}</div><div class="boss-info-text {page_class}">{page_text}</div></div></div>',
+        f'<div class="boss-status-banner"><div class="boss-status-pair">{ext_main_html}<div class="boss-info-text {page_class}">{page_text}</div></div></div>',
         unsafe_allow_html=True,
     )
     status_cols[2].metric("扩展版本", runtime.get("extension_version") or "-")
@@ -487,41 +526,94 @@ with st.container(border=True):
             st.markdown('<div class="boss-empty-box">等待采集开始...</div>', unsafe_allow_html=True)
 
     with result_cols[1]:
-        render_result_title("候选人列表", build_candidate_summary(runtime))
-        candidates = runtime.get("candidates", [])
-        if candidates:
-            candidate_rows = ""
-            for c in candidates[-30:]:
-                sig = c.get("signature", "")
-                parts = sig.split("/")
-                status = "已下载" if "download" in c.get("status", "") else "已跳过"
-                status_class = "boss-candidate-status-downloaded" if status == "已下载" else "boss-candidate-status-skipped"
-                detail = c.get("file", "") or c.get("reason_text", "") or translate_boss_detail(c.get("reason", ""))
-                candidate_rows += (
-                    "<tr>"
-                    f"<td>{html.escape(parts[0] if len(parts) > 0 else '')}</td>"
-                    f"<td>{html.escape(parts[1] if len(parts) > 1 else '')}</td>"
-                    f"<td>{html.escape(parts[2] if len(parts) > 2 else '')}</td>"
-                    f"<td class=\"{status_class}\">{html.escape(status)}</td>"
-                    f"<td>{html.escape(detail)}</td>"
-                    f"<td>{html.escape(c.get('at', ''))}</td>"
-                    "</tr>"
-                )
-            table_html = (
-                '<div class="boss-candidate-box"><table class="boss-candidate-table">'
-                "<thead><tr><th>姓名</th><th>年龄</th><th>学历</th><th>状态</th><th>详情</th><th>时间</th></tr></thead>"
-                f"<tbody>{candidate_rows}</tbody></table></div>"
-            )
-            if is_running:
-                render_auto_scroll_html(table_html, "boss-candidate-bottom")
-            else:
-                st.markdown(table_html, unsafe_allow_html=True)
-        else:
-            st.markdown('<div class="boss-empty-box">暂无候选人。采集后会自动出现在这里。</div>', unsafe_allow_html=True)
+        render_boss_history_task_table()
 
-# --- History Tasks ---
-if not is_running:
-    render_boss_history_task_table()
+# --- Archived Candidates (full width, page bottom) ---
+with st.container(border=True):
+    try:
+        current_dedup_total_for_summary = load_boss_dedup_record_count()
+    except Exception:
+        current_dedup_total_for_summary = 0
+    baseline = int(runtime.get("dedup_record_count_baseline") or 0)
+    render_result_title(
+        "已入库候选人",
+        build_candidate_summary_db(current_dedup_total_for_summary, baseline),
+    )
+    records = load_boss_records_for_display()
+    if records:
+        display_rows = [
+            {"删除": False, **{k: v for k, v in r.items() if k != "id"}}
+            for r in records
+        ]
+        edited = st.data_editor(
+            display_rows,
+            use_container_width=True,
+            hide_index=True,
+            height=400,
+            num_rows="fixed",
+            disabled=[c for c in display_rows[0].keys() if c != "删除"],
+            key="boss_records_editor",
+        )
+        to_delete_ids: list[int] = [
+            int(records[i]["id"])
+            for i, row in enumerate(edited)
+            if row.get("删除")
+        ]
+        del_cols = st.columns([1.4, 1.4, 5.2])
+        delete_disabled = len(to_delete_ids) == 0 or is_running
+        if del_cols[0].button(
+            f"删除选中（{len(to_delete_ids)}）",
+            disabled=delete_disabled,
+            type="primary",
+            use_container_width=True,
+        ):
+            try:
+                with create_session() as session:
+                    svc = BossCandidateRecordService(session)
+                    deleted = sum(1 for rid in to_delete_ids if svc.delete_record_by_id(rid))
+                st.session_state["boss_record_delete_message"] = f"已删除 {deleted} 条记录"
+            except Exception as exc:
+                st.session_state["boss_record_delete_message"] = f"删除失败：{exc}"
+            st.rerun()
+        if del_cols[1].button(
+            "全部删除",
+            disabled=is_running,
+            use_container_width=True,
+        ):
+            st.session_state["boss_confirm_delete_all"] = True
+            st.rerun()
+        msg = st.session_state.pop("boss_record_delete_message", None)
+        if msg:
+            del_cols[2].caption(msg)
+
+        if st.session_state.get("boss_confirm_delete_all"):
+            with st.container(border=True):
+                st.warning("警告：这将删除BOSS直聘网站所有的已入库候选人记录！")
+                confirm_cols = st.columns([1.4, 1.4, 5.2])
+                if confirm_cols[0].button(
+                    "确认全部删除",
+                    type="primary",
+                    use_container_width=True,
+                    key="boss_confirm_delete_all_yes",
+                ):
+                    try:
+                        with create_session() as session:
+                            svc = BossCandidateRecordService(session)
+                            deleted = svc.delete_all_by_platform("boss")
+                        st.session_state["boss_record_delete_message"] = f"已全部删除 {deleted} 条记录"
+                    except Exception as exc:
+                        st.session_state["boss_record_delete_message"] = f"全部删除失败：{exc}"
+                    st.session_state["boss_confirm_delete_all"] = False
+                    st.rerun()
+                if confirm_cols[1].button(
+                    "取消",
+                    use_container_width=True,
+                    key="boss_confirm_delete_all_no",
+                ):
+                    st.session_state["boss_confirm_delete_all"] = False
+                    st.rerun()
+    else:
+        st.markdown('<div class="boss-empty-box">暂无已入库候选人。采集成功后会归档到这里。</div>', unsafe_allow_html=True)
 
 # Auto-refresh when collecting
 if is_running:

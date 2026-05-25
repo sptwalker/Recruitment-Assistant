@@ -127,6 +127,7 @@ class BossCandidateRecord(Base):
     name: Mapped[str | None] = mapped_column(String(128), index=True)
     gender: Mapped[str | None] = mapped_column(String(16))
     job_title: Mapped[str | None] = mapped_column(String(255), index=True)
+    talking_position: Mapped[str | None] = mapped_column(String(64))
     phone: Mapped[str | None] = mapped_column(String(64))
     resume_file_name: Mapped[str | None] = mapped_column(String(255))
     source_url: Mapped[str | None] = mapped_column(Text)

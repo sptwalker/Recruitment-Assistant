@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from collections import Counter
 from concurrent.futures import Future
 from datetime import datetime
@@ -36,7 +37,7 @@ from recruitment_assistant.services.extension_contract import (
 )
 
 
-ZHILIAN_BRIDGE_VERSION = "1.22.0"
+ZHILIAN_BRIDGE_VERSION = "1.30.0"
 
 
 class ZhilianWSBridge:
@@ -64,6 +65,7 @@ class ZhilianWSBridge:
             "downloaded_count": 0,
             "skipped_count": 0,
             "dedup_record_count": 0,
+            "dedup_record_count_baseline": 0,
             "resume_request_count": 0,
             "current_index": 0,
             "scanned_count": 0,
@@ -122,6 +124,7 @@ class ZhilianWSBridge:
             "task_status": "pending",
         })
         self._seen_candidate_records.update(self._load_candidate_keys())
+        self.runtime_state["dedup_record_count_baseline"] = self._load_dedup_record_count()
         self._write_event_log("run_started", {"run_id": run_id})
         self._log("info", f"新测试轮次已创建: {run_id}")
         self._log(
@@ -433,9 +436,12 @@ class ZhilianWSBridge:
         self.runtime_state["candidates"] = []
         self.runtime_state["skip_reason_counts"] = {}
         self.runtime_state["task_id"] = None
-        self.runtime_state["task_started_at"] = ""
+        # 任务开始时间保底：先用当前时间，后续 _create_crawl_task 成功后会覆盖为 DB 任务 started_at
+        self.runtime_state["task_started_at"] = datetime.now().isoformat(timespec="seconds")
         self.runtime_state["task_planned_count"] = 0
         self.runtime_state["task_status"] = "pending"
+        # 本轮新增基线 = 启动时 DB 总记录数
+        self.runtime_state["dedup_record_count_baseline"] = self._load_dedup_record_count()
         boss_candidate_keys = self._load_candidate_keys()
         boss_candidate_signatures = self._load_candidate_signatures()
         self._seen_candidate_records.update(boss_candidate_keys)
@@ -554,6 +560,7 @@ class ZhilianWSBridge:
         }
         if extra:
             payload["data"].update(extra)
+        payload["data"]["ack_sent_at_ms"] = int(time.time() * 1000)  # diag: persist ack timing (unix epoch ms, 与 content.js Date.now() 对齐)
         self.ws_server.send_command(payload)
         self._write_event_log("resume_persist_ack_sent", payload["data"])
 
@@ -634,7 +641,11 @@ class ZhilianWSBridge:
                 version = data.get("version", "")
                 self.runtime_state["extension_connected"] = True
                 self.runtime_state["extension_version"] = version
-                self._log("info", f"扩展已连接 v{version or '?'}；期望版本={ZHILIAN_EXTENSION_EXPECTED_VERSION}")
+                self.runtime_state["last_disconnect_reason"] = ""
+                last_state = self.runtime_state.get("_last_connection_log_state")
+                if last_state != "connected":
+                    self._log("info", f"扩展已连接 v{version or '?'}；期望版本={ZHILIAN_EXTENSION_EXPECTED_VERSION}")
+                    self.runtime_state["_last_connection_log_state"] = "connected"
                 if version and version != ZHILIAN_EXTENSION_EXPECTED_VERSION:
                     self._log("warning", f"扩展版本不匹配: 当前={version}；期望={ZHILIAN_EXTENSION_EXPECTED_VERSION}，请在 chrome://extensions/ 重新加载扩展")
             case "heartbeat":
@@ -684,12 +695,57 @@ class ZhilianWSBridge:
             case "extension_disconnected":
                 self.runtime_state["extension_connected"] = False
                 self.runtime_state["page_ready"] = False
+                self.runtime_state["last_disconnect_reason"] = str(data.get("reason", "unknown") or "unknown")
                 was_running = bool(self.runtime_state.get("running"))
                 self.runtime_state["running"] = False
                 self.runtime_state["paused"] = False
                 if was_running:
                     self._finish_crawl_task("failed", error_message=f"扩展连接已断开: {data.get('reason', 'unknown')}")
-                self._log("error", f"扩展连接已断开: {data.get('reason', 'unknown')}")
+                last_state = self.runtime_state.get("_last_connection_log_state")
+                if last_state != "disconnected":
+                    self._log("error", f"扩展连接已断开: {data.get('reason', 'unknown')}")
+                    self.runtime_state["_last_connection_log_state"] = "disconnected"
+            case "settings_precheck_failed":
+                reason = data.get("reason", "unknown")
+                hint = data.get("hint", "")
+                popups_setting = data.get("popups_setting", "")
+                self._log("error", f"采集前置检查失败：{reason}（popups={popups_setting}）。{hint}")
+                self.runtime_state["running"] = False
+                self.runtime_state["paused"] = False
+                self._finish_crawl_task("failed", error_message=f"settings_precheck_failed: {reason}")
+            case "persist_ack_timing":
+                self._write_event_log("persist_ack_timing", data or {})  # diag: persist ack timing
+                sig = data.get("candidate_signature", "") or data.get("download_request_id", "")
+                save_ms = data.get("save_duration_ms", -1)
+                ws_ms = data.get("ws_chain_ms", -1)
+                status = data.get("status", "")
+                self._log("info", f"持久化耗时: {sig} → save={save_ms}ms / ws={ws_ms}ms / status={status}")
+            case "zhilian_loop_diag":
+                self._write_event_log("zhilian_loop_diag", data or {})  # diag: outer loop trace
+                stage = data.get("stage", "")
+                if stage == "outer_scan":
+                    self._log("info", f"循环诊断[scan]: targets={data.get('targets_count', '?')} seen={data.get('seen_size', '?')} retries={data.get('scroll_retries', '?')}")
+                elif stage == "empty_retry":
+                    self._log("info", f"循环诊断[empty_retry]: retries={data.get('scroll_retries', '?')}/{data.get('max_retries', '?')} seen={data.get('seen_size', '?')}")
+                elif stage == "inner_loop_finished":
+                    self._log("info", f"循环诊断[batch_done]: processed={data.get('processed_in_batch', '?')} completed={data.get('completed', '?')}/{data.get('target_completed', '?')} seen={data.get('seen_size', '?')}")
+                elif stage == "outer_loop_exit":
+                    self._log("info", f"循环诊断[exit]: state={data.get('state', '?')} completed={data.get('completed', '?')}/{data.get('target_completed', '?')} seen={data.get('seen_size', '?')} retries={data.get('scroll_retries', '?')}")
+            case "zhilian_iter_diag":
+                self._write_event_log("zhilian_iter_diag", data or {})  # diag: per-iter phase timing
+                sig = data.get("candidate_signature", "")
+                branch = data.get("branch", "")
+                total = data.get("iter_total_ms", 0)
+                scroll_ms = data.get("scroll_ms", 0)
+                click_ms = data.get("click_ms", 0)
+                wait_ms = data.get("wait_ms", 0)
+                post_ms = data.get("post_wait_ms", 0)
+                in_dom = data.get("element_still_in_dom", True)
+                self._log("info", f"迭代分段: {sig} [{branch}] total={total}ms / scroll={scroll_ms} / click={click_ms} / wait={wait_ms} / post={post_ms} / in_dom={in_dom}")
+            case "download_prompt_suspected":
+                hint = data.get("hint", "")
+                waited = data.get("waited_ms", 0)
+                self._log("error", f"疑似下载前询问保存位置（已等 {waited}ms 未落盘）。{hint}")
 
             case "page_ready":
                 self.runtime_state["page_ready"] = True
@@ -1115,6 +1171,14 @@ class ZhilianWSBridge:
             self._log("warning", f"读取 去重记录失败: {exc}")
             return set()
 
+    def _load_dedup_record_count(self) -> int:
+        try:
+            with create_session() as session:
+                return BossCandidateRecordService(session).count_records("zhilian")
+        except Exception as exc:
+            self._log("warning", f"读取 去重记录总数失败: {exc}")
+            return 0
+
     def _normalize_boss_candidate_signature(self, signature: str) -> str:
         parts = [part.strip() for part in str(signature or "").split("/")]
         while len(parts) < 3:
@@ -1153,6 +1217,8 @@ class ZhilianWSBridge:
         gender = candidate_info.get("gender") if candidate_info.get("gender") not in {"", "待识别"} else None
         job_title = candidate_info.get("job_title") if candidate_info.get("job_title") not in {"", "待识别"} else None
         phone = candidate_info.get("phone") if candidate_info.get("phone") not in {"", "待识别"} else None
+        talking_position_raw = (candidate_info.get("talking_position") or "").strip()
+        talking_position = self._simplify_talking_position(talking_position_raw) or None
 
         with create_session() as session:
             service = BossCandidateRecordService(session)
@@ -1164,6 +1230,7 @@ class ZhilianWSBridge:
                 name=name if name != "待识别" else None,
                 gender=gender,
                 job_title=job_title,
+                talking_position=talking_position,
                 phone=phone,
                 resume_file_name=file_name,
                 source_url=source_url,
@@ -1184,6 +1251,7 @@ class ZhilianWSBridge:
         return s
 
     def _save_resume(self, data: dict) -> None:
+        save_started_at_ms = int(time.monotonic() * 1000)  # diag: persist ack timing
         candidate_sig = data.get("candidate_signature", "未知")
         candidate_info = data.get("candidate_info", {})
         source_filename = data.get("filename", "")
@@ -1216,13 +1284,20 @@ class ZhilianWSBridge:
                         "status": "hash_mismatch_blocked",
                         "at": datetime.now().isoformat(),
                     })
+                    save_completed_at_ms = int(time.monotonic() * 1000)  # diag: persist ack timing
                     self._send_persist_ack(
                         candidate_sig,
                         candidate_info,
                         "hash_mismatch_blocked",
                         download_request_id,
                         f"内容已归属 {bound_signature}",
-                        {"bound_signature": bound_signature, "hash": file_hash},
+                        {
+                            "bound_signature": bound_signature,
+                            "hash": file_hash,
+                            "save_started_at_ms": save_started_at_ms,
+                            "save_completed_at_ms": save_completed_at_ms,
+                            "save_duration_ms": save_completed_at_ms - save_started_at_ms,
+                        },
                     )
                     return
                 self._saved_resume_hash_signatures[file_hash] = candidate_sig
@@ -1302,13 +1377,20 @@ class ZhilianWSBridge:
                 }
                 self.runtime_state["candidates"].append(record)
                 self._write_event_log("resume_saved", record)
+                save_completed_at_ms = int(time.monotonic() * 1000)  # diag: persist ack timing
                 self._send_persist_ack(
                     candidate_sig,
                     candidate_info,
                     "saved",
                     download_request_id,
                     "",
-                    {"file": final_filename, "hash": file_hash},
+                    {
+                        "file": final_filename,
+                        "hash": file_hash,
+                        "save_started_at_ms": save_started_at_ms,
+                        "save_completed_at_ms": save_completed_at_ms,
+                        "save_duration_ms": save_completed_at_ms - save_started_at_ms,
+                    },
                 )
                 return
 
@@ -1321,7 +1403,19 @@ class ZhilianWSBridge:
             "status": "archive_missing",
             "at": datetime.now().isoformat(),
         })
-        self._send_persist_ack(candidate_sig, candidate_info, "archive_missing", download_request_id, "源文件未找到")
+        save_completed_at_ms = int(time.monotonic() * 1000)  # diag: persist ack timing
+        self._send_persist_ack(
+            candidate_sig,
+            candidate_info,
+            "archive_missing",
+            download_request_id,
+            "源文件未找到",
+            {
+                "save_started_at_ms": save_started_at_ms,
+                "save_completed_at_ms": save_completed_at_ms,
+                "save_duration_ms": save_completed_at_ms - save_started_at_ms,
+            },
+        )
 
 
     def _translate_skip_reason(self, reason: str) -> str:

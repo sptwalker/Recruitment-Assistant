@@ -36,7 +36,7 @@ from recruitment_assistant.services.extension_contract import (
 )
 
 
-QIANCHENG_BRIDGE_VERSION = "1.16.0"
+QIANCHENG_BRIDGE_VERSION = "1.20.0"
 
 
 class QianchengWSBridge:
@@ -64,6 +64,7 @@ class QianchengWSBridge:
             "downloaded_count": 0,
             "skipped_count": 0,
             "dedup_record_count": 0,
+            "dedup_record_count_baseline": 0,
             "resume_request_count": 0,
             "current_index": 0,
             "scanned_count": 0,
@@ -122,6 +123,7 @@ class QianchengWSBridge:
             "task_status": "pending",
         })
         self._seen_candidate_records.update(self._load_candidate_keys())
+        self.runtime_state["dedup_record_count_baseline"] = self._load_dedup_record_count()
         self._write_event_log("run_started", {"run_id": run_id})
         self._log("info", f"新测试轮次已创建: {run_id}")
         self._log(
@@ -436,9 +438,12 @@ class QianchengWSBridge:
         self.runtime_state["candidates"] = []
         self.runtime_state["skip_reason_counts"] = {}
         self.runtime_state["task_id"] = None
-        self.runtime_state["task_started_at"] = ""
+        # 任务开始时间保底：先用当前时间，后续 _create_crawl_task 成功后会覆盖为 DB 任务 started_at
+        self.runtime_state["task_started_at"] = datetime.now().isoformat(timespec="seconds")
         self.runtime_state["task_planned_count"] = 0
         self.runtime_state["task_status"] = "pending"
+        # 本轮新增基线 = 启动时 DB 总记录数
+        self.runtime_state["dedup_record_count_baseline"] = self._load_dedup_record_count()
         boss_candidate_keys = self._load_candidate_keys()
         boss_candidate_signatures = self._load_candidate_signatures()
         self._seen_candidate_records.update(boss_candidate_keys)
@@ -634,7 +639,11 @@ class QianchengWSBridge:
                 version = data.get("version", "")
                 self.runtime_state["extension_connected"] = True
                 self.runtime_state["extension_version"] = version
-                self._log("info", f"扩展已连接 v{version or '?'}；期望版本={QIANCHENG_EXTENSION_EXPECTED_VERSION}")
+                self.runtime_state["last_disconnect_reason"] = ""
+                last_state = self.runtime_state.get("_last_connection_log_state")
+                if last_state != "connected":
+                    self._log("info", f"扩展已连接 v{version or '?'}；期望版本={QIANCHENG_EXTENSION_EXPECTED_VERSION}")
+                    self.runtime_state["_last_connection_log_state"] = "connected"
                 if version and version != QIANCHENG_EXTENSION_EXPECTED_VERSION:
                     self._log("warning", f"扩展版本不匹配: 当前={version}；期望={QIANCHENG_EXTENSION_EXPECTED_VERSION}，请在 chrome://extensions/ 重新加载扩展")
             case "heartbeat":
@@ -706,12 +715,28 @@ class QianchengWSBridge:
             case "extension_disconnected":
                 self.runtime_state["extension_connected"] = False
                 self.runtime_state["page_ready"] = False
+                self.runtime_state["last_disconnect_reason"] = str(data.get("reason", "unknown") or "unknown")
                 was_running = bool(self.runtime_state.get("running"))
                 self.runtime_state["running"] = False
                 self.runtime_state["paused"] = False
                 if was_running:
                     self._finish_crawl_task("failed", error_message=f"扩展连接已断开: {data.get('reason', 'unknown')}")
-                self._log("error", f"扩展连接已断开: {data.get('reason', 'unknown')}")
+                last_state = self.runtime_state.get("_last_connection_log_state")
+                if last_state != "disconnected":
+                    self._log("error", f"扩展连接已断开: {data.get('reason', 'unknown')}")
+                    self.runtime_state["_last_connection_log_state"] = "disconnected"
+            case "settings_precheck_failed":
+                reason = data.get("reason", "unknown")
+                hint = data.get("hint", "")
+                popups_setting = data.get("popups_setting", "")
+                self._log("error", f"采集前置检查失败：{reason}（popups={popups_setting}）。{hint}")
+                self.runtime_state["running"] = False
+                self.runtime_state["paused"] = False
+                self._finish_crawl_task("failed", error_message=f"settings_precheck_failed: {reason}")
+            case "download_prompt_suspected":
+                hint = data.get("hint", "")
+                waited = data.get("waited_ms", 0)
+                self._log("error", f"疑似下载前询问保存位置（已等 {waited}ms 未落盘）。{hint}")
 
             case "page_ready":
                 self.runtime_state["page_ready"] = True
@@ -1154,6 +1179,14 @@ class QianchengWSBridge:
             self._log("warning", f"读取 去重记录失败: {exc}")
             return set()
 
+    def _load_dedup_record_count(self) -> int:
+        try:
+            with create_session() as session:
+                return BossCandidateRecordService(session).count_records("qiancheng")
+        except Exception as exc:
+            self._log("warning", f"读取 去重记录总数失败: {exc}")
+            return 0
+
     def _normalize_boss_candidate_signature(self, signature: str) -> str:
         parts = [part.strip() for part in str(signature or "").split("/")]
         while len(parts) < 3:
@@ -1192,6 +1225,13 @@ class QianchengWSBridge:
         gender = candidate_info.get("gender") if candidate_info.get("gender") not in {"", "待识别"} else None
         job_title = candidate_info.get("job_title") if candidate_info.get("job_title") not in {"", "待识别"} else None
         phone = candidate_info.get("phone") if candidate_info.get("phone") not in {"", "待识别"} else None
+        talking_position_raw = (
+            candidate_info.get("talking_position")
+            or self._talking_position_by_sig.get(candidate_sig)
+            or candidate_info.get("job_title")
+            or ""
+        ).strip()
+        talking_position = self._simplify_talking_position(talking_position_raw) or None
 
         with create_session() as session:
             service = BossCandidateRecordService(session)
@@ -1203,6 +1243,7 @@ class QianchengWSBridge:
                 name=name if name != "待识别" else None,
                 gender=gender,
                 job_title=job_title,
+                talking_position=talking_position,
                 phone=phone,
                 resume_file_name=file_name,
                 source_url=source_url,

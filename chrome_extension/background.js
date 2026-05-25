@@ -88,13 +88,105 @@ function connect(platform) {
   platform.ws.onerror = () => { platform.ws?.close(); };
 }
 
+// 采集开始前的浏览器设置预检：
+// - 弹窗（popups）：rd5/rd6/ehire/zhipin 域必须为 allow，否则附件简历的弹出窗口会被吃掉。
+//   chrome.contentSettings.popups.get 会真实读到 chrome://settings/content/popups 的状态。
+// - 下载前询问：Chrome 没有给扩展开放 prompt_for_download 这个 pref 的读接口；这里只能放过，
+//   留给"首次下载兑底探测"在采集开始后兜底报错（见 download_prompt_suspected）。
+async function runStartCollectPrechecks(platform, _config) {
+  const probeUrl = ({
+    boss: "https://www.zhipin.com/",
+    qiancheng: "https://ehire.51job.com/",
+    zhilian: "https://rd5.zhaopin.com/",
+  })[platform.cfg.code] || "https://www.zhipin.com/";
+
+  if (!chrome.contentSettings || !chrome.contentSettings.popups) {
+    return { ok: false, reason: "content_settings_api_unavailable", probe_url: probeUrl };
+  }
+  try {
+    const result = await new Promise((resolve, reject) => {
+      chrome.contentSettings.popups.get({ primaryUrl: probeUrl }, (details) => {
+        if (chrome.runtime.lastError) reject(chrome.runtime.lastError);
+        else resolve(details || {});
+      });
+    });
+    const setting = result.setting || "";
+    if (setting !== "allow") {
+      return {
+        ok: false,
+        reason: "popups_not_allowed",
+        popups_setting: setting || "unknown",
+        probe_url: probeUrl,
+        hint: "请打开 chrome://settings/content/popups，将 \"网站可以发送弹出式窗口并使用重定向\" 设为允许（或为该招聘域名加白名单）后重试。",
+      };
+    }
+    return { ok: true, popups_setting: setting, probe_url: probeUrl };
+  } catch (error) {
+    return {
+      ok: false,
+      reason: "popups_probe_error",
+      error: String(error?.message || error),
+      probe_url: probeUrl,
+    };
+  }
+}
+
+// 首次下载兑底探测：内容脚本拿到附件链接后会经 download_intent / download_direct_url 触发
+// chrome.downloads.download。Chrome 端如果勾着"下载前询问每个文件的保存位置"，会先弹一个
+// 保存对话框、阻塞 download_created 事件——此时 5 秒内 platform.firstDownloadSeen 不会被翻为
+// true，我们就上报 download_prompt_suspected，让 bridge 用深红日志提醒用户去关掉该设置。
+function armFirstDownloadProbe(platform) {
+  platform.firstDownloadSeen = false;
+  if (platform.firstDownloadSuspectedTimer) {
+    clearTimeout(platform.firstDownloadSuspectedTimer);
+    platform.firstDownloadSuspectedTimer = null;
+  }
+  platform.firstDownloadIntentAt = 0;
+}
+
+function markFirstDownloadIntentSent(platform) {
+  if (platform.firstDownloadSeen || platform.firstDownloadIntentAt) return;
+  platform.firstDownloadIntentAt = Date.now();
+  platform.firstDownloadSuspectedTimer = setTimeout(() => {
+    if (platform.firstDownloadSeen) return;
+    sendToServer(platform, {
+      type: "download_prompt_suspected",
+      data: {
+        run_id: platform.activeRunId,
+        waited_ms: Date.now() - platform.firstDownloadIntentAt,
+        hint: "首次下载已发起 5 秒仍未落盘，疑似 Chrome 勾选了\"下载前询问每个文件的保存位置\"。请到 chrome://settings/downloads 关闭后重试。",
+      },
+    });
+  }, 5000);
+}
+
+function markFirstDownloadSeen(platform) {
+  if (platform.firstDownloadSeen) return;
+  platform.firstDownloadSeen = true;
+  if (platform.firstDownloadSuspectedTimer) {
+    clearTimeout(platform.firstDownloadSuspectedTimer);
+    platform.firstDownloadSuspectedTimer = null;
+  }
+}
+
 function handleServerCommand(platform, msg) {
   const { type, config, run_id } = msg;
   if (run_id) platform.activeRunId = run_id;
   switch (type) {
     case "start_collect":
-      platform.collectState = "collecting";
-      sendToContentScript(platform, { type: "start_collect", config, run_id: platform.activeRunId });
+      runStartCollectPrechecks(platform, config).then((result) => {
+        if (!result.ok) {
+          sendToServer(platform, {
+            type: "settings_precheck_failed",
+            data: { run_id: platform.activeRunId, ...result },
+          });
+          platform.collectState = "idle";
+          return;
+        }
+        platform.collectState = "collecting";
+        armFirstDownloadProbe(platform);
+        sendToContentScript(platform, { type: "start_collect", config, run_id: platform.activeRunId });
+      });
       break;
     case "pause_collect":
       platform.collectState = "paused";
@@ -303,6 +395,7 @@ function downloadDirectUrl(platform, data = {}, sendResponse = () => {}) {
 
   const intent = { ...baseIntent, download_source: "direct_iframe", direct_bound: true };
   platform.lastDownloadIntent = intent;
+  markFirstDownloadIntentSent(platform);
   sendToServer(platform, { type: "direct_download_starting", data: intent });
   try {
     chrome.downloads.download({ url, filename: makeSafeDownloadFilename(intent), conflictAction: "uniquify", saveAs: false }, (downloadId) => {
@@ -314,6 +407,7 @@ function downloadDirectUrl(platform, data = {}, sendResponse = () => {}) {
         return;
       }
       pendingDownloads.set(downloadId, { ...intent, download_id: downloadId, started_at: Date.now(), bound_by: "direct_download_callback" });
+      markFirstDownloadSeen(platform);
       sendToServer(platform, { type: "download_created", data: { ...intent, download_id: downloadId, filename: url, bound_by: "direct_download_callback" } });
       respondOnce({ ok: true, download_id: downloadId, download_request_id: intent.download_request_id || "" });
     });
@@ -370,6 +464,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   }
 
   const boundIntent = { ...intent, url, direct_url: url, at: Date.now(), platform_code: "zhilian", download_source: "zhilian_active_download" };
+  markFirstDownloadIntentSent(platform);
   sendToServer(platform, { type: "zhilian_active_download_starting", data: boundIntent });
 
   try {
@@ -387,6 +482,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
         return;
       }
       pendingDownloads.set(downloadId, { ...boundIntent, download_id: downloadId, started_at: Date.now(), bound_by: "zhilian_active_download" });
+      markFirstDownloadSeen(platform);
       sendToServer(platform, { type: "download_created", data: { ...boundIntent, download_id: downloadId, filename: url, bound_by: "zhilian_active_download" } });
       setTimeout(() => { chrome.tabs.remove(tabId).catch(() => {}); }, 500);
     });
@@ -402,6 +498,7 @@ chrome.downloads.onCreated.addListener((item) => {
   if (pendingDownloads.has(item.id)) {
     const pending = pendingDownloads.get(item.id);
     const platform = platforms[pending.platform_code] || platforms.boss;
+    markFirstDownloadSeen(platform);
     sendToServer(platform, {
       type: "download_created_seen_bound",
       data: { ...pending, download_id: item.id, filename: item.filename || item.url || "", bound_by: pending.bound_by || "existing" },
@@ -413,6 +510,7 @@ chrome.downloads.onCreated.addListener((item) => {
     const intent = takeQueuedDownloadIntent(platform, item);
     if (!intent) continue;
     pendingDownloads.set(item.id, { ...intent, download_id: item.id, started_at: Date.now(), bound_by: "downloads_on_created_queue" });
+    markFirstDownloadSeen(platform);
     sendToServer(platform, {
       type: "download_created",
       data: { ...intent, download_id: item.id, filename: item.filename || item.url || "", bound_by: "downloads_on_created_queue" },

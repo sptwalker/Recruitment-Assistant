@@ -711,16 +711,31 @@ def extract_text_from_docx(path: str | Path) -> str:
 
 
 def is_empty_or_corrupted(path: str | Path) -> bool:
-    """检测文件是否真实损坏或空文件；可打开但无法提取文本的扫描件不判为损坏。"""
+    """检测文件是否真实损坏或空文件；可打开但无法提取文本的扫描件不判为损坏。
+
+    PDF 探测优先用 pymupdf —— pypdf 对 xref 不规范的 PDF（BOM/坏 boolean object 等）
+    会抛 PdfReadError，旧实现 except Exception: return True 把扫描件 PDF 误判为损坏，
+    导致后续的 PaddleOCR 回退根本走不到。pymupdf 容错更强；它失败再退回 pypdf。
+    """
     path = Path(path)
     if not path.exists() or path.stat().st_size < 100:
         return True
     suffix = path.suffix.lower()
     try:
         if suffix == ".pdf":
-            from pypdf import PdfReader
-            reader = PdfReader(str(path))
-            return len(reader.pages) == 0
+            try:
+                import fitz  # pymupdf
+                doc = fitz.open(str(path))
+                try:
+                    if doc.page_count == 0:
+                        return True
+                    return False
+                finally:
+                    doc.close()
+            except Exception:
+                from pypdf import PdfReader
+                reader = PdfReader(str(path))
+                return len(reader.pages) == 0
         elif suffix == ".docx":
             text = extract_text_from_docx(path)
             return len(text.strip()) < 50

@@ -111,6 +111,7 @@ class ResumeSourceCreate(BaseModel):
     file_name: str | None = None
     file_type: str | None = None
     file_path: str | None = None
+    attachment_works_path: str | None = None
     crawl_time: datetime | None = None
     is_duplicate: int = 0
 

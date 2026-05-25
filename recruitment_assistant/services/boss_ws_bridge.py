@@ -31,7 +31,7 @@ from recruitment_assistant.services.extension_contract import (
 )
 
 
-BOSS_BRIDGE_VERSION = "2.04.0"
+BOSS_BRIDGE_VERSION = "2.05.0"
 
 
 class BossWSBridge:
@@ -1122,8 +1122,8 @@ class BossWSBridge:
         s = re.sub(r"[（(][^）)]*[）)]", "", raw)
         s = re.split(r"[/／]", s, maxsplit=1)[0]
         s = s.strip()
-        if len(s) > 8:
-            s = s[:8]
+        if len(s) > 12:
+            s = s[:12]
         return s
 
     def _build_boss_candidate_key(self, candidate_sig: str, candidate_info: dict[str, Any]) -> str:

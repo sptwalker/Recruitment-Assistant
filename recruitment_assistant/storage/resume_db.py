@@ -39,3 +39,15 @@ def create_resume_session() -> Session:
 def init_resume_database() -> None:
     from recruitment_assistant.storage.resume_models import ResumeBase as _  # noqa: F401 ensure models registered
     ResumeBase.metadata.create_all(bind=resume_engine)
+    _migrate_add_attachment_works_path()
+
+
+def _migrate_add_attachment_works_path() -> None:
+    """旧库 idempotent 加列：resume_source.attachment_works_path TEXT NULL。
+
+    Base.metadata.create_all 不会 ALTER 已存在的表；老库启动时手动补列，重复启动安全。
+    """
+    with resume_engine.begin() as conn:
+        cols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(resume_source)").fetchall()}
+        if "attachment_works_path" not in cols:
+            conn.exec_driver_sql("ALTER TABLE resume_source ADD COLUMN attachment_works_path TEXT")

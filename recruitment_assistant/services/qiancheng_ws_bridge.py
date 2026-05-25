@@ -36,7 +36,7 @@ from recruitment_assistant.services.extension_contract import (
 )
 
 
-QIANCHENG_BRIDGE_VERSION = "1.20.0"
+QIANCHENG_BRIDGE_VERSION = "1.22.0"
 
 
 class QianchengWSBridge:
@@ -775,6 +775,10 @@ class QianchengWSBridge:
                     logger.debug("沟通职位识别跳过: sig={} reason={} raw={}", sig, reason, raw_preview)
             case "resume_downloaded":
                 self._save_resume(data)
+            case "qiancheng_attachment_works_skipped":
+                sig = data.get("candidate_signature", "未知")
+                reason = data.get("reason", "") or "unknown"
+                self._log("warning", f"附件作品跳过: {sig}（{reason}）")
             case "candidate_skipped":
                 self._record_skip(data)
             case "candidate_list_scanned":
@@ -1152,8 +1156,8 @@ class QianchengWSBridge:
         s = re.sub(r"[（(][^）)]*[）)]", "", raw)
         s = re.split(r"[/／]", s, maxsplit=1)[0]
         s = s.strip()
-        if len(s) > 8:
-            s = s[:8]
+        if len(s) > 12:
+            s = s[:12]
         return s
 
     def _build_boss_candidate_key(self, candidate_sig: str, candidate_info: dict[str, Any]) -> str:
@@ -1253,6 +1257,12 @@ class QianchengWSBridge:
             )
 
     def _save_resume(self, data: dict) -> None:
+        # 「附件作品」分支：扩展端复用 download_intent 链路，靠 data["variant"] 区分。
+        # 作品是简历的加分项，不算独立简历记录，不阻断简历主流程，不写 BossCandidateRecord。
+        if str(data.get("variant", "")).strip() == "attachment_works":
+            self._save_attachment_works(data)
+            return
+
         candidate_sig = data.get("candidate_signature", "未知")
         candidate_info = data.get("candidate_info", {})
         source_filename = data.get("filename", "")
@@ -1408,6 +1418,120 @@ class QianchengWSBridge:
             "at": datetime.now().isoformat(),
         })
         self._send_persist_ack(candidate_sig, candidate_info, "archive_missing", download_request_id, "源文件未找到")
+
+
+    def _save_attachment_works(self, data: dict) -> None:
+        """归档「附件作品」PDF。
+
+        作品是候选人简历之外的加分项：失败不阻断主流程；不写 BossCandidateRecord 去重表
+        （那张表代表"已采集过该简历"，作品不重复采集是靠 candidate_key+::works 二级 dedup 实现的）；
+        和简历共享 hash 去重池（防作品/简历跨候选人串档）。
+        """
+        candidate_sig = data.get("candidate_signature", "未知")
+        candidate_info = data.get("candidate_info", {}) or {}
+        source_filename = data.get("filename", "")
+        download_path = data.get("download_path", "")
+        download_request_id = str(data.get("download_request_id", "") or "")
+        candidate_key = self._build_boss_candidate_key(candidate_sig, candidate_info)
+        works_dedup_key = f"{candidate_key}::works" if candidate_key else ""
+
+        if works_dedup_key and works_dedup_key in self._seen_candidate_records:
+            self._log("info", f"附件作品去重命中，已存在记录: {candidate_sig}")
+            self._send_persist_ack(candidate_sig, candidate_info, "works_duplicate_skipped", download_request_id, "works_duplicate_in_run")
+            return
+
+        if not download_path:
+            self._log("warning", f"附件作品下载完成但未带文件路径，跳过: {candidate_sig}")
+            self._send_persist_ack(candidate_sig, candidate_info, "works_archive_missing", download_request_id, "缺少 download_path")
+            return
+
+        source = Path(download_path)
+        if not source.exists():
+            self._log("warning", f"附件作品源文件未找到，跳过: {candidate_sig}；path={download_path}")
+            self._send_persist_ack(candidate_sig, candidate_info, "works_archive_missing", download_request_id, "源文件未找到")
+            return
+
+        now = datetime.now()
+        project_root = Path(__file__).resolve().parents[2]
+        target_dir = project_root / "data" / "attachments" / "51job" / now.strftime("%Y%m%d")
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        content = source.read_bytes()
+        file_hash = sha256(content).hexdigest()
+        bound_signature = self._saved_resume_hash_signatures.get(file_hash)
+        if bound_signature and bound_signature != candidate_sig:
+            self._log(
+                "warning",
+                f"附件作品 hash 已归属 {bound_signature}，本次为 {candidate_sig}，已拦截",
+            )
+            self._send_persist_ack(
+                candidate_sig,
+                candidate_info,
+                "works_hash_mismatch_blocked",
+                download_request_id,
+                f"内容已归属 {bound_signature}",
+                {"bound_signature": bound_signature, "hash": file_hash},
+            )
+            return
+        self._saved_resume_hash_signatures[file_hash] = candidate_sig
+        suffix = source.suffix.lower() or ".pdf"
+
+        name = self._normalize_resume_filename_part(candidate_info.get("name"), "未知姓名")
+        age = self._normalize_resume_filename_part(candidate_info.get("age"), "未知年龄")
+        education = self._normalize_resume_filename_part(candidate_info.get("education"), "未知学历")
+        talking_position_raw = (
+            candidate_info.get("talking_position")
+            or self._talking_position_by_sig.get(candidate_sig)
+            or candidate_info.get("job_title")
+            or ""
+        ).strip()
+        simplified_position = self._simplify_talking_position(talking_position_raw)
+        position_part = self._normalize_resume_filename_part(simplified_position, simplified_position) if simplified_position else ""
+
+        # 编号沿用简历计数 +1 即可（同一候选人的 works 与 resume 在同一目录，不会冲突）。
+        seq = self.runtime_state["downloaded_count"]
+        stem_parts = [name, age, education]
+        if position_part:
+            stem_parts.append(position_part)
+        # 关键差异：在「来源网站」之后、「日期」之前插入「（附件作品）」。
+        stem_parts.extend(["51前程无忧", "（附件作品）", now.strftime("%Y%m%d"), now.strftime("%H%M%S"), f"{seq:03d}"])
+        filename_stem = "-".join(stem_parts)
+        filename = f"{filename_stem}{suffix}"
+
+        target = target_dir / filename
+        duplicate_index = 1
+        while target.exists() and target != source:
+            target = target_dir / f"{filename_stem}-{duplicate_index}{suffix}"
+            duplicate_index += 1
+        if source.resolve() != target.resolve():
+            shutil.copy2(str(source), str(target))
+            try:
+                source.unlink()
+            except OSError as exc:
+                self._log("warning", f"附件作品归档后删除源文件失败: {source}；原因={exc}")
+
+        if works_dedup_key:
+            self._seen_candidate_records.add(works_dedup_key)
+
+        # 实时日志着色：09 页面分级表里 success=绿色、关键词含「成功/已归档」即触发。
+        self._log("success", f"附件作品已归档: {target.name}")
+        self._write_event_log("attachment_works_saved", {
+            "signature": candidate_sig,
+            "candidate_key": candidate_key,
+            "file": target.name,
+            "path": str(target),
+            "hash": file_hash,
+            "status": "works_saved",
+            "at": now.isoformat(),
+        })
+        self._send_persist_ack(
+            candidate_sig,
+            candidate_info,
+            "works_saved",
+            download_request_id,
+            "",
+            {"file": target.name, "hash": file_hash, "variant": "attachment_works"},
+        )
 
 
     def _translate_skip_reason(self, reason: str) -> str:

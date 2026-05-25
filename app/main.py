@@ -223,8 +223,8 @@ def platform_card_html(platform: dict, data: dict) -> str:
 
 def stat_row_html(title: str, subtitle: str, items: list[tuple[str, str, str]]) -> str:
     cells = "".join(
-        f'<div class="home-stat-cell"><span>{label}</span><strong>{value}</strong><em>{note}</em></div>'
-        for label, value, note in items
+        f'<div class="home-stat-cell"><span>{label}</span>{body}<em>{note}</em></div>'
+        for label, body, note in items
     )
     return f"""
 <div class="home-stat-panel">
@@ -235,6 +235,62 @@ def stat_row_html(title: str, subtitle: str, items: list[tuple[str, str, str]]) 
 <div class="home-stat-grid">{cells}</div>
 </div>
 """
+
+
+def stat_value_body(value: str, muted: bool = False) -> str:
+    cls = ' class="home-stat-num-muted"' if muted else ""
+    return f"<strong{cls}>{value}</strong>"
+
+
+def safe_pct(part: int | float, total: int | float) -> int:
+    if not total:
+        return 0
+    pct = round(float(part) / float(total) * 100)
+    return max(0, min(100, int(pct)))
+
+
+_RING_PERIMETER = 150.796  # 2π × 24
+
+
+def ring_chart_body(percent: int, variant: str = "primary") -> str:
+    pct = max(0, min(100, int(percent)))
+    offset = _RING_PERIMETER * (1 - pct / 100)
+    return (
+        f'<div class="home-stat-chart">'
+        f'<svg viewBox="0 0 60 60" class="home-ring-svg home-ring-{variant}">'
+        '<circle class="home-ring-bg" cx="30" cy="30" r="24"/>'
+        f'<circle class="home-ring-fg" cx="30" cy="30" r="24" '
+        f'stroke-dasharray="{_RING_PERIMETER:.2f}" stroke-dashoffset="{offset:.2f}"/>'
+        f'<text x="30" y="35" text-anchor="middle" class="home-ring-text">{pct}%</text>'
+        '</svg>'
+        '</div>'
+    )
+
+
+def wave_chart_body(percent: int, key: str = "home") -> str:
+    # 圆心 30,30 半径 24 → 圆顶 y=6 圆底 y=54，水平面 y = 6 + (1 − pct) × 48
+    pct = max(0, min(100, int(percent)))
+    water_y = 6 + (1 - pct / 100) * 48
+    clip_id = f"home-wave-clip-{key}"
+    return (
+        '<div class="home-stat-chart">'
+        '<svg viewBox="0 0 60 60" class="home-wave-svg">'
+        '<defs>'
+        f'<clipPath id="{clip_id}"><circle cx="30" cy="30" r="24"/></clipPath>'
+        '</defs>'
+        '<circle class="home-wave-bg" cx="30" cy="30" r="24"/>'
+        f'<g clip-path="url(#{clip_id})">'
+        f'<path class="home-wave-fg" d="M -10 {water_y:.1f} Q 5 {water_y - 4:.1f} 20 {water_y:.1f} '
+        f'T 50 {water_y:.1f} T 80 {water_y:.1f} L 80 60 L -10 60 Z"/>'
+        f'<path class="home-wave-fg" opacity="0.55" d="M -10 {water_y + 4:.1f} '
+        f'Q 5 {water_y + 8:.1f} 20 {water_y + 4:.1f} T 50 {water_y + 4:.1f} '
+        f'T 80 {water_y + 4:.1f} L 80 60 L -10 60 Z"/>'
+        '</g>'
+        '<circle class="home-wave-border" cx="30" cy="30" r="24"/>'
+        f'<text x="30" y="35" text-anchor="middle" class="home-wave-text">{pct}%</text>'
+        '</svg>'
+        '</div>'
+    )
 
 
 home_data = load_home_dashboard_data()
@@ -307,7 +363,7 @@ dashboard_css = """
 .home-platform-icon img { width:100%; height:100%; object-fit:cover; display:block; }
 .home-status-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin:16px 0; }
 .home-status-grid div { padding:10px 11px; background:var(--color-bg-soft); border:1px solid var(--color-border); border-radius:14px; }
-.home-status-grid span, .home-card-data span, .home-stat-cell span { display:block; color:var(--color-text-secondary); font-size:12px; line-height:1.2; }
+.home-status-grid span, .home-card-data span { display:block; color:var(--color-text-secondary); font-size:12px; line-height:1.2; }
 .home-status-grid b { display:block; margin-top:5px; font-size:14px; color:var(--color-text); }
 .home-status-ok { color:var(--color-success) !important; }
 .home-status-warn { color:var(--color-warning) !important; }
@@ -323,9 +379,30 @@ dashboard_css = """
 .home-stat-title h3 { margin:0; color:var(--color-text); font-size:19px; font-weight:900; }
 .home-stat-title p { margin:6px 0 0; color:var(--color-text-secondary); font-size:12px; line-height:1.45; }
 .home-stat-grid { display:grid; grid-template-columns:repeat(6, minmax(0, 1fr)); gap:10px; }
-.home-stat-cell { padding:13px 10px; text-align:center; background:var(--color-bg-soft); border:1px solid var(--color-border); border-radius:16px; box-sizing:border-box; }
-.home-stat-cell strong { display:block; margin-top:6px; color:var(--color-text); font-size:24px; line-height:1.05; font-weight:900; }
-.home-stat-cell em { display:block; margin-top:5px; color:var(--color-text-muted); font-size:11px; font-style:normal; }
+.home-stat-cell { padding:14px 10px; min-height:140px; text-align:center; background:var(--color-bg-soft); border:1px solid var(--color-border); border-radius:16px; box-sizing:border-box; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:6px; }
+.home-stat-cell > span { color:var(--color-text-secondary); font-size:12px; line-height:1.2; }
+.home-stat-cell strong { display:block; color:var(--color-text); font-size:34px; line-height:1.05; font-weight:900; }
+.home-stat-cell strong.home-stat-num-muted { color:var(--color-text-secondary); }
+.home-stat-cell em { display:block; color:var(--color-text-muted); font-size:11px; font-style:normal; }
+.home-stat-chart { display:flex; align-items:center; justify-content:center; }
+.home-stat-chart svg { width:64px; height:64px; }
+.home-ring-svg { --ring-color: var(--color-primary); }
+.home-ring-svg.home-ring-primary { --ring-color: var(--color-primary); }
+.home-ring-svg.home-ring-secondary { --ring-color: var(--color-secondary); }
+.home-ring-svg.home-ring-accent { --ring-color: var(--color-accent); }
+/* 面试阶段递进配色：用 success(浅) → primary(深) 在 srgb 空间做 4 段插值，
+   再叠一点 --color-text 做最深一档，整体随主题切换。 */
+.home-ring-svg.home-ring-step-0 { --ring-color: color-mix(in srgb, var(--color-success) 78%, var(--color-primary)); }
+.home-ring-svg.home-ring-step-1 { --ring-color: color-mix(in srgb, var(--color-success) 38%, var(--color-primary)); }
+.home-ring-svg.home-ring-step-2 { --ring-color: var(--color-primary); }
+.home-ring-svg.home-ring-step-3 { --ring-color: color-mix(in srgb, var(--color-primary) 70%, var(--color-text)); }
+.home-ring-bg { fill:none; stroke:color-mix(in srgb, var(--ring-color) 18%, var(--color-bg-soft)); stroke-width:6; }
+.home-ring-fg { fill:none; stroke:var(--ring-color); stroke-width:6; stroke-linecap:round; transform:rotate(-90deg); transform-origin:50% 50%; }
+.home-ring-text { font-size:14px; font-weight:900; fill:var(--color-text); }
+.home-wave-bg { fill:var(--color-primary-soft); }
+.home-wave-fg { fill:var(--color-primary); }
+.home-wave-border { fill:none; stroke:var(--color-primary); stroke-width:1.4; opacity:.45; }
+.home-wave-text { font-size:14px; font-weight:900; fill:#fff; paint-order:stroke; stroke:rgba(0,0,0,.35); stroke-width:2; }
 @media (max-width: 980px) { .home-dashboard-shell { padding:18px; } .home-platform-grid, .home-stat-panel { grid-template-columns:1fr; } .home-stat-grid { grid-template-columns:repeat(2, 1fr); } .home-dashboard-title { align-items:flex-start; flex-direction:column; } }
 </style>
 """
@@ -349,27 +426,40 @@ ext_bar_html = (
 
 platform_cards = "".join(platform_card_html(platform, home_data) for platform in platforms)
 resume_stats = stat_row_html(
-    "简历库总数",
-    "按已入库简历来源平台汇总，辅助判断采集转化效果。",
+    "简历库信息",
+    "自动采集结果，按已入库简历来源平台汇总统计。",
     [
-        ("简历库总数", fmt_count(resume_total), "已归档"),
-        ("今日采集", fmt_count(home_data["today_resumes"]), "今日入库"),
-        ("智联", fmt_count(platform_resume_counts["zhilian"]), "智联招聘"),
-        ("BOSS", fmt_count(platform_resume_counts["boss"]), "BOSS直聘"),
-        ("前程", fmt_count(platform_resume_counts["qiancheng"]), "51前程无忧"),
-        ("入库率", f"{archive_rate}%", "入库/采集"),
+        ("简历库总数", stat_value_body(fmt_count(resume_total)), "已归档"),
+        ("今日采集", stat_value_body(fmt_count(home_data["today_resumes"]), muted=True), "今日入库"),
+        ("智联", ring_chart_body(safe_pct(platform_resume_counts["zhilian"], resume_total), "primary"),
+            f'{fmt_count(platform_resume_counts["zhilian"])} · 智联招聘'),
+        ("BOSS", ring_chart_body(safe_pct(platform_resume_counts["boss"], resume_total), "secondary"),
+            f'{fmt_count(platform_resume_counts["boss"])} · BOSS直聘'),
+        ("前程", ring_chart_body(safe_pct(platform_resume_counts["qiancheng"], resume_total), "accent"),
+            f'{fmt_count(platform_resume_counts["qiancheng"])} · 51前程无忧'),
+        ("入库率", wave_chart_body(archive_rate, key="archive"), "入库/采集"),
     ],
 )
+interview_total_with_pending = (
+    int(interviews["pending"] or 0)
+    + int(interviews["first"] or 0)
+    + int(interviews["second"] or 0)
+    + int(interviews["third"] or 0)
+)
 interview_stats = stat_row_html(
-    "面试总数",
-    "跟进邀约池与各轮面试评价数量，快速判断招聘推进节奏。",
+    "面试/待邀信息",
+    "面试邀约池与各轮面试数量统计，数字化管理面试全流程。",
     [
-        ("面试总数", fmt_count(interviews["total"]), "全部邀约"),
-        ("招聘岗位数", fmt_count(interviews["positions"]), "岗位库"),
-        ("待邀", fmt_count(interviews["pending"]), "待处理"),
-        ("一面", fmt_count(interviews["first"]), "第一轮"),
-        ("二面", fmt_count(interviews["second"]), "第二轮"),
-        ("三面", fmt_count(interviews["third"]), "第三轮"),
+        ("面试/待邀总数", stat_value_body(fmt_count(interview_total_with_pending)), "全部邀约"),
+        ("招聘岗位数", stat_value_body(fmt_count(interviews["positions"]), muted=True), "岗位库"),
+        ("待邀", ring_chart_body(safe_pct(interviews["pending"], interview_total_with_pending), "step-0"),
+            f'{fmt_count(interviews["pending"])} · 待处理'),
+        ("一面", ring_chart_body(safe_pct(interviews["first"], interview_total_with_pending), "step-1"),
+            f'{fmt_count(interviews["first"])} · 第一轮'),
+        ("二面", ring_chart_body(safe_pct(interviews["second"], interview_total_with_pending), "step-2"),
+            f'{fmt_count(interviews["second"])} · 第二轮'),
+        ("三面", ring_chart_body(safe_pct(interviews["third"], interview_total_with_pending), "step-3"),
+            f'{fmt_count(interviews["third"])} · 第三轮'),
     ],
 )
 

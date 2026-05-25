@@ -37,7 +37,7 @@ from recruitment_assistant.services.extension_contract import (
 )
 
 
-ZHILIAN_BRIDGE_VERSION = "1.30.0"
+ZHILIAN_BRIDGE_VERSION = "1.31.0"
 
 
 class ZhilianWSBridge:
@@ -1246,8 +1246,8 @@ class ZhilianWSBridge:
         s = re.sub(r"[（(][^）)]*[）)]", "", raw)
         s = re.split(r"[/／]", s, maxsplit=1)[0]
         s = s.strip()
-        if len(s) > 8:
-            s = s[:8]
+        if len(s) > 12:
+            s = s[:12]
         return s
 
     def _save_resume(self, data: dict) -> None:

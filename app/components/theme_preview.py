@@ -98,7 +98,26 @@ body {{ margin:0; font-family:var(--font-family-base, -apple-system, BlinkMacSys
 .tp-status-banner .sb-item {{ text-align:center; }}
 .tp-status-banner .sb-label {{ display:block; font-size:10px; color:var(--color-text-secondary); }}
 .tp-status-banner .sb-value {{ display:block; font-size:14px; font-weight:800; color:var(--color-text); margin-top:2px; }}
-@media (max-width:720px) {{ .tp-grid {{ grid-template-columns:1fr; }} }}
+.tp-pct-grid {{ display:grid; grid-template-columns:repeat(4, 1fr); gap:12px; }}
+.tp-pct-cell {{ background:var(--color-surface); border:1px solid var(--color-border); border-radius:14px; padding:14px 12px 12px; text-align:center; display:flex; flex-direction:column; align-items:center; justify-content:flex-start; box-shadow:var(--shadow-sm); }}
+.tp-pct-svg {{ width:100%; max-width:170px; height:96px; }}
+.tp-pct-num {{ font-size:20px; font-weight:900; fill:var(--color-text); }}
+.tp-pct-num-light {{ font-size:18px; font-weight:900; fill:#fff; paint-order:stroke; stroke:rgba(0,0,0,.28); stroke-width:2px; }}
+.tp-pct-label {{ font-size:11px; color:var(--color-text-secondary); margin-top:8px; font-weight:700; line-height:1.4; }}
+.tp-gauge-bg {{ fill:none; stroke:var(--color-primary-soft); stroke-width:14; stroke-linecap:round; }}
+.tp-gauge-fg {{ fill:none; stroke:var(--color-primary); stroke-width:14; stroke-linecap:round; }}
+.tp-ring-bg {{ fill:none; stroke:var(--color-primary-soft); stroke-width:12; }}
+.tp-ring-fg {{ fill:none; stroke:var(--color-primary); stroke-width:12; stroke-linecap:round; transform:rotate(-90deg); transform-origin:50% 50%; }}
+.tp-pct-cell-bullet {{ justify-content:center; padding:18px 14px 14px; }}
+.tp-bullet-num {{ font-size:22px; font-weight:900; color:var(--color-text); margin-bottom:14px; }}
+.tp-bullet-track {{ position:relative; height:12px; background:var(--color-primary-soft); border-radius:999px; margin-bottom:8px; width:100%; }}
+.tp-bullet-fill {{ height:100%; background:linear-gradient(90deg, var(--color-primary), var(--color-accent)); border-radius:999px; }}
+.tp-bullet-target {{ position:absolute; top:-4px; bottom:-4px; width:3px; background:var(--color-text); border-radius:2px; }}
+.tp-bullet-scale {{ display:flex; justify-content:space-between; width:100%; font-size:9px; color:var(--color-text-secondary); font-weight:700; }}
+.tp-wb-bg {{ fill:var(--color-primary-soft); }}
+.tp-wb-wave {{ fill:var(--color-primary); }}
+.tp-wb-border {{ fill:none; stroke:var(--color-primary); stroke-width:1.5; opacity:.45; }}
+@media (max-width:720px) {{ .tp-grid {{ grid-template-columns:1fr; }} .tp-pct-grid {{ grid-template-columns:repeat(2, 1fr); }} }}
 </style>
 <div class="tp">
   <div class="tp-banner">
@@ -128,6 +147,55 @@ body {{ margin:0; font-family:var(--font-family-base, -apple-system, BlinkMacSys
       <div class="tp-progress"><span></span></div>
       <div style="height:10px"></div>
       <div class="tp-tags"><span class="tp-tag">成功</span><span class="tp-tag">待处理</span><span class="tp-tag">高优先级</span></div>
+    </div>
+  </div>
+  <div class="tp-section">
+    <div class="tp-section-title">百分比可视化控件</div>
+    <div class="tp-pct-grid">
+      <div class="tp-pct-cell">
+        <svg class="tp-pct-svg" viewBox="0 0 160 100">
+          <path class="tp-gauge-bg" d="M 18 88 A 62 62 0 0 1 142 88" />
+          <path class="tp-gauge-fg" d="M 18 88 A 62 62 0 0 1 142 88"
+                stroke-dasharray="194.78" stroke-dashoffset="58.43" />
+          <text x="80" y="80" text-anchor="middle" class="tp-pct-num">70%</text>
+        </svg>
+        <div class="tp-pct-label">半圆仪表盘<br/>批次达成率</div>
+      </div>
+      <div class="tp-pct-cell">
+        <svg class="tp-pct-svg" viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet">
+          <circle class="tp-ring-bg" cx="50" cy="50" r="38" />
+          <circle class="tp-ring-fg" cx="50" cy="50" r="38"
+                  stroke-dasharray="238.76" stroke-dashoffset="68.50" />
+          <text x="50" y="56" text-anchor="middle" class="tp-pct-num">71%</text>
+        </svg>
+        <div class="tp-pct-label">环形进度<br/>简历解析进度</div>
+      </div>
+      <div class="tp-pct-cell tp-pct-cell-bullet">
+        <div class="tp-bullet-num">82%</div>
+        <div class="tp-bullet-track">
+          <div class="tp-bullet-fill" style="width:82%"></div>
+          <div class="tp-bullet-target" style="left:90%"></div>
+        </div>
+        <div class="tp-bullet-scale"><span>0</span><span>50%</span><span>目标 90%</span></div>
+        <div class="tp-pct-label" style="margin-top:10px">子弹图<br/>实际 vs 目标</div>
+      </div>
+      <div class="tp-pct-cell">
+        <svg class="tp-pct-svg" viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet">
+          <defs>
+            <clipPath id="tp-wb-clip"><circle cx="50" cy="50" r="38" /></clipPath>
+          </defs>
+          <circle class="tp-wb-bg" cx="50" cy="50" r="38" />
+          <g clip-path="url(#tp-wb-clip)">
+            <path class="tp-wb-wave"
+                  d="M -10 55 Q 15 47 40 55 T 90 55 T 140 55 L 140 100 L -10 100 Z" />
+            <path class="tp-wb-wave" opacity="0.55"
+                  d="M -10 60 Q 15 68 40 60 T 90 60 T 140 60 L 140 100 L -10 100 Z" />
+          </g>
+          <circle class="tp-wb-border" cx="50" cy="50" r="38" />
+          <text x="50" y="56" text-anchor="middle" class="tp-pct-num-light">63%</text>
+        </svg>
+        <div class="tp-pct-label">水波球<br/>磁盘 / 配额占用</div>
+      </div>
     </div>
   </div>
   <div class="tp-section">

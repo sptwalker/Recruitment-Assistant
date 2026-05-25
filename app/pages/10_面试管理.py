@@ -460,6 +460,15 @@ try:
                 fp = Path(cand.resume_source.file_path) if cand.resume_source and cand.resume_source.file_path else None
                 if fp:
                     st.markdown(f"<div class='interview-file-path'>📎 {fp}</div>", unsafe_allow_html=True)
+                wp = Path(cand.resume_source.attachment_works_path) if cand.resume_source and getattr(cand.resume_source, "attachment_works_path", None) else None
+                if wp:
+                    works_row = st.columns([8, 1])
+                    works_row[0].markdown(f"<div class='interview-file-path'>🎨 {wp}</div>", unsafe_allow_html=True)
+                    if works_row[1].button("打开作品", key=f"interview_open_works_{inv.invitation_id}", use_container_width=True, disabled=not wp.exists()):
+                        try:
+                            os.startfile(str(wp))
+                        except OSError as exc:
+                            st.error(f"打开作品失败：{exc}")
 
                 action_cols = st.columns(5)
                 if action_cols[0].button("打开简历", key=f"interview_open_{inv.invitation_id}", use_container_width=True, disabled=not (fp and fp.exists())):

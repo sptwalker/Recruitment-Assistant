@@ -146,6 +146,7 @@ class ResumeSource(ResumeBase):
     file_name: Mapped[str | None] = mapped_column(String(255))
     file_type: Mapped[str | None] = mapped_column(String(10))
     file_path: Mapped[str | None] = mapped_column(Text)
+    attachment_works_path: Mapped[str | None] = mapped_column(Text)
     crawl_time: Mapped[datetime | None] = mapped_column(DateTime)
     is_duplicate: Mapped[int] = mapped_column(Integer, default=0)
 

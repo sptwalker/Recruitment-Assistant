@@ -62,13 +62,19 @@ RESUME_DIRS = {
 
 
 def scan_resume_files() -> list[dict]:
-    """扫描三个平台目录下所有 PDF/DOCX 简历文件。"""
+    """扫描三个平台目录下所有 PDF/DOCX 简历文件。
+
+    带「（附件作品）」标记的文件不是独立简历，是某候选人的作品附件，跳过；
+    解析入库主流程结束后，再由 `link_attachment_works_for_resume` 按文件名配对到对应候选人。
+    """
     files = []
     for platform, base_dir in RESUME_DIRS.items():
         if not base_dir.exists():
             continue
         for f in sorted(base_dir.rglob("*"), key=lambda p: p.stat().st_mtime, reverse=True):
             if f.suffix.lower() in (".pdf", ".docx", ".doc") and f.is_file():
+                if "（附件作品）" in f.stem:
+                    continue
                 files.append({
                     "path": f,
                     "platform": platform,
@@ -77,6 +83,33 @@ def scan_resume_files() -> list[dict]:
                     "mtime": datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M"),
                 })
     return files
+
+
+def find_attachment_works_path_for(resume_path: Path) -> str | None:
+    """根据简历文件名在同目录找配对的作品 PDF。
+
+    简历命名：<name>-<age>-<edu>[-position]-<source>-<date>-<time>-<seq>.pdf
+    作品命名：<name>-<age>-<edu>[-position]-<source>-（附件作品）-<date>-<time>-<seq>.pdf
+
+    规则：同目录、文件名以「<resume_stem 前缀（去末尾日期/时间/序号 3 段）>」为前缀、含「（附件作品）」的 .pdf 文件。
+    """
+    if not resume_path.exists():
+        return None
+    folder = resume_path.parent
+    stem = resume_path.stem
+    parts = stem.split("-")
+    # 至少 3 段（姓名/年龄/学历/...日期/时间/序号），剥掉末尾 3 段当 prefix。
+    if len(parts) < 4:
+        return None
+    prefix = "-".join(parts[:-3])
+    for f in folder.glob("*.pdf"):
+        if f == resume_path:
+            continue
+        if "（附件作品）" not in f.stem:
+            continue
+        if f.stem.startswith(prefix + "-"):
+            return str(f)
+    return None
 
 
 def extract_text(path: Path) -> str:
@@ -226,6 +259,7 @@ with tabs[0]:
 
     # ---------- 渲染日志窗口（HTML，文字可选中，无灰化）----------
     import html as _html
+    import streamlit.components.v1 as components
 
     def render_log_window() -> None:
         # 只保留最后 500 行展示，避免 DOM 过大
@@ -240,51 +274,62 @@ with tabs[0]:
             f"<div class='{_log_row_class(line)}'>{_html.escape(line) or '&nbsp;'}</div>"
             for line in recent
         )
+        # 用 components.html 而不是 st.markdown：markdown 会过滤 <script>，
+        # 自动滚到底脚本必须靠真正的 iframe 执行。
+        # overflow-y: scroll（不是 auto）= 始终保留滚动条占位，避免内容达阈值时整体宽度抖动。
         html = f"""
         <div id='resume-log-window' class='resume-log-window'>
           {escaped_rows}
         </div>
         <script>
-          setTimeout(() => {{
-            const logWindow = document.getElementById('resume-log-window');
-            if (logWindow) {{
-              logWindow.scrollTop = logWindow.scrollHeight;
-            }}
-          }}, 0);
+          (function() {{
+            const win = document.getElementById('resume-log-window');
+            if (!win) return;
+            // 首次渲染：直接到底
+            win.scrollTop = win.scrollHeight;
+            // 监听后续 DOM 变化（Streamlit 增量重渲染时新行追加进来即贴底）
+            const obs = new MutationObserver(() => {{
+              win.scrollTop = win.scrollHeight;
+            }});
+            obs.observe(win, {{ childList: true, subtree: true, characterData: true }});
+          }})();
         </script>
         <style>
+          html, body {{ margin: 0; padding: 0; background: transparent; }}
           .resume-log-window {{
             height: 460px;
-            overflow-y: auto;
-            background: var(--color-surface);
-            color: var(--color-text);
+            overflow-y: scroll;          /* 始终显示滚动条 */
+            background: #ffffff;
+            color: #262730;
             font-family: 'Consolas','Monaco','Microsoft YaHei Mono','Microsoft YaHei',monospace;
             font-size: 13px;
             line-height: 1.55;
             padding: 12px 14px;
             border-radius: 6px;
-            border: 1px solid var(--color-border);
+            border: 1px solid #e6eaf1;
             white-space: pre-wrap;
             word-break: break-all;
             user-select: text;            /* 允许选中文字 */
+            scrollbar-gutter: stable;
           }}
           .resume-log-window .log-row {{
-            color: var(--color-text);
+            color: #262730;
           }}
           .resume-log-window .log-row-error {{
-            color: var(--color-danger);
+            color: #c0392b;
             font-weight: 700;
           }}
           .resume-log-window::-webkit-scrollbar {{ width: 10px; }}
-          .resume-log-window::-webkit-scrollbar-track {{ background: var(--color-bg-soft); }}
+          .resume-log-window::-webkit-scrollbar-track {{ background: #f0f2f6; }}
           .resume-log-window::-webkit-scrollbar-thumb {{
-            background: var(--color-border-strong, var(--color-border));
+            background: #c8ccd4;
             border-radius: 5px;
           }}
-          .resume-log-window::-webkit-scrollbar-thumb:hover {{ background: var(--color-text-muted); }}
+          .resume-log-window::-webkit-scrollbar-thumb:hover {{ background: #9aa0a6; }}
         </style>
         """
-        st.markdown(html, unsafe_allow_html=True)
+        # iframe 高度比 480 多 6px，给边框/圆角留余量
+        components.html(html, height=486, scrolling=False)
 
     render_log_window()
 
@@ -580,6 +625,7 @@ with tabs[0]:
                                 file_name=fname,
                                 file_type=path.suffix.lstrip(".").upper(),
                                 file_path=str(path),
+                                attachment_works_path=find_attachment_works_path_for(path),
                                 crawl_time=datetime.now(),
                             )
                             try:
@@ -856,6 +902,21 @@ def _render_candidate_detail(c, svc, session) -> None:
                     st.error(f"打开目录失败：{exc}")
             if not file_exists:
                 st.warning("⚠️ 文件不存在，可能已被移动或删除")
+        if getattr(rs, "attachment_works_path", None):
+            st.markdown("**🎨 附件作品文件地址：**")
+            st.code(rs.attachment_works_path, language=None)
+            wp = Path(rs.attachment_works_path)
+            works_exists = wp.exists()
+            works_cols = st.columns([1, 7])
+            if works_cols[0].button("📄 打开", key=f"browse_open_works_{c.candidate_id}",
+                                     disabled=not works_exists,
+                                     help="用默认应用打开附件作品文件"):
+                try:
+                    os.startfile(str(wp))
+                except OSError as exc:
+                    st.error(f"打开失败：{exc}")
+            if not works_exists:
+                st.warning("⚠️ 附件作品文件不存在，可能已被移动或删除")
     else:
         st.markdown("_（无）_")
 

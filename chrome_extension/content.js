@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  const CONTENT_SCRIPT_VERSION = "2.38.0";
+  const CONTENT_SCRIPT_VERSION = "2.39.3";
 
   // 平台注册表：每个平台的 hostname、WS 端口、文本标记、localStorage key 一站式声明。
   // 这是从单平台升级到多平台的核心入口——新加平台只需在此对象增加一条配置。
@@ -920,9 +920,9 @@
     s = s.trim();
     const chineseOnly = (s.match(/[一-龥]/g) || []).join("");
     if (chineseOnly && chineseOnly.length > 0) {
-      return chineseOnly.length > 8 ? chineseOnly.slice(0, 8) : chineseOnly;
+      return chineseOnly.length > 12 ? chineseOnly.slice(0, 12) : chineseOnly;
     }
-    return s.length > 8 ? s.slice(0, 8) : s;
+    return s.length > 12 ? s.slice(0, 12) : s;
   }
 
   async function waitForContactInfo(clickedItem = null, timeoutMs = 2200) {
@@ -3087,11 +3087,15 @@
     profile_link_info: ".info-main .person-info .link-info",
     attachment_btn_scope: ".chat-user-operate",
     attachment_btn_text: "附件简历",
+    attachment_works_btn_text: "附件作品",
     preview_container: ".annex-resume",
     preview_ready_marker: ".annex-resume .container-options-item.item-download",
     download_btn_sensor: "#sensor_Bchatinfo_xiazai",
     download_btn_class: ".container-options-item.item-download",
     close_preview: ".annex-resume .container-close",
+    // 附件作品预览页是独立 Vue modal（data-v-0cc45215），下载是原生 <a class="download_a" href="blob:...">。
+    // 简历那套 .annex-resume / .item-download selector 在作品 modal 不存在；必须独立 selector。
+    attachment_works_download_anchor: 'a.download_a[href^="blob:"]',
   };
 
   const QIANCHENG_EDUCATION_KEYWORDS = ["博士", "硕士", "本科", "大专", "专科", "高中", "中专", "中职", "初中"];
@@ -3159,7 +3163,7 @@
   }
 
   function simplifyQianchengTalkingPosition(raw) {
-    // 对齐 bridge 端 _simplify_talking_position 规则：剥括号 + 首段 + 限 8 字符。
+    // 对齐 bridge 端 _simplify_talking_position 规则：剥括号 + 首段 + 限 12 字符。
     // 防御：纯标点 / 空白 / 单冒号必须返回空串，不能进入文件名。
     if (!raw) return "";
     const s0 = String(raw).trim();
@@ -3169,7 +3173,7 @@
     s = s.split(/[/／、|｜・·]/)[0];
     s = s.trim();
     if (!s || !/[一-龥a-zA-Z0-9]/.test(s)) return "";
-    if (s.length > 8) s = s.slice(0, 8);
+    if (s.length > 12) s = s.slice(0, 12);
     return s;
   }
 
@@ -3189,6 +3193,21 @@
     const candidates = Array.from(scope.querySelectorAll("span, div, button, a"));
     for (const c of candidates) {
       if ((c.innerText || c.textContent || "").trim() === QIANCHENG_SELECTORS.attachment_btn_text) return c;
+    }
+    return null;
+  }
+
+  function findQianchengAttachmentWorksButton() {
+    // 与「附件简历」共用 .file-type-text class，仅文本不同。
+    const scope = document.querySelector(QIANCHENG_SELECTORS.attachment_btn_scope);
+    if (!scope) return null;
+    const all = scope.querySelectorAll(".file-type-text");
+    for (const el of all) {
+      if ((el.innerText || el.textContent || "").trim() === QIANCHENG_SELECTORS.attachment_works_btn_text) return el;
+    }
+    const candidates = Array.from(scope.querySelectorAll("span, div, button, a"));
+    for (const c of candidates) {
+      if ((c.innerText || c.textContent || "").trim() === QIANCHENG_SELECTORS.attachment_works_btn_text) return c;
     }
     return null;
   }
@@ -3321,6 +3340,85 @@
     return `qiancheng|profile|${name}|${age}|${education}`;
   }
 
+  async function waitForQianchengWorksDownloadAnchor(timeoutMs = 6000) {
+    // 作品 modal 是异步渲染：href="blob:..." 通常要等几百 ms 才挂上。
+    // 命中条件：a.download_a[href^="blob:"] 且 visible。
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const anchors = document.querySelectorAll(QIANCHENG_SELECTORS.attachment_works_download_anchor);
+      for (const a of anchors) {
+        const rect = a.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0) return a;
+      }
+      await sleep(200);
+    }
+    return null;
+  }
+
+  async function tryDownloadQianchengAttachmentWorks(candidateId, signature, info) {
+    // 简历下载并 persist_ack=saved 之后才会进来。整段是加分项：任何一步失败都
+    // emit qiancheng_attachment_works_skipped、return false，不影响主流程。
+    // 区别于简历分支的关键：download_intent 带 variant="attachment_works"，
+    // background.js 通过 spread 透传给 resume_downloaded 事件，bridge 据此走 _save_attachment_works。
+    const btn = findQianchengAttachmentWorksButton();
+    if (!btn) {
+      // 没有作品按钮属于多数情况，静默 console.log，不发事件占用日志条。
+      try { console.debug("[qiancheng works] no attachment_works button", { sig: signature }); } catch {}
+      return false;
+    }
+    emit({ type: "qiancheng_attachment_works_button_found", data: { candidate_id: candidateId, candidate_signature: signature } });
+
+    clickElementReliably(btn);
+    await sleep(400);
+
+    // 注意：不能复用 waitForQianchengPreviewReady（那个等的是 .annex-resume 简历 modal 的 selector）。
+    // 作品 modal 是独立 Vue scope，必须等它自己的下载锚点出现。
+    const downloadAnchor = await waitForQianchengWorksDownloadAnchor(6000);
+    if (!downloadAnchor) {
+      emit({ type: "qiancheng_attachment_works_skipped", data: { candidate_id: candidateId, candidate_signature: signature, reason: "works_download_anchor_not_found" } });
+      // 关闭对话框：作品 modal 通常也响应简历那套 close 按钮，不行就 ESC 兜底。
+      const closeBtn = findQianchengClosePreviewButton();
+      if (closeBtn) { clickElementReliably(closeBtn); await sleep(400); }
+      else { document.body?.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })); }
+      return false;
+    }
+
+    const downloadRequestId = makeDownloadRequestId(candidateId, signature);
+    emit({
+      type: "download_intent",
+      data: {
+        candidate_id: candidateId,
+        candidate_signature: signature,
+        candidate_info: info,
+        expected_filename: `${signature}_works.pdf`,
+        download_request_id: downloadRequestId,
+        variant: "attachment_works",
+      },
+    });
+    const resultPromise = waitForDownloadResult(downloadRequestId, 20000);
+    // 原生 <a download href="blob:..."> 用 click() 即可触发 Chrome downloads；不要走 dispatchEvent，
+    // 部分 Chromium 版本对合成 click 不下载 blob。
+    try { downloadAnchor.click(); }
+    catch (_e) { clickElementReliably(downloadAnchor); }
+    const downloadResult = await resultPromise;
+    if (downloadResult.ok) {
+      // finalizeDownloadWithPersistAck 等的是 persist_ack；works 分支 bridge 也会回 ack（status="works_saved"）。
+      await finalizeDownloadWithPersistAck(candidateId, signature, downloadRequestId, "qiancheng_attachment_works");
+    } else {
+      emit({ type: "qiancheng_attachment_works_skipped", data: { candidate_id: candidateId, candidate_signature: signature, reason: downloadResult.reason || "download_failed" } });
+    }
+
+    const closeBtn = findQianchengClosePreviewButton();
+    if (closeBtn) {
+      clickElementReliably(closeBtn);
+      await sleep(400);
+    } else {
+      document.body?.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+      await sleep(300);
+    }
+    return downloadResult.ok;
+  }
+
   async function qianchengCollectLoop() {
     emit({ type: "page_ready", data: { url: location.href, platform: "qiancheng" } });
     const ready = await ensureQianchengOnChattingPage();
@@ -3449,10 +3547,12 @@
       const resultPromise = waitForDownloadResult(downloadRequestId, 20000);
       clickElementReliably(downloadBtn);
       const downloadResult = await resultPromise;
+      let resumeSaved = false;
       if (downloadResult.ok) {
         await finalizeDownloadWithPersistAck(candidateId, signature, downloadRequestId, "qiancheng_sensor_download");
         dedupSignatures.add(signature);
         if (candidateKey) dedupKeys.add(candidateKey);
+        resumeSaved = true;
       } else {
         emit({ type: "candidate_skipped", data: { candidate_id: candidateId, candidate_signature: signature, reason: downloadResult.reason || "download_failed" } });
         results.skipped++;
@@ -3462,6 +3562,15 @@
       if (closeBtn) {
         clickElementReliably(closeBtn);
         await sleep(500);
+      }
+
+      // 简历下载成功后再独立尝试附件作品。失败不阻断、不计入 skipped。
+      if (resumeSaved) {
+        try {
+          await tryDownloadQianchengAttachmentWorks(candidateId, signature, info);
+        } catch (error) {
+          emit({ type: "qiancheng_attachment_works_skipped", data: { candidate_id: candidateId, candidate_signature: signature, reason: "exception", error: String(error) } });
+        }
       }
 
       emit({ type: "collect_progress", data: { scanned_count: i + 1, current_index: i, downloaded: results.completed, skipped: results.skipped } });
@@ -4778,7 +4887,9 @@
           },
         });
         const key = data.download_request_id || data.candidate_signature || "";
-        const ackResult = { ok: data.status === "saved", status: data.status || "unknown", reason: data.reason || "", data };
+        // 状态白名单：saved=简历归档成功；works_saved=附件作品归档成功（同样视为正向 ack）。
+        const ackOk = data.status === "saved" || data.status === "works_saved";
+        const ackResult = { ok: ackOk, status: data.status || "unknown", reason: data.reason || "", data };
         const resolver = pendingPersistAcks.get(key);
         if (resolver) {
           pendingPersistAcks.delete(key);

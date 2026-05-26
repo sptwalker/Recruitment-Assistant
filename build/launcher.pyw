@@ -13,7 +13,6 @@ from pathlib import Path
 APP_ROOT = Path(__file__).resolve().parent
 PYTHON_DIR = APP_ROOT / "python"
 PGSQL_DIR = APP_ROOT / "pgsql"
-PGDATA_DIR = APP_ROOT / "pgdata"
 PYTHON_EXE = PYTHON_DIR / "python.exe"
 PG_CTL = PGSQL_DIR / "bin" / "pg_ctl.exe"
 INITDB = PGSQL_DIR / "bin" / "initdb.exe"
@@ -26,6 +25,27 @@ DB_USER = "postgres"
 DB_PASSWORD = "932092"
 
 LOG_FILE = APP_ROOT / "logs" / "launcher.log"
+
+
+def _safe_pgdata() -> Path:
+    """返回一个不含非 ASCII 字符的 pgdata 路径。
+
+    PostgreSQL initdb/pg_ctl 在 Windows 上无法处理路径中的中文字符
+    （UTF8 编码下会报 invalid byte sequence）。如果安装目录包含非 ASCII
+    字符，将 pgdata 放到 %LOCALAPPDATA%/ResumeAssistantPG/pgdata 下。
+    """
+    local_path = APP_ROOT / "pgdata"
+    try:
+        str(local_path).encode("ascii")
+        return local_path
+    except UnicodeEncodeError:
+        safe = Path(os.environ.get("LOCALAPPDATA", os.environ.get("TEMP", "C:\\Temp")))
+        safe = safe / "ResumeAssistantPG" / "pgdata"
+        safe.mkdir(parents=True, exist_ok=True)
+        return safe
+
+
+PGDATA_DIR = _safe_pgdata()
 
 
 def log(msg: str) -> None:
@@ -41,32 +61,24 @@ def is_port_open(port: int) -> bool:
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
-def _short_path(p: Path, ensure_exists: bool = False) -> str:
-    """将长路径转为 Windows 8.3 短路径，避免非 ASCII 字符导致 PostgreSQL 失败。
-
-    GetShortPathNameW 只对已存在的路径有效。如果路径不存在且 ensure_exists=True，
-    先创建目录再取短路径。对于祖先目录含中文的情况，逐级向上查找已存在的祖先取短路径。
-    """
-    import ctypes
-
-    if ensure_exists and not p.exists():
-        p.mkdir(parents=True, exist_ok=True)
-
-    buf = ctypes.create_unicode_buffer(512)
+def _safe_pg_log() -> str:
+    """返回 PostgreSQL 日志文件路径（纯 ASCII）。"""
+    local_log = APP_ROOT / "logs" / "postgresql.log"
     try:
-        rv = ctypes.windll.kernel32.GetShortPathNameW(str(p), buf, 512)
-        if rv and rv < 512 and buf.value:
-            return buf.value
-    except Exception:
-        pass
-    return str(p)
+        str(local_log).encode("ascii")
+        return str(local_log)
+    except UnicodeEncodeError:
+        safe = Path(os.environ.get("LOCALAPPDATA", os.environ.get("TEMP", "C:\\Temp")))
+        safe = safe / "ResumeAssistantPG"
+        safe.mkdir(parents=True, exist_ok=True)
+        return str(safe / "postgresql.log")
 
 
 def get_env() -> dict:
     env = os.environ.copy()
     env["PATH"] = f"{PGSQL_DIR / 'bin'};{PYTHON_DIR};{PYTHON_DIR / 'Scripts'};{env.get('PATH', '')}"
     env["PYTHONPATH"] = str(APP_ROOT)
-    env["PGDATA"] = _short_path(PGDATA_DIR, ensure_exists=True)
+    env["PGDATA"] = str(PGDATA_DIR)
     env["PGPORT"] = str(PG_PORT)
     env["PGUSER"] = DB_USER
     env["PGPASSWORD"] = DB_PASSWORD
@@ -76,10 +88,10 @@ def get_env() -> dict:
 def init_postgres() -> None:
     if not (PGDATA_DIR / "PG_VERSION").exists():
         log("Initializing PostgreSQL data directory...")
-        pgdata_path = _short_path(PGDATA_DIR, ensure_exists=True)
-        log(f"  PGDATA path: {pgdata_path}")
+        log(f"  PGDATA: {PGDATA_DIR}")
+        PGDATA_DIR.mkdir(parents=True, exist_ok=True)
         result = subprocess.run(
-            [_short_path(INITDB), "-D", pgdata_path, "-U", DB_USER, "-E", "UTF8", "--locale=C"],
+            [str(INITDB), "-D", str(PGDATA_DIR), "-U", DB_USER, "-E", "UTF8", "--locale=C"],
             env=get_env(),
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             creationflags=subprocess.CREATE_NO_WINDOW,
@@ -101,9 +113,9 @@ def start_postgres() -> None:
         return
     init_postgres()
     log("Starting PostgreSQL...")
-    pgdata_path = _short_path(PGDATA_DIR)
+    pg_log = _safe_pg_log()
     result = subprocess.run(
-        [_short_path(PG_CTL), "start", "-D", pgdata_path, "-l", _short_path(APP_ROOT / "logs" / "postgresql.log"), "-w"],
+        [str(PG_CTL), "start", "-D", str(PGDATA_DIR), "-l", pg_log, "-w"],
         env=get_env(),
         capture_output=True, text=True, encoding="utf-8", errors="replace",
         creationflags=subprocess.CREATE_NO_WINDOW,
@@ -123,14 +135,14 @@ def start_postgres() -> None:
 def ensure_database() -> None:
     env = get_env()
     result = subprocess.run(
-        [_short_path(PSQL), "-U", DB_USER, "-p", str(PG_PORT), "-lqt"],
+        [str(PSQL), "-U", DB_USER, "-p", str(PG_PORT), "-lqt"],
         capture_output=True, text=True, env=env,
         creationflags=subprocess.CREATE_NO_WINDOW,
     )
     if DB_NAME not in result.stdout:
         log(f"Creating database '{DB_NAME}'...")
         subprocess.run(
-            [_short_path(PSQL), "-U", DB_USER, "-p", str(PG_PORT), "-c", f"CREATE DATABASE {DB_NAME};"],
+            [str(PSQL), "-U", DB_USER, "-p", str(PG_PORT), "-c", f"CREATE DATABASE {DB_NAME};"],
             env=env, creationflags=subprocess.CREATE_NO_WINDOW, check=True,
         )
     log("Running database migrations...")
@@ -173,6 +185,8 @@ def main() -> None:
     try:
         log("=" * 50)
         log("简历智采助手启动中...")
+        log(f"  APP_ROOT: {APP_ROOT}")
+        log(f"  PGDATA:   {PGDATA_DIR}")
         start_postgres()
         ensure_database()
         proc = start_streamlit()

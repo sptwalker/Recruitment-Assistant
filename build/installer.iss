@@ -55,9 +55,16 @@ Type: filesandordirs; Name: "{app}\__pycache__"
 
 [Code]
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  SafePgDir: String;
 begin
   if CurUninstallStep = usPostUninstall then
   begin
+    { 清理 %LOCALAPPDATA%\ResumeAssistantPG（中文路径回退目录） }
+    SafePgDir := ExpandConstant('{localappdata}\ResumeAssistantPG');
+    if DirExists(SafePgDir) then
+      DelTree(SafePgDir, True, True, True);
+
     if MsgBox('是否保留数据目录（简历数据库、下载的附件）？', mbConfirmation, MB_YESNO) = IDNO then
     begin
       DelTree(ExpandConstant('{app}\data'), True, True, True);

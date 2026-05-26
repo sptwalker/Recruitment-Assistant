@@ -22,7 +22,7 @@ from typing import Any
 
 from loguru import logger
 
-from app.components.layout import APP_VERSION
+from recruitment_assistant.version import APP_VERSION
 from recruitment_assistant.services.crawl_task_service import BossCandidateRecordService, CrawlTaskService
 from recruitment_assistant.services.ws_server import ZhilianWSServer
 from recruitment_assistant.storage.db import create_session

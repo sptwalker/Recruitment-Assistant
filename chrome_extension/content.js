@@ -264,6 +264,8 @@
   }
 
   function findBestListContainer() {
+    const precise = document.querySelector("div.user-list.b-scroll-stable") || document.querySelector("div.user-list");
+    if (precise && isVisible(precise)) return precise;
     return LIST_CONTAINER_SELECTORS
       .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
       .filter((el) => isVisible(el) && isInLeftCandidateArea(el))
@@ -271,32 +273,28 @@
       .sort((a, b) => b.score - a.score)[0]?.el || null;
   }
 
-  // 与智联 scrollZhilianCandidateList 同款锚点策略：从最后一张候选人卡片反向走 parent 找真正的虚拟滚动容器，
-  // 再走 scrollIntoView(end) 兜底推动 React/Vue 懒加载下一批。仅靠 findBestListContainer 拿到的 score 第一容器
-  // 在 BOSS 沟通页是外层 wrapper（scrollHeight 早就到底），不是真正的虚拟列表容器。
+  // 优先通过 boss-virtual-list 的 Vue API scrollToOffset 驱动虚拟列表滚动，
+  // 比 scrollTop 更可靠，因为 user-list overflow:hidden 仅做布局，虚拟列表内部用 padding 模拟高度。
   function scrollBossCandidateList(dy) {
+    const container = document.querySelector("div.user-list.b-scroll-stable") || document.querySelector("div.user-list");
+    if (container) {
+      const vue = container.__vue__;
+      if (vue && typeof vue.scrollToOffset === "function") {
+        const currentOffset = vue.getOffset?.() || container.scrollTop || 0;
+        const newOffset = currentOffset + dy;
+        vue.scrollToOffset(newOffset);
+        container.dispatchEvent(new Event("scroll", { bubbles: true }));
+        return { ok: true, container, mode: "vue_scrollToOffset", before: currentOffset, after: newOffset };
+      }
+      const before = container.scrollTop;
+      container.scrollTop = before + dy;
+      container.dispatchEvent(new Event("scroll", { bubbles: true }));
+      if (container.scrollTop !== before) return { ok: true, container, mode: "user_list_scrollTop", before, after: container.scrollTop };
+    }
     const items = getCandidateItems();
     const anchor = items.length ? items[items.length - 1] : null;
     if (anchor) {
-      let node = anchor.parentElement;
-      while (node && node !== document.body) {
-        if (node.scrollHeight > node.clientHeight + 10) {
-          const before = node.scrollTop;
-          node.scrollTop = before + dy;
-          node.dispatchEvent(new Event("scroll", { bubbles: true }));
-          if (node.scrollTop !== before) return { ok: true, container: node, mode: "anchor_parent", before, after: node.scrollTop };
-          break;
-        }
-        node = node.parentElement;
-      }
       try { anchor.scrollIntoView({ block: "end" }); return { ok: true, container: anchor.parentElement || null, mode: "scroll_into_view_end", before: 0, after: 0 }; } catch {}
-    }
-    const fallback = findBestListContainer();
-    if (fallback) {
-      const before = fallback.scrollTop;
-      fallback.scrollTop = before + dy;
-      fallback.dispatchEvent(new Event("scroll", { bubbles: true }));
-      return { ok: fallback.scrollTop !== before, container: fallback, mode: "fallback_best_container", before, after: fallback.scrollTop };
     }
     return { ok: false, container: null, mode: "no_container", before: 0, after: 0 };
   }
@@ -306,115 +304,60 @@
       emit({ type: "boss_chat_menu_skip", data: { reason: "already_on_chat", url: location.href } });
       return true;
     }
-    let attempts = 0;
     for (let wave = 0; wave < 3; wave++) {
-      attempts++;
-      const candidates = [];
-      const all = document.querySelectorAll("a, button, span, li, div, [role='menuitem'], [class*='menu'], [class*='nav']");
-      for (const el of all) {
-        const text = (el.innerText || el.textContent || "").trim();
-        if (text !== "沟通") continue;
-        const rect = el.getBoundingClientRect();
-        if (rect.width <= 0 || rect.height <= 0) continue;
-        if (rect.left >= window.innerWidth * 0.3) continue;
-        if (rect.width >= 200) continue;
-        if (!isVisible(el)) continue;
-        candidates.push({ el, rect });
-      }
-      if (candidates.length > 0) {
-        candidates.sort((a, b) => a.rect.left - b.rect.left);
-        const target = candidates[0].el;
+      const target = document.querySelector('dl.menu-chat a[href*="/web/chat"]');
+      if (target && isVisible(target)) {
         try {
           clickElementDirect(target);
-          emit({ type: "boss_chat_menu_clicked", data: { rect: candidates[0].rect, attempts } });
+          emit({ type: "boss_chat_menu_clicked", data: { rect: target.getBoundingClientRect(), attempts: wave + 1 } });
           await sleep(800);
           return true;
         } catch (exc) {
-          emit({ type: "boss_chat_menu_skip", data: { reason: "click_failed", error: String(exc), attempts } });
+          emit({ type: "boss_chat_menu_skip", data: { reason: "click_failed", error: String(exc), attempts: wave + 1 } });
           return false;
         }
       }
       await sleep(500);
     }
-    emit({ type: "boss_chat_menu_skip", data: { reason: "not_found", url: location.href, attempts } });
+    emit({ type: "boss_chat_menu_skip", data: { reason: "not_found", url: location.href, attempts: 3 } });
     return false;
   }
 
   async function clickBossChattingTab() {
-    let attempts = 0;
     for (let wave = 0; wave < 3; wave++) {
-      attempts++;
-      const candidates = [];
-      const all = document.querySelectorAll("a, button, span, li, div, [role='tab'], [class*='tab'], [class*='filter']");
-      for (const el of all) {
-        const text = (el.innerText || el.textContent || "").trim();
-        if (text !== "沟通中") continue;
-        const rect = el.getBoundingClientRect();
-        if (rect.width < 20 || rect.height < 10) continue;
-        if (!isVisible(el)) continue;
-        candidates.push({ el, rect });
-      }
-      if (candidates.length > 0) {
-        candidates.sort((a, b) => a.rect.left - b.rect.left);
-        const target = candidates[0].el;
+      const target = document.querySelector('.chat-label-item[title="沟通中"]');
+      if (target && isVisible(target)) {
+        const already = target.classList.contains("selected");
+        if (already) {
+          emit({ type: "boss_chatting_tab_clicked", data: { rect: target.getBoundingClientRect(), text: "沟通中", attempts: wave + 1, already_selected: true } });
+          return true;
+        }
         try {
           clickElementDirect(target);
-          emit({ type: "boss_chatting_tab_clicked", data: { rect: candidates[0].rect, text: "沟通中", attempts } });
+          emit({ type: "boss_chatting_tab_clicked", data: { rect: target.getBoundingClientRect(), text: "沟通中", attempts: wave + 1 } });
           await sleep(800);
           return true;
         } catch (exc) {
-          emit({ type: "boss_chatting_tab_skip", data: { reason: "click_failed", error: String(exc), attempts } });
+          emit({ type: "boss_chatting_tab_skip", data: { reason: "click_failed", error: String(exc), attempts: wave + 1 } });
           return false;
         }
       }
       await sleep(600);
     }
-    emit({ type: "boss_chatting_tab_skip", data: { reason: "not_found", url: location.href, attempts } });
+    emit({ type: "boss_chatting_tab_skip", data: { reason: "not_found", url: location.href, attempts: 3 } });
     return false;
   }
 
   async function resetCandidateListScroll() {
-    const ANCHOR_SELECTORS = [
-      ".geek-item-wrap",
-      "[class*='geek-item']",
-      ".user-list [class*='item']",
-      ".chat-list li",
-      ".user-list li",
-      ".friend-list li",
-      "[class*='chat-list'] li",
-      "[class*='friend-list'] li",
-      "[class*='user-list'] li",
-      "[class*='conversation'] li",
-    ];
-    const anchorDiag = ANCHOR_SELECTORS.map((sel) => ({
-      sel,
-      count: document.querySelectorAll(sel).length,
-    })).filter((x) => x.count > 0);
-    const anchor = document.querySelector(ANCHOR_SELECTORS.join(", "));
-
-    const directScrollables = Array.from(document.querySelectorAll(
-      ".user-list, .chat-list, .friend-list, [class*='user-list'], [class*='chat-list'], [class*='friend-list'], [class*='b-scroll-stable']"
-    )).filter((el) => {
-      if (!isVisible(el)) return false;
-      const rect = el.getBoundingClientRect();
-      return rect.left < (window.innerWidth || 1440) * 0.55 && el.scrollHeight - el.clientHeight > 30;
-    });
-
-    const scrollables = new Set(directScrollables);
-    if (anchor) {
-      let node = anchor.parentElement;
-      while (node && node !== document.body && node !== document.documentElement) {
-        try {
-          const cs = getComputedStyle(node);
-          if (/(auto|scroll|overlay)/.test(cs.overflowY) && node.scrollHeight - node.clientHeight > 30) {
-            scrollables.add(node);
-          }
-        } catch (_) { /* ignore */ }
-        node = node.parentElement;
+    const container = document.querySelector("div.user-list.b-scroll-stable") || document.querySelector("div.user-list");
+    const scrollList = [];
+    if (container && isVisible(container)) {
+      scrollList.push(container);
+      const vue = container.__vue__;
+      if (vue && typeof vue.scrollToOffset === "function") {
+        vue.scrollToOffset(0);
       }
     }
-    const scrollList = Array.from(scrollables);
-    const anchorTopBefore = anchor ? Math.round(anchor.getBoundingClientRect().top) : null;
     const before = scrollList.map((el) => ({
       tag: el.tagName,
       cls: String(el.className || "").slice(0, 80),
@@ -434,17 +377,11 @@
     window.scrollTo(0, 0);
     await sleep(900);
     const after = scrollList.map((el) => el.scrollTop);
-    const anchorTopAfter = anchor
-      ? Math.round((document.querySelector(ANCHOR_SELECTORS.join(", ")) || anchor).getBoundingClientRect().top)
-      : null;
     emit({
       type: "boss_diag",
       data: {
         step: "scroll_reset_detail",
-        anchor_found: !!anchor,
-        anchor_selectors_hit: anchorDiag,
-        anchor_top_before: anchorTopBefore,
-        anchor_top_after: anchorTopAfter,
+        anchor_found: !!container,
         scrollable_count: scrollList.length,
         before,
         after,
@@ -456,51 +393,70 @@
 
   function getCandidateItems() {
     const seen = new Set();
-    const seenKeys = new Set();
     const items = [];
     let hitContainerInfo = null;
-    const containers = LIST_CONTAINER_SELECTORS
-      .flatMap((selector) => Array.from(document.querySelectorAll(selector)).map((el) => ({ selector, el })))
-      .filter(({ el }) => isVisible(el) && isInLeftCandidateArea(el));
 
-    for (const { selector, el: container } of containers) {
-      const before = items.length;
-      // BOSS 新版聊天列表：.user-list 直接子 .geek-item-wrap 即候选人项，
-      // 卡片本身不显示年龄/学历（点击后才出现在右侧详情），
-      // 所以一旦命中已知的列表容器，就信任结构、跳过 scoring。
-      const trustedNodes = Array.from(container.querySelectorAll(".geek-item-wrap"));
-      if (trustedNodes.length > 0) {
-        // 信任分支：DOM 节点本身已是候选人唯一标识，不再做文本去重
-        // （沟通列表卡片只显示姓名+聊天预览，文本去重会把姓名相同/前缀相同的候选人误过滤掉）。
-        for (const el of trustedNodes) {
-          if (seen.has(el)) continue;
-          seen.add(el);
-          if (!isVisible(el)) continue;
-          items.push({ el, score: 5, top: el.getBoundingClientRect().top });
-        }
-      } else {
-        const nodes = container.querySelectorAll("li, [class*='item'], [class*='card'], [class*='user']");
-        for (const el of nodes) {
-          if (seen.has(el)) continue;
-          seen.add(el);
-          const score = scoreCandidateItem(el);
-          if (score < 2) continue;
-          const key = candidateKeyFromText(textOf(el));
-          if (!key || seenKeys.has(key)) continue;
-          seenKeys.add(key);
-          items.push({ el, score, top: el.getBoundingClientRect().top });
-        }
+    // 精确路径：直接从 div.user-list 取 .geek-item-wrap > .geek-item
+    const userList = document.querySelector("div.user-list.b-scroll-stable") || document.querySelector("div.user-list");
+    if (userList && isVisible(userList)) {
+      const geekItems = userList.querySelectorAll(".geek-item-wrap > .geek-item");
+      for (const el of geekItems) {
+        if (seen.has(el)) continue;
+        seen.add(el);
+        if (!isVisible(el)) continue;
+        items.push({ el, score: 5, top: el.getBoundingClientRect().top });
       }
-      if (items.length > before) {
+      if (items.length > 0) {
         hitContainerInfo = {
-          selector,
-          tag: container.tagName,
-          cls: String(container.className || "").slice(0, 100),
-          rect: getRectSnapshot(container),
-          trusted: trustedNodes.length > 0,
+          selector: "div.user-list .geek-item-wrap > .geek-item",
+          tag: userList.tagName,
+          cls: String(userList.className || "").slice(0, 100),
+          rect: getRectSnapshot(userList),
+          trusted: true,
         };
       }
-      if (items.length > 0) break;
+    }
+
+    // 回退：如果精确路径未命中，走旧的容器搜索
+    if (items.length === 0) {
+      const seenKeys = new Set();
+      const containers = LIST_CONTAINER_SELECTORS
+        .flatMap((selector) => Array.from(document.querySelectorAll(selector)).map((el) => ({ selector, el })))
+        .filter(({ el }) => isVisible(el) && isInLeftCandidateArea(el));
+      for (const { selector, el: container } of containers) {
+        const before = items.length;
+        const trustedNodes = Array.from(container.querySelectorAll(".geek-item-wrap"));
+        if (trustedNodes.length > 0) {
+          for (const el of trustedNodes) {
+            if (seen.has(el)) continue;
+            seen.add(el);
+            if (!isVisible(el)) continue;
+            items.push({ el, score: 5, top: el.getBoundingClientRect().top });
+          }
+        } else {
+          const nodes = container.querySelectorAll("li, [class*='item'], [class*='card'], [class*='user']");
+          for (const el of nodes) {
+            if (seen.has(el)) continue;
+            seen.add(el);
+            const score = scoreCandidateItem(el);
+            if (score < 2) continue;
+            const key = candidateKeyFromText(textOf(el));
+            if (!key || seenKeys.has(key)) continue;
+            seenKeys.add(key);
+            items.push({ el, score, top: el.getBoundingClientRect().top });
+          }
+        }
+        if (items.length > before) {
+          hitContainerInfo = {
+            selector,
+            tag: container.tagName,
+            cls: String(container.className || "").slice(0, 100),
+            rect: getRectSnapshot(container),
+            trusted: trustedNodes.length > 0,
+          };
+        }
+        if (items.length > 0) break;
+      }
     }
 
     let fallbackUsed = null;
@@ -1001,6 +957,23 @@
   }
 
   function findResumeButton() {
+    // 精确选择器：附件简历按钮
+    const precise = document.querySelector("a.btn.resume-btn-file");
+    if (precise && isVisible(precise)) {
+      const text = textOf(precise);
+      const stateName = classifyResumeButtonText(text);
+      const dimmed = isDisabled(precise) || isVisuallyDimmed(precise);
+      return {
+        el: precise,
+        text,
+        state: dimmed ? "dim" : "bright",
+        state_label: dimmed ? "暗淡" : "明亮",
+        enabled: !dimmed,
+        left: precise.getBoundingClientRect().left,
+        top: precise.getBoundingClientRect().top,
+      };
+    }
+    // 回退：旧的启发式搜索
     const nodes = document.querySelectorAll("button, a, [role='button'], span, i");
     const matches = [];
     for (const el of nodes) {
@@ -1558,6 +1531,21 @@
   }
 
   function clickResumePreviewCloseButton(candidateId = "", signature = "") {
+    // 精确选择器：预览弹窗关闭按钮
+    const preciseClose = document.querySelector(".dialog-wrap.active .close-btn");
+    if (preciseClose && isVisible(preciseClose)) {
+      emit({
+        type: "stale_preview_close_diagnostics",
+        data: {
+          candidate_id: candidateId,
+          candidate_signature: signature,
+          close_candidate_count: 1,
+          close_candidates: [{ score: 99, descriptor: "precise:.dialog-wrap.active .close-btn", path: getElementDomPath(preciseClose), rect: getRectSnapshot(preciseClose) }],
+        },
+      });
+      return clickElementReliably(preciseClose);
+    }
+    // 回退：启发式搜索
     const roots = getPreviewRoots();
     const matches = [];
     for (const root of roots) {
@@ -1622,7 +1610,7 @@
         const isOwnedByOther = ownerSig && ownerSig !== currentSignature;
         const isOrphan = !ownerSig; // 没认领 + 没人正在处理 → 上一轮残留
         if (!isOwnedByOther && !isOrphan) continue;
-        const popupHost = el.closest?.(".popover, .modal, .ant-modal, .ant-modal-root, .resume-preview, .resume-preview-modal, [class*='preview']") || null;
+        const popupHost = el.closest?.(".dialog-wrap, .popover, .modal, .ant-modal, .ant-modal-root, .resume-preview, .resume-preview-modal, [class*='preview']") || null;
         const target = popupHost && popupHost !== document.body ? popupHost : el;
         target.remove();
         removed += 1;
@@ -1707,6 +1695,15 @@
   }
 
   function findResumePreview(fallbackInfo = {}, debugContext = null) {
+    // 精确路径：BOSS 附件简历 iframe
+    const preciseIframe = document.querySelector("iframe.attachment-iframe");
+    if (preciseIframe && isVisible(preciseIframe)) {
+      const rect = preciseIframe.getBoundingClientRect();
+      if (rect.width >= 300 && rect.height >= 180) {
+        return { root: preciseIframe, rect, score: 100, info: extractResumePreviewInfo(preciseIframe, fallbackInfo), pdf_iframe: true };
+      }
+    }
+
     const pdfFramePreview = findPdfIframePreview(fallbackInfo, debugContext);
     if (pdfFramePreview) return pdfFramePreview;
 
@@ -2057,6 +2054,8 @@
 
   function getPreviewRoots() {
     const selectors = [
+      ".dialog-wrap.active .resume-detail",
+      ".dialog-wrap.active",
       "[role='dialog']",
       "[class*='dialog']",
       "[class*='modal']",
@@ -2096,6 +2095,20 @@
   }
 
   function findDownloadButton(candidateId = "", signature = "") {
+    // 精确选择器：附件简历工具栏下载按钮（第三个 icon-content，含 #icon-attacthment-download SVG）
+    const preciseDownload = document.querySelector('.attachment-resume-btns .popover.icon-content:last-child');
+    if (preciseDownload && isVisible(preciseDownload)) {
+      const svgUse = preciseDownload.querySelector('use');
+      const href = svgUse?.getAttribute('xlink:href') || svgUse?.getAttribute('href') || '';
+      if (href.includes('download')) {
+        emit({
+          type: "download_button_candidates_detailed",
+          data: { candidate_id: candidateId, candidate_signature: signature, candidates: [{ score: 100, text: "precise:attachment-resume-btns download", descriptor: `svg:${href}`, path: getElementDomPath(preciseDownload), rect: getRectSnapshot(preciseDownload) }] },
+        });
+        return preciseDownload;
+      }
+    }
+    // 回退：启发式搜索
     const matches = [];
     const roots = getPreviewRoots();
     const selector = "button, a, [role='button'], [class*='btn'], [class*='icon-content'], [class*='download'], [class*='toolbar'], span, i, svg, use";
@@ -4405,8 +4418,9 @@
 
     const seenSignatures = new Set();
     const processedElements = new WeakSet();
+    let processedCount = 0;
     let scrollRetries = 0;
-    const MAX_SCROLL_RETRIES = 5;
+    const MAX_SCROLL_RETRIES = 10;
     let consecutiveUnrecognized = 0;
 
     for (let i = results.currentIndex; i < items.length && results.completed < config.max_resumes; i++) {
@@ -4418,6 +4432,7 @@
       const item = items[i];
       if (processedElements.has(item)) continue;
       processedElements.add(item);
+      processedCount++;
 
       const candidateStepStartedAt = Date.now();
       try {
@@ -4569,33 +4584,51 @@
     }
 
     while (results.completed < config.max_resumes && state !== "stopped" && scrollRetries < MAX_SCROLL_RETRIES) {
-      // 反向锚点滚动 + scrollIntoView(end) 兜底，触发虚拟列表懒加载（参照智联同类修复）。
       const beforeCount = getCandidateItems().length;
-      const scrollResult = scrollBossCandidateList(Math.max(400, Math.floor((findBestListContainer()?.clientHeight || 600) * 0.8)));
+      const scrollContainer = findBestListContainer();
+      const scrollResult = scrollBossCandidateList(Math.max(400, Math.floor((scrollContainer?.clientHeight || 600) * 0.8)));
       emit({ type: "boss_list_scroll_attempt", data: { mode: scrollResult.mode, ok: scrollResult.ok, before_count: beforeCount, before_scroll_top: scrollResult.before, after_scroll_top: scrollResult.after, retries: scrollRetries } });
-      if (!scrollResult.ok) {
-        // 容器都没找到，再试一次 scrollIntoView 把最后一张推到底
-        const items = getCandidateItems();
-        const last = items[items.length - 1];
-        try { last?.scrollIntoView({ block: "end" }); } catch {}
+
+      if (!scrollResult.ok && scrollContainer) {
+        // Vue API 兜底：用 scrollToBottom 触发虚拟列表加载到底
+        const vue = scrollContainer.__vue__;
+        if (vue && typeof vue.scrollToBottom === "function") {
+          vue.scrollToBottom();
+          scrollContainer.dispatchEvent(new Event("scroll", { bubbles: true }));
+        }
+      }
+      // 补发 wheel 事件，部分虚拟列表仅响应 wheel 而非 scrollTop 变化
+      if (scrollContainer) {
+        scrollContainer.dispatchEvent(new WheelEvent("wheel", { deltaY: 300, bubbles: true }));
       }
       await sleep(1500);
       const newItems = getCandidateItems();
       const freshItems = newItems.filter((el) => !processedElements.has(el));
       if (freshItems.length === 0) {
-        // 没有新候选人就再尝试一次 scrollIntoView 兜底，等多一拍。两次都没动静才退出。
-        const items = getCandidateItems();
-        const last = items[items.length - 1];
+        // 用 Vue scrollToIndex 尝试跳到更后面的条目
+        if (scrollContainer) {
+          const vue = scrollContainer.__vue__;
+          if (vue && typeof vue.scrollToIndex === "function") {
+            const totalProcessed = processedCount;
+            vue.scrollToIndex(Math.min(totalProcessed + 5, 99));
+            scrollContainer.dispatchEvent(new Event("scroll", { bubbles: true }));
+          } else {
+            scrollContainer.scrollTop = scrollContainer.scrollHeight;
+            scrollContainer.dispatchEvent(new Event("scroll", { bubbles: true }));
+          }
+        }
+        const allItems = getCandidateItems();
+        const last = allItems[allItems.length - 1];
         try { last?.scrollIntoView({ block: "end" }); } catch {}
-        await sleep(1500);
+        await sleep(2000);
         const retryItems = getCandidateItems();
         const retryFresh = retryItems.filter((el) => !processedElements.has(el));
         if (retryFresh.length === 0) {
-          if (newItems.length === beforeCount && scrollRetries >= MAX_SCROLL_RETRIES - 1) {
+          scrollRetries++;
+          if (scrollRetries >= MAX_SCROLL_RETRIES) {
             emit({ type: "boss_list_scroll_exhausted", data: { total_items: newItems.length, retries: scrollRetries } });
             break;
           }
-          scrollRetries++;
           continue;
         }
         items = retryFresh;
@@ -4612,6 +4645,7 @@
         const item = items[i];
         if (processedElements.has(item)) continue;
         processedElements.add(item);
+        processedCount++;
 
         const candidateStepStartedAt = Date.now();
         try {

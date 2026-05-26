@@ -248,3 +248,23 @@ class PositionMatch(ResumeBase):
     score: Mapped[int] = mapped_column(Integer, index=True)
     reason: Mapped[str | None] = mapped_column(Text)
     create_time: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class InterviewOutline(ResumeBase):
+    __tablename__ = "interview_outlines"
+
+    outline_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    invitation_id: Mapped[int] = mapped_column(
+        ForeignKey("interview_invitations.invitation_id", ondelete="CASCADE"),
+        nullable=False, unique=True, index=True,
+    )
+    candidate_id: Mapped[int] = mapped_column(
+        ForeignKey("candidates.candidate_id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    position_id: Mapped[int | None] = mapped_column(
+        ForeignKey("job_positions.position_id", ondelete="SET NULL"),
+    )
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    create_time: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    update_time: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())

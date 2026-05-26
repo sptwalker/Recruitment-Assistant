@@ -5,6 +5,7 @@ from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
+from streamlit.components.v1 import html as st_html
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
@@ -13,7 +14,7 @@ from recruitment_assistant.config.settings import get_settings
 from recruitment_assistant.services.resume_ai_service import ResumeAIService
 from recruitment_assistant.services.resume_archive_service import ResumeArchiveService
 from recruitment_assistant.storage.resume_db import create_resume_session, init_resume_database
-from recruitment_assistant.storage.resume_models import Candidate, InterviewEvaluation, JobPosition
+from recruitment_assistant.storage.resume_models import Candidate, InterviewEvaluation, InterviewOutline, JobPosition
 
 
 @st.cache_resource
@@ -89,23 +90,59 @@ def _candidate_summary(cand, pos) -> str:
     for label, value in (
         ("性别", cand.gender),
         ("年龄", f"{cand.age}岁" if cand.age else ""),
-        ("学历", cand.education_level),
-        ("城市", cand.current_city),
-        ("自我评价", cand.self_intro),
+        ("最高学历", cand.education_level),
+        ("现居城市", cand.current_city),
     ):
         if value:
             parts.append(f"{label}：{value}")
+    if cand.educations:
+        edu_lines = []
+        for e in cand.educations:
+            line = e.school_name
+            if e.major:
+                line += f" · {e.major}"
+            if e.education_level:
+                line += f"（{e.education_level}）"
+            edu_lines.append(line)
+        parts.append("教育经历：" + "；".join(edu_lines))
     if cand.skills:
         skills = "、".join(s.skill_name or "" for s in cand.skills if s.skill_name)
         if skills:
-            parts.append(f"技能：{skills}")
+            parts.append(f"核心技能：{skills}")
     if cand.work_experiences:
-        works = []
-        for w in cand.work_experiences[:3]:
-            works.append(f"{w.company_name}·{w.position or '-'}：{w.job_content or ''}")
-        parts.append("工作经历：" + "；".join(works))
-    if pos:
-        parts.append(f"应聘岗位：{pos.title}")
+        parts.append("工作经历：")
+        for w in cand.work_experiences[:5]:
+            date_range = ""
+            if w.start_date:
+                date_range = f"（{w.start_date} 至 {w.end_date or '至今'}）"
+            parts.append(f"  - {w.company_name} · {w.position or '-'}{date_range}")
+            if w.job_content:
+                parts.append(f"    职责：{w.job_content}")
+    if cand.project_experiences:
+        parts.append("项目经验：")
+        for p in cand.project_experiences[:5]:
+            parts.append(f"  - {p.project_name}（{p.project_role or '-'}）")
+            if p.project_desc:
+                parts.append(f"    描述：{p.project_desc}")
+            if p.project_duty:
+                parts.append(f"    职责：{p.project_duty}")
+            if p.project_result:
+                parts.append(f"    成果：{p.project_result}")
+    if cand.job_intention:
+        ji = cand.job_intention
+        intent_parts = []
+        if ji.target_position:
+            intent_parts.append(f"目标岗位：{ji.target_position}")
+        if ji.target_city:
+            intent_parts.append(f"期望城市：{ji.target_city}")
+        if ji.expected_salary:
+            intent_parts.append(f"期望薪资：{ji.expected_salary}")
+        if ji.job_status:
+            intent_parts.append(f"求职状态：{ji.job_status}")
+        if intent_parts:
+            parts.append("求职意向：" + "，".join(intent_parts))
+    if cand.self_intro:
+        parts.append(f"自我评价：{cand.self_intro}")
     return "\n".join(parts)
 
 
@@ -115,6 +152,134 @@ def _career_label(cand) -> str:
         work = cand.work_experiences[0]
         return work.position or work.company_name or "-"
     return "-"
+
+
+def _format_evaluations(evals: list) -> str:
+    if not evals:
+        return ""
+    parts = []
+    for ev in evals:
+        line = f"- {ev.interview_round or '面试'}：评分 {ev.score or '-'}"
+        if ev.strengths:
+            line += f"，优势：{ev.strengths}"
+        if ev.weaknesses:
+            line += f"，不足：{ev.weaknesses}"
+        if ev.conclusion:
+            line += f"，结论：{ev.conclusion}"
+        parts.append(line)
+    return "\n".join(parts)
+
+
+import re as _re
+
+
+def _markdown_to_print_html(content: str) -> str:
+    lines = []
+    for line in content.split("\n"):
+        s = line.strip()
+        if not s:
+            continue
+        if s == "---":
+            lines.append("<hr/>")
+        elif s.startswith("### "):
+            lines.append(f"<h3>{_inline(s[4:])}</h3>")
+        elif s.startswith("## "):
+            lines.append(f"<h2>{_inline(s[3:])}</h2>")
+        elif s.startswith("# "):
+            lines.append(f"<h1>{_inline(s[2:])}</h1>")
+        elif s.startswith("- "):
+            lines.append(f"<li>{_inline(s[2:])}</li>")
+        else:
+            lines.append(f"<p>{_inline(s)}</p>")
+    return "\n".join(lines)
+
+
+def _inline(text: str) -> str:
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return _re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", text)
+
+
+@st.dialog("面试大纲", width="large")
+def _open_outline_dialog():
+    inv_id = st.session_state.get("interview_outline_inv_id")
+    if not inv_id:
+        st.error("未选中面试邀约")
+        return
+    session = create_resume_session()
+    svc = ResumeArchiveService(session)
+    try:
+        inv = svc.get_invitation(inv_id)
+        if not inv:
+            st.error("面试邀约不存在")
+            return
+        cand = svc.get_candidate(inv.candidate_id)
+        if not cand:
+            st.error("候选人不存在")
+            return
+        pos = session.get(JobPosition, inv.position_id) if inv.position_id else None
+        evals = svc.list_interview_evals(cand.candidate_id)
+
+        regenerate_key = f"outline_regen_{inv_id}"
+        need_generate = st.session_state.pop(regenerate_key, False)
+
+        outline_row = svc.get_outline(inv_id)
+        if need_generate or not outline_row:
+            with st.spinner("正在生成面试大纲…"):
+                position_name = pos.title if pos else "未指定岗位"
+                requirements = pos.requirements or "" if pos else ""
+                eval_text = _format_evaluations(evals)
+                content = ai_service.generate_interview_outline(
+                    _candidate_summary(cand, pos),
+                    position_name,
+                    requirements=requirements,
+                    evaluations=eval_text,
+                )
+                outline_row = svc.save_outline(inv_id, cand.candidate_id, inv.position_id, content)
+
+        st.markdown(
+            f"<div style='font-size:28px;font-weight:900;margin-bottom:8px;'>{cand.name}</div>"
+            f"<div style='font-size:14px;color:var(--color-text-secondary);margin-bottom:16px;'>"
+            f"{pos.title if pos else '未指定岗位'} · {cand.education_level or '-'} · {f'{cand.age}岁' if cand.age else '-'}</div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown("---")
+        st.markdown(outline_row.content)
+        st.markdown("---")
+
+        btn_a, btn_b, _ = st.columns([1, 1, 3])
+        if btn_a.button("🔄 重新生成", key="outline_regenerate", width="stretch"):
+            st.session_state[regenerate_key] = True
+            st.session_state["interview_outline_inv_id"] = inv_id
+            st.rerun()
+        if btn_b.button("🖨️ 打印大纲", key="outline_print", width="stretch"):
+            body_html = _markdown_to_print_html(outline_row.content)
+            st_html(
+                f"""<script>
+                var w = window.open('', '_blank');
+                w.document.write(`<html><head><title>{cand.name} - 面试大纲</title>
+                <style>
+                @page {{ size: A4; margin: 2.54cm; }}
+                body {{ font-family: SimSun, "宋体", serif; font-size: 12pt; line-height: 1.8; color: #000;
+                       max-width: 680px; margin: 0 auto; padding: 40px 0; }}
+                h1 {{ font-family: SimHei, "黑体", sans-serif; font-size: 16pt; font-weight: bold;
+                     margin: 24pt 0 12pt; text-align: center; }}
+                h2 {{ font-family: SimHei, "黑体", sans-serif; font-size: 14pt; font-weight: bold;
+                     margin: 18pt 0 8pt; border-bottom: 1px solid #333; padding-bottom: 4pt; }}
+                h3 {{ font-family: SimHei, "黑体", sans-serif; font-size: 12pt; font-weight: bold;
+                     margin: 12pt 0 6pt; }}
+                p {{ margin: 4pt 0; text-indent: 0; }}
+                li {{ margin: 3pt 0 3pt 24pt; list-style-type: disc; }}
+                strong {{ font-weight: bold; }}
+                hr {{ border: none; border-top: 0.5pt solid #999; margin: 12pt 0; }}
+                </style></head><body>{body_html}</body></html>`);
+                w.document.close();
+                w.focus();
+                w.print();
+                </script>""",
+                height=0,
+            )
+    finally:
+        session.close()
 
 
 @st.dialog("记录面试评价", width="large")
@@ -195,7 +360,7 @@ def _open_eval_dialog():
                 conclusion = st.selectbox("面试结论", ["通过", "待定", "淘汰"], key=f"interview_conclusion_{inv_id}")
 
             btn_left, _, btn_right = st.columns([1, 1, 1])
-            if btn_left.button("保  存", type="primary", use_container_width=True, key=f"interview_save_{inv_id}"):
+            if btn_left.button("保  存", type="primary", width="stretch", key=f"interview_save_{inv_id}"):
                 interview_dt = datetime.combine(interview_date, datetime.now().time())
                 svc.create_interview_eval(
                     candidate_id=cand.candidate_id,
@@ -211,7 +376,7 @@ def _open_eval_dialog():
                 )
                 st.session_state.pop("interview_eval_inv_id", None)
                 st.rerun()
-            if btn_right.button("取  消", use_container_width=True, key=f"interview_close_{inv_id}"):
+            if btn_right.button("取  消", width="stretch", key=f"interview_close_{inv_id}"):
                 st.session_state.pop("interview_eval_inv_id", None)
                 st.rerun()
 
@@ -297,12 +462,12 @@ def _open_abandon_dialog():
         eval_count = len(svc.list_interview_evals(cand.candidate_id))
         st.warning(f"是否要真的彻底放弃对候选人「{cand.name}」的招聘计划？确认后将删除他的所有面试评价记录（共 {eval_count} 条），并保留当前邀约为已取消状态。")
         cols = st.columns(2)
-        if cols[0].button("确认放弃招聘", type="primary", use_container_width=True, key=f"abandon_confirm_{inv_id}"):
+        if cols[0].button("确认放弃招聘", type="primary", width="stretch", key=f"abandon_confirm_{inv_id}"):
             svc.delete_interview_evals(cand.candidate_id)
             svc.update_invitation_status(inv.invitation_id, "cancelled")
             st.session_state.pop("interview_abandon_inv_id", None)
             st.rerun()
-        if cols[1].button("再考虑一下", use_container_width=True, key=f"abandon_cancel_{inv_id}"):
+        if cols[1].button("再考虑一下", width="stretch", key=f"abandon_cancel_{inv_id}"):
             st.session_state.pop("interview_abandon_inv_id", None)
             st.rerun()
     finally:
@@ -334,7 +499,9 @@ try:
             .options(
                 selectinload(Candidate.educations),
                 selectinload(Candidate.work_experiences),
+                selectinload(Candidate.project_experiences),
                 selectinload(Candidate.skills),
+                selectinload(Candidate.job_intention),
                 selectinload(Candidate.resume_source),
             )
         ).all()
@@ -377,7 +544,7 @@ try:
             if st.button(
                 button_label,
                 key=f"interview_filter_{label}",
-                use_container_width=True,
+                width="stretch",
                 type="primary" if st.session_state.interview_filter == label else "secondary",
             ):
                 st.session_state.interview_filter = label
@@ -464,46 +631,38 @@ try:
                 if wp:
                     works_row = st.columns([8, 1])
                     works_row[0].markdown(f"<div class='interview-file-path'>🎨 {wp}</div>", unsafe_allow_html=True)
-                    if works_row[1].button("打开作品", key=f"interview_open_works_{inv.invitation_id}", use_container_width=True, disabled=not wp.exists()):
+                    if works_row[1].button("打开作品", key=f"interview_open_works_{inv.invitation_id}", width="stretch", disabled=not wp.exists()):
                         try:
                             os.startfile(str(wp))
                         except OSError as exc:
                             st.error(f"打开作品失败：{exc}")
 
                 action_cols = st.columns(5)
-                if action_cols[0].button("打开简历", key=f"interview_open_{inv.invitation_id}", use_container_width=True, disabled=not (fp and fp.exists())):
+                if action_cols[0].button("打开简历", key=f"interview_open_{inv.invitation_id}", width="stretch", disabled=not (fp and fp.exists())):
                     try:
                         os.startfile(str(fp))
                     except OSError as exc:
                         st.error(f"打开失败：{exc}")
-                if action_cols[1].button("生成面试大纲", key=f"interview_outline_btn_{inv.invitation_id}", use_container_width=True, disabled=not ai_service.is_configured):
-                    position_name = pos.title if pos else "未指定岗位"
-                    st.session_state[f"interview_outline_{inv.invitation_id}"] = ai_service.generate_interview_outline(
-                        _candidate_summary(cand, pos),
-                        position_name,
-                    )
-                    st.rerun()
-                if action_cols[2].button("查看面试评价", key=f"interview_history_{inv.invitation_id}", use_container_width=True):
+                if action_cols[1].button("面试大纲", key=f"interview_outline_btn_{inv.invitation_id}", width="stretch", disabled=not ai_service.is_configured):
+                    st.session_state["interview_outline_inv_id"] = inv.invitation_id
+                    _open_outline_dialog()
+                if action_cols[2].button("查看面试评价", key=f"interview_history_{inv.invitation_id}", width="stretch"):
                     st.session_state["interview_history_inv_id"] = inv.invitation_id
                     _open_eval_history_dialog()
                 if inv.status == "cancelled":
-                    if action_cols[3].button("恢复面试", key=f"interview_restore_{inv.invitation_id}", use_container_width=True):
+                    if action_cols[3].button("恢复面试", key=f"interview_restore_{inv.invitation_id}", width="stretch"):
                         svc.update_invitation_status(inv.invitation_id, "pending")
                         st.rerun()
-                    if action_cols[4].button("放弃招聘", key=f"interview_abandon_{inv.invitation_id}", use_container_width=True):
+                    if action_cols[4].button("放弃招聘", key=f"interview_abandon_{inv.invitation_id}", width="stretch"):
                         st.session_state["interview_abandon_inv_id"] = inv.invitation_id
                         _open_abandon_dialog()
                 else:
-                    if action_cols[3].button("记录面试评价", key=f"interview_eval_{inv.invitation_id}", use_container_width=True):
+                    if action_cols[3].button("记录面试评价", key=f"interview_eval_{inv.invitation_id}", width="stretch"):
                         st.session_state["interview_eval_inv_id"] = inv.invitation_id
                         _open_eval_dialog()
-                    if action_cols[4].button("取消面试", key=f"interview_cancel_{inv.invitation_id}", use_container_width=True):
+                    if action_cols[4].button("取消面试", key=f"interview_cancel_{inv.invitation_id}", width="stretch"):
                         svc.update_invitation_status(inv.invitation_id, "cancelled")
                         st.rerun()
 
-                outline = st.session_state.get(f"interview_outline_{inv.invitation_id}")
-                if outline:
-                    with st.expander("面试大纲", expanded=True):
-                        st.markdown(outline)
 finally:
     session.close()

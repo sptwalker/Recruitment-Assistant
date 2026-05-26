@@ -187,15 +187,52 @@ with tabs[0]:
         st.warning("⚠️ AI API Key 未配置。请到「平台登录 → AI模型」标签配置 `AI_API_KEY` / `AI_BASE_URL` / `AI_MODEL`，保存后重启 Streamlit。")
 
     # 数据库当前状态（非任务信息，保留在窗口外）
+    all_files = scan_resume_files()
     session = create_resume_session()
     svc = ResumeArchiveService(session)
     stats = svc.get_stats()
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("简历库总数", stats["total"])
-    col2.metric("BOSS直聘", stats["platform_counts"].get("BOSS直聘", 0))
-    col3.metric("智联招聘", stats["platform_counts"].get("智联招聘", 0))
-    col4.metric("51前程无忧", stats["platform_counts"].get("51前程无忧", 0))
     session.close()
+
+    total = stats["total"] or 0
+    boss_count = stats["platform_counts"].get("BOSS直聘", 0)
+    zhilian_count = stats["platform_counts"].get("智联招聘", 0)
+    qiancheng_count = stats["platform_counts"].get("51前程无忧", 0)
+
+    def _ring_svg(value: int, total_n: int, color: str) -> str:
+        pct = round(value / total_n * 100) if total_n > 0 else 0
+        r, circ = 12, 75.4
+        offset = circ * (1 - pct / 100)
+        return (
+            f'<svg width="30" height="30" viewBox="0 0 30 30">'
+            f'<circle cx="15" cy="15" r="{r}" fill="none" stroke="#e5e7eb" stroke-width="2.5"/>'
+            f'<circle cx="15" cy="15" r="{r}" fill="none" stroke="{color}" stroke-width="2.5" '
+            f'stroke-dasharray="{circ}" stroke-dashoffset="{offset:.1f}" '
+            f'transform="rotate(-90 15 15)" stroke-linecap="round"/>'
+            f'<text x="15" y="15" text-anchor="middle" dominant-baseline="central" '
+            f'font-size="8" font-weight="700" fill="{color}">{pct}%</text>'
+            f'</svg>'
+        )
+
+    def _stat_card(label: str, value: int, ring_html: str = "", is_primary: bool = False) -> str:
+        ring_part = f'<div style="flex-shrink:0;margin-left:8px;">{ring_html}</div>' if ring_html else ''
+        label_style = "font-size:16px;font-weight:900;font-family:SimHei,sans-serif;" if is_primary else "font-size:15px;font-weight:700;"
+        return (
+            f'<div style="background:var(--color-surface);border:1px solid var(--color-border);border-radius:12px;'
+            f'padding:10px 14px;display:flex;align-items:center;justify-content:center;min-height:54px;">'
+            f'<div style="display:flex;align-items:baseline;gap:6px;">'
+            f'<span style="{label_style}color:var(--color-text-secondary);white-space:nowrap;">{label}：</span>'
+            f'<span style="font-size:24px;font-weight:800;color:var(--color-text);line-height:1;">{value}</span>'
+            f'</div>{ring_part}</div>'
+        )
+
+    col0, col1, col2, col3, col4 = st.columns(5)
+    col0.markdown(_stat_card("简历库总数", total, is_primary=True), unsafe_allow_html=True)
+    col1.markdown(_stat_card("待入库文件", len(all_files)), unsafe_allow_html=True)
+    col2.markdown(_stat_card("BOSS直聘", boss_count, _ring_svg(boss_count, total, "#0a7d2e")), unsafe_allow_html=True)
+    col3.markdown(_stat_card("智联招聘", zhilian_count, _ring_svg(zhilian_count, total, "#1d4ed8")), unsafe_allow_html=True)
+    col4.markdown(_stat_card("51前程无忧", qiancheng_count, _ring_svg(qiancheng_count, total, "#b45309")), unsafe_allow_html=True)
+
+    st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
 
     # ---------- 任务状态：用 session_state 跨 rerun 维护 ----------
     # parse_task_state: "idle" / "running" / "stopping"
@@ -228,8 +265,7 @@ with tabs[0]:
             },
         }
 
-    # 每次 rerun 都重新扫描简历目录（只在 idle 时使用，运行中用 parse_queue 快照）
-    all_files = scan_resume_files()
+    # all_files 已在上方 metric 区扫描，运行中用 parse_queue 快照
 
     def append_scan_summary(lines: list[str], files: list[dict]) -> None:
         ts = datetime.now().strftime("%H:%M:%S")
@@ -342,55 +378,33 @@ with tabs[0]:
     is_running = task_state == "running"
     is_stopping = task_state == "stopping"
 
-    btn_cols = st.columns([1.4, 1.4, 1.4, 1.4, 3.0])
-    # 索引 0=日期过滤 1=开始/停止 2=重新扫描 3=清空 4=进度
-
-    # 在按钮列上方放同高度的占位行，让按钮顶部和 picker 的输入框顶部对齐
-    _label_style = "font-size:18px; font-weight:bold; margin-bottom:6px;"
-    for _i in (1, 2, 3, 4):
-        btn_cols[_i].markdown(
-            f"<div style='{_label_style}'>&nbsp;</div>", unsafe_allow_html=True
-        )
+    btn_cols = st.columns([1.8, 0.3, 1.2, 1.2, 1.2, 2.1])
+    # 索引 0=日期 1=间隔 2=开始/停止 3=重新扫描 4=清空 5=进度
 
     with btn_cols[0]:
         st.markdown(
-            f"<div style='{_label_style}'>请选择最远整理日期</div>",
+            "<div style='font-size:14px; font-weight:bold; margin-bottom:4px;'>请选择最远整理日期</div>",
             unsafe_allow_html=True,
         )
-        st.markdown(
-            """
-            <style>
-            div[data-testid="stDateInput"] input[aria-label="请选择最远整理日期"] {
-                min-width: 190px !important;
-                width: 190px !important;
-                font-size: 17px !important;
-                font-weight: 700 !important;
-                padding: 10px 12px !important;
-            }
-            div[data-testid="stDateInput"] div[data-baseweb="input"] {
-                min-width: 190px !important;
-                width: 190px !important;
-            }
-            </style>
-            """,
-            unsafe_allow_html=True,
+        since = st.date_input(
+            "请选择最远整理日期",
+            value=st.session_state.parse_since_date,
+            max_value=date.today(),
+            label_visibility="collapsed",
+            key="parse_since_date_picker",
+            help="只整理修改时间晚于此日期的简历（含当天）",
+            disabled=not is_idle,
         )
-        # 放宽 date_input 子列，让日期控件显示更宽
-        _picker_sub_cols = st.columns([1.35, 0.65])
-        with _picker_sub_cols[0]:
-            since = st.date_input(
-                "请选择最远整理日期",
-                value=st.session_state.parse_since_date,
-                max_value=date.today(),
-                label_visibility="collapsed",
-                key="parse_since_date_picker",
-                help="只整理修改时间晚于此日期的简历（含当天）",
-                disabled=not is_idle,
-            )
         st.session_state.parse_since_date = since
 
+    # btn_cols[1] 是间隔占位列，不放内容
+
+    # 按钮列加顶部占位，与日期输入框底部对齐
+    for _i in (2, 3, 4, 5):
+        btn_cols[_i].markdown("<div style='height:24px'></div>", unsafe_allow_html=True)
+
     if is_idle:
-        start_btn = btn_cols[1].button(
+        start_btn = btn_cols[2].button(
             "🚀 自动解析入库",
             type="primary",
             disabled=(not ai_service.is_configured) or (not all_files),
@@ -399,21 +413,21 @@ with tabs[0]:
         stop_btn = False
     else:
         start_btn = False
-        stop_btn = btn_cols[1].button(
+        stop_btn = btn_cols[2].button(
             "⏹ 停止解析任务",
             type="secondary",
             disabled=is_stopping,
             key="parse_stop_btn",
         )
 
-    refresh_btn = btn_cols[2].button("🔄 重新扫描", disabled=not is_idle, key="parse_refresh_btn")
-    clear_btn = btn_cols[3].button("🧹 清空窗口", disabled=not is_idle, key="parse_clear_btn")
+    refresh_btn = btn_cols[3].button("🔄 重新扫描", disabled=not is_idle, key="parse_refresh_btn")
+    clear_btn = btn_cols[4].button("🧹 清空窗口", disabled=not is_idle, key="parse_clear_btn")
 
     # 运行中显示进度副文本（也只在窗口外的"状态条"，不输出任务信息）
     if is_running or is_stopping:
         done = st.session_state.parse_index
         total_q = len(st.session_state.parse_queue)
-        btn_cols[4].progress(
+        btn_cols[5].progress(
             done / max(total_q, 1),
             text=f"进度 {done}/{total_q}" + ("（正在停止…）" if is_stopping else ""),
         )

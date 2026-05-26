@@ -10,6 +10,7 @@ from recruitment_assistant.storage.resume_models import (
     Honor,
     InterviewEvaluation,
     InterviewInvitation,
+    InterviewOutline,
     JobIntention,
     JobPosition,
     PositionMatch,
@@ -327,3 +328,27 @@ class ResumeArchiveService:
             .order_by(PositionMatch.score.desc(), PositionMatch.match_id)
         )
         return list(self.session.execute(stmt).all())
+
+    # --- 面试大纲 CRUD ---
+
+    def get_outline(self, invitation_id: int) -> InterviewOutline | None:
+        return self.session.scalar(
+            select(InterviewOutline).where(InterviewOutline.invitation_id == invitation_id)
+        )
+
+    def save_outline(self, invitation_id: int, candidate_id: int, position_id: int | None, content: str) -> InterviewOutline:
+        existing = self.get_outline(invitation_id)
+        if existing:
+            existing.content = content
+            existing.update_time = func.now()
+            self.session.commit()
+            return existing
+        outline = InterviewOutline(
+            invitation_id=invitation_id,
+            candidate_id=candidate_id,
+            position_id=position_id,
+            content=content,
+        )
+        self.session.add(outline)
+        self.session.commit()
+        return outline

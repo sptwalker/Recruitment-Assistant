@@ -29,3 +29,8 @@ Thumbs.db
 /dist/
 build/*.zip
 build/get-pip.py
+
+# IDE & tool metadata
+.claude/
+.codebuddy/
+node_modules/

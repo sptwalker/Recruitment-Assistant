@@ -2,8 +2,12 @@
 简历智采助手 - 启动器
 双击运行：启动 PostgreSQL → 初始化数据库 → 启动 Streamlit → 打开浏览器
 """
+import ctypes
+import ctypes.wintypes
 import os
+import shutil
 import socket
+import struct
 import subprocess
 import sys
 import time
@@ -33,24 +37,71 @@ def _is_ascii(p: Path) -> bool:
         return False
 
 
+def _create_junction(link: Path, target: Path) -> bool:
+    """用 Windows API 创建 NTFS 目录联接，绕过 cmd.exe 编码问题。"""
+    GENERIC_WRITE = 0x40000000
+    OPEN_EXISTING = 3
+    FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+    FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+    FSCTL_SET_REPARSE_POINT = 0x000900A4
+    IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003
+    INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+    link.mkdir(parents=True, exist_ok=True)
+
+    kernel32 = ctypes.windll.kernel32
+    kernel32.CreateFileW.restype = ctypes.c_void_p
+    h = kernel32.CreateFileW(
+        str(link), GENERIC_WRITE, 0, None, OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, None,
+    )
+    if h == INVALID_HANDLE_VALUE:
+        return False
+    try:
+        sub_name = f"\\??\\{target}".encode("utf-16-le")
+        print_name = str(target).encode("utf-16-le")
+        path_buf = sub_name + b"\x00\x00" + print_name + b"\x00\x00"
+        header = struct.pack(
+            "<LHHHHHH",
+            IO_REPARSE_TAG_MOUNT_POINT,
+            8 + len(path_buf),
+            0,
+            0, len(sub_name),
+            len(sub_name) + 2, len(print_name),
+        )
+        buf = header + path_buf
+        out = ctypes.c_ulong(0)
+        ok = kernel32.DeviceIoControl(
+            ctypes.c_void_p(h), FSCTL_SET_REPARSE_POINT,
+            buf, len(buf), None, 0, ctypes.byref(out), None,
+        )
+        return bool(ok)
+    finally:
+        kernel32.CloseHandle(ctypes.c_void_p(h))
+
+
 def _safe_pgsql() -> Path:
     """返回一个纯 ASCII 的 pgsql 目录路径。
 
-    PostgreSQL 二进制文件（initdb/pg_ctl/psql）在启动时会解析自身路径
-    来定位 share/ 等目录。如果路径中含非 ASCII 字符，UTF8 编码会报错。
-    解决：在 %LOCALAPPDATA% 下创建 Windows 目录联接（junction），
-    让 PG 通过纯 ASCII 路径访问自身文件。
+    PostgreSQL 二进制文件在启动时解析自身路径来定位 share/ 等目录。
+    非 ASCII 路径会导致 UTF8 编码错误。解决：用 Windows NTFS junction
+    在 %LOCALAPPDATA% 下创建纯 ASCII 的入口指向实际 pgsql 目录。
     """
     local_path = APP_ROOT / "pgsql"
     if _is_ascii(local_path):
         return local_path
     safe = _SAFE_BASE / "pgsql"
-    if not safe.exists():
-        safe.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run(
-            ["cmd", "/c", "mklink", "/J", str(safe), str(local_path)],
-            creationflags=subprocess.CREATE_NO_WINDOW,
-            capture_output=True,
+    target_exe = safe / "bin" / "initdb.exe"
+    if target_exe.exists():
+        return safe
+    if safe.exists():
+        shutil.rmtree(safe, ignore_errors=True)
+    safe.parent.mkdir(parents=True, exist_ok=True)
+    _create_junction(safe, local_path)
+    if not target_exe.exists():
+        raise RuntimeError(
+            f"无法创建 pgsql 目录联接: {safe} -> {local_path}\n"
+            "请尝试将软件安装到纯英文路径（如 C:\\ResumeAssistant）"
         )
     return safe
 
@@ -209,8 +260,9 @@ def main() -> None:
     try:
         log("=" * 50)
         log("简历智采助手启动中...")
-        log(f"  APP_ROOT: {APP_ROOT}")
-        log(f"  PGDATA:   {PGDATA_DIR}")
+        log(f"  APP_ROOT:  {APP_ROOT}")
+        log(f"  PGSQL_DIR: {PGSQL_DIR}")
+        log(f"  PGDATA:    {PGDATA_DIR}")
         start_postgres()
         ensure_database()
         proc = start_streamlit()

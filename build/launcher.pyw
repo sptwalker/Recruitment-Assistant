@@ -221,11 +221,16 @@ def ensure_database() -> None:
             env=env, creationflags=subprocess.CREATE_NO_WINDOW, check=True,
         )
     log("Running database migrations...")
-    subprocess.run(
+    mig = subprocess.run(
         [str(PYTHON_EXE), "-c", "from recruitment_assistant.storage.db import init_database; init_database()"],
         cwd=str(APP_ROOT), env=env,
-        creationflags=subprocess.CREATE_NO_WINDOW, check=True,
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        creationflags=subprocess.CREATE_NO_WINDOW,
     )
+    if mig.returncode != 0:
+        log(f"  migration stdout: {mig.stdout}")
+        log(f"  migration stderr: {mig.stderr}")
+        mig.check_returncode()
 
 
 def start_streamlit() -> subprocess.Popen:

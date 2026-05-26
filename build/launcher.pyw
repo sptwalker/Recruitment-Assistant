@@ -41,13 +41,21 @@ def is_port_open(port: int) -> bool:
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
-def _short_path(p: Path) -> str:
-    """将长路径转为 Windows 8.3 短路径，避免非 ASCII 字符导致 PostgreSQL 失败。"""
+def _short_path(p: Path, ensure_exists: bool = False) -> str:
+    """将长路径转为 Windows 8.3 短路径，避免非 ASCII 字符导致 PostgreSQL 失败。
+
+    GetShortPathNameW 只对已存在的路径有效。如果路径不存在且 ensure_exists=True，
+    先创建目录再取短路径。对于祖先目录含中文的情况，逐级向上查找已存在的祖先取短路径。
+    """
+    import ctypes
+
+    if ensure_exists and not p.exists():
+        p.mkdir(parents=True, exist_ok=True)
+
+    buf = ctypes.create_unicode_buffer(512)
     try:
-        import ctypes
-        buf = ctypes.create_unicode_buffer(512)
         rv = ctypes.windll.kernel32.GetShortPathNameW(str(p), buf, 512)
-        if rv and rv < 512:
+        if rv and rv < 512 and buf.value:
             return buf.value
     except Exception:
         pass
@@ -58,7 +66,7 @@ def get_env() -> dict:
     env = os.environ.copy()
     env["PATH"] = f"{PGSQL_DIR / 'bin'};{PYTHON_DIR};{PYTHON_DIR / 'Scripts'};{env.get('PATH', '')}"
     env["PYTHONPATH"] = str(APP_ROOT)
-    env["PGDATA"] = _short_path(PGDATA_DIR)
+    env["PGDATA"] = _short_path(PGDATA_DIR, ensure_exists=True)
     env["PGPORT"] = str(PG_PORT)
     env["PGUSER"] = DB_USER
     env["PGPASSWORD"] = DB_PASSWORD
@@ -66,9 +74,9 @@ def get_env() -> dict:
 
 
 def init_postgres() -> None:
-    if not PGDATA_DIR.exists():
+    if not (PGDATA_DIR / "PG_VERSION").exists():
         log("Initializing PostgreSQL data directory...")
-        pgdata_path = _short_path(PGDATA_DIR)
+        pgdata_path = _short_path(PGDATA_DIR, ensure_exists=True)
         log(f"  PGDATA path: {pgdata_path}")
         result = subprocess.run(
             [_short_path(INITDB), "-D", pgdata_path, "-U", DB_USER, "-E", "UTF8", "--locale=C"],

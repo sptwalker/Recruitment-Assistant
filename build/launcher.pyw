@@ -12,11 +12,7 @@ from pathlib import Path
 
 APP_ROOT = Path(__file__).resolve().parent
 PYTHON_DIR = APP_ROOT / "python"
-PGSQL_DIR = APP_ROOT / "pgsql"
 PYTHON_EXE = PYTHON_DIR / "python.exe"
-PG_CTL = PGSQL_DIR / "bin" / "pg_ctl.exe"
-INITDB = PGSQL_DIR / "bin" / "initdb.exe"
-PSQL = PGSQL_DIR / "bin" / "psql.exe"
 
 STREAMLIT_PORT = 8501
 PG_PORT = 5432
@@ -26,25 +22,53 @@ DB_PASSWORD = "932092"
 
 LOG_FILE = APP_ROOT / "logs" / "launcher.log"
 
+_SAFE_BASE = Path(os.environ.get("LOCALAPPDATA", os.environ.get("TEMP", "C:\\Temp"))) / "ResumeAssistantPG"
+
+
+def _is_ascii(p: Path) -> bool:
+    try:
+        str(p).encode("ascii")
+        return True
+    except UnicodeEncodeError:
+        return False
+
+
+def _safe_pgsql() -> Path:
+    """返回一个纯 ASCII 的 pgsql 目录路径。
+
+    PostgreSQL 二进制文件（initdb/pg_ctl/psql）在启动时会解析自身路径
+    来定位 share/ 等目录。如果路径中含非 ASCII 字符，UTF8 编码会报错。
+    解决：在 %LOCALAPPDATA% 下创建 Windows 目录联接（junction），
+    让 PG 通过纯 ASCII 路径访问自身文件。
+    """
+    local_path = APP_ROOT / "pgsql"
+    if _is_ascii(local_path):
+        return local_path
+    safe = _SAFE_BASE / "pgsql"
+    if not safe.exists():
+        safe.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(safe), str(local_path)],
+            creationflags=subprocess.CREATE_NO_WINDOW,
+            capture_output=True,
+        )
+    return safe
+
 
 def _safe_pgdata() -> Path:
-    """返回一个不含非 ASCII 字符的 pgdata 路径。
-
-    PostgreSQL initdb/pg_ctl 在 Windows 上无法处理路径中的中文字符
-    （UTF8 编码下会报 invalid byte sequence）。如果安装目录包含非 ASCII
-    字符，将 pgdata 放到 %LOCALAPPDATA%/ResumeAssistantPG/pgdata 下。
-    """
+    """返回一个纯 ASCII 的 pgdata 路径。"""
     local_path = APP_ROOT / "pgdata"
-    try:
-        str(local_path).encode("ascii")
+    if _is_ascii(local_path):
         return local_path
-    except UnicodeEncodeError:
-        safe = Path(os.environ.get("LOCALAPPDATA", os.environ.get("TEMP", "C:\\Temp")))
-        safe = safe / "ResumeAssistantPG" / "pgdata"
-        safe.mkdir(parents=True, exist_ok=True)
-        return safe
+    safe = _SAFE_BASE / "pgdata"
+    safe.mkdir(parents=True, exist_ok=True)
+    return safe
 
 
+PGSQL_DIR = _safe_pgsql()
+PG_CTL = PGSQL_DIR / "bin" / "pg_ctl.exe"
+INITDB = PGSQL_DIR / "bin" / "initdb.exe"
+PSQL = PGSQL_DIR / "bin" / "psql.exe"
 PGDATA_DIR = _safe_pgdata()
 
 

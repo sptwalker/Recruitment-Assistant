@@ -41,11 +41,24 @@ def is_port_open(port: int) -> bool:
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
+def _short_path(p: Path) -> str:
+    """将长路径转为 Windows 8.3 短路径，避免非 ASCII 字符导致 PostgreSQL 失败。"""
+    try:
+        import ctypes
+        buf = ctypes.create_unicode_buffer(512)
+        rv = ctypes.windll.kernel32.GetShortPathNameW(str(p), buf, 512)
+        if rv and rv < 512:
+            return buf.value
+    except Exception:
+        pass
+    return str(p)
+
+
 def get_env() -> dict:
     env = os.environ.copy()
     env["PATH"] = f"{PGSQL_DIR / 'bin'};{PYTHON_DIR};{PYTHON_DIR / 'Scripts'};{env.get('PATH', '')}"
     env["PYTHONPATH"] = str(APP_ROOT)
-    env["PGDATA"] = str(PGDATA_DIR)
+    env["PGDATA"] = _short_path(PGDATA_DIR)
     env["PGPORT"] = str(PG_PORT)
     env["PGUSER"] = DB_USER
     env["PGPASSWORD"] = DB_PASSWORD
@@ -55,12 +68,18 @@ def get_env() -> dict:
 def init_postgres() -> None:
     if not PGDATA_DIR.exists():
         log("Initializing PostgreSQL data directory...")
-        subprocess.run(
-            [str(INITDB), "-D", str(PGDATA_DIR), "-U", DB_USER, "-E", "UTF8", "--locale=C"],
+        pgdata_path = _short_path(PGDATA_DIR)
+        log(f"  PGDATA path: {pgdata_path}")
+        result = subprocess.run(
+            [_short_path(INITDB), "-D", pgdata_path, "-U", DB_USER, "-E", "UTF8", "--locale=C"],
             env=get_env(),
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
             creationflags=subprocess.CREATE_NO_WINDOW,
-            check=True,
         )
+        if result.returncode != 0:
+            log(f"  initdb stdout: {result.stdout}")
+            log(f"  initdb stderr: {result.stderr}")
+            result.check_returncode()
         pg_hba = PGDATA_DIR / "pg_hba.conf"
         content = pg_hba.read_text(encoding="utf-8")
         content = content.replace("scram-sha-256", "trust").replace("md5", "trust")
@@ -74,12 +93,17 @@ def start_postgres() -> None:
         return
     init_postgres()
     log("Starting PostgreSQL...")
-    subprocess.run(
-        [str(PG_CTL), "start", "-D", str(PGDATA_DIR), "-l", str(APP_ROOT / "logs" / "postgresql.log"), "-w"],
+    pgdata_path = _short_path(PGDATA_DIR)
+    result = subprocess.run(
+        [_short_path(PG_CTL), "start", "-D", pgdata_path, "-l", _short_path(APP_ROOT / "logs" / "postgresql.log"), "-w"],
         env=get_env(),
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
         creationflags=subprocess.CREATE_NO_WINDOW,
-        check=True,
     )
+    if result.returncode != 0:
+        log(f"  pg_ctl stdout: {result.stdout}")
+        log(f"  pg_ctl stderr: {result.stderr}")
+        result.check_returncode()
     for _ in range(30):
         if is_port_open(PG_PORT):
             log("PostgreSQL started.")
@@ -91,14 +115,14 @@ def start_postgres() -> None:
 def ensure_database() -> None:
     env = get_env()
     result = subprocess.run(
-        [str(PSQL), "-U", DB_USER, "-p", str(PG_PORT), "-lqt"],
+        [_short_path(PSQL), "-U", DB_USER, "-p", str(PG_PORT), "-lqt"],
         capture_output=True, text=True, env=env,
         creationflags=subprocess.CREATE_NO_WINDOW,
     )
     if DB_NAME not in result.stdout:
         log(f"Creating database '{DB_NAME}'...")
         subprocess.run(
-            [str(PSQL), "-U", DB_USER, "-p", str(PG_PORT), "-c", f"CREATE DATABASE {DB_NAME};"],
+            [_short_path(PSQL), "-U", DB_USER, "-p", str(PG_PORT), "-c", f"CREATE DATABASE {DB_NAME};"],
             env=env, creationflags=subprocess.CREATE_NO_WINDOW, check=True,
         )
     log("Running database migrations...")

@@ -38,9 +38,12 @@ def setup_embedded_python(target_dir: Path, requirements_file: Path) -> None:
                 new_lines.append("import site")
             else:
                 new_lines.append(line)
-        if "Lib" not in "\n".join(new_lines):
+        content = "\n".join(new_lines)
+        if "Lib" not in content:
             new_lines.insert(0, "Lib")
             new_lines.insert(1, "Lib/site-packages")
+        if ".." not in new_lines:
+            new_lines.insert(0, "..")
         pth_file.write_text("\n".join(new_lines), encoding="utf-8")
 
     stdlib_zip = target_dir / "python311.zip"

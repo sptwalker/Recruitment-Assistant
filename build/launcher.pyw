@@ -189,22 +189,22 @@ def start_postgres() -> None:
     init_postgres()
     log("Starting PostgreSQL...")
     pg_log = _safe_pg_log()
-    result = subprocess.run(
-        [str(PG_CTL), "start", "-D", str(PGDATA_DIR), "-l", pg_log, "-w"],
+    # 不用 -w 和 capture_output：pg_ctl 在 Windows 上 spawn postgres.exe 后，
+    # 子进程会继承管道句柄，导致 subprocess.run 永远阻塞等待管道关闭。
+    subprocess.run(
+        [str(PG_CTL), "start", "-D", str(PGDATA_DIR), "-l", pg_log],
         env=get_env(),
-        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         creationflags=subprocess.CREATE_NO_WINDOW,
+        timeout=15,
     )
-    if result.returncode != 0:
-        log(f"  pg_ctl stdout: {result.stdout}")
-        log(f"  pg_ctl stderr: {result.stderr}")
-        result.check_returncode()
     for _ in range(30):
         if is_port_open(PG_PORT):
             log("PostgreSQL started.")
             return
         time.sleep(0.5)
-    raise RuntimeError("PostgreSQL failed to start within 15 seconds.")
+    log(f"PostgreSQL failed to start. Check log: {pg_log}")
+    raise RuntimeError(f"PostgreSQL 启动超时，详见日志: {pg_log}")
 
 
 def ensure_database() -> None:

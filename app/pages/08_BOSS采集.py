@@ -432,7 +432,7 @@ with st.container(border=True):
     status_cols[3].metric("去重记录数", current_dedup_total)
     status_cols[4].metric("最近事件", runtime.get("last_event_at") or "-")
 
-    action_cols = st.columns([1.25, 1.25, 1.1, 1.25, 4.15], gap="medium")
+    action_cols = st.columns([1.25, 1.25, 1.1, 5.4], gap="medium")
     action_cols[0].link_button("打开 BOSS 登录页面", "https://www.zhipin.com/web/user/?ka=header-login")
     if action_cols[1].button("重新检测 BOSS 页面", disabled=not ws_connected):
         bridge.probe_page()
@@ -440,16 +440,6 @@ with st.container(border=True):
     if action_cols[2].button("重置日志信息", disabled=runtime.get("running", False)):
         bridge.reset_run()
         st.rerun()
-    if action_cols[3].button("清除去重数据库", disabled=runtime.get("running", False)):
-        try:
-            deleted_count = bridge.clear_boss_dedup_records()
-            st.session_state["boss_dedup_clear_message"] = f"已清除 BOSS 去重记录 {deleted_count} 条"
-        except Exception as exc:
-            st.session_state["boss_dedup_clear_message"] = f"清除 BOSS 去重记录失败：{exc}"
-        st.rerun()
-    clear_message = st.session_state.get("boss_dedup_clear_message")
-    if clear_message:
-        action_cols[4].caption(clear_message)
     summary = st.session_state.get("boss_run_summary")
     if summary:
         st.code(json.dumps(summary, ensure_ascii=False, indent=2), language="json")
@@ -570,8 +560,10 @@ with st.container(border=True):
             try:
                 with create_session() as session:
                     svc = BossCandidateRecordService(session)
-                    deleted = sum(1 for rid in to_delete_ids if svc.delete_record_by_id(rid))
-                st.session_state["boss_record_delete_message"] = f"已删除 {deleted} 条记录"
+                    removed_keys = {svc.delete_record_by_id(rid) for rid in to_delete_ids}
+                    removed_keys.discard(None)
+                bridge.discard_dedup_keys(removed_keys)
+                st.session_state["boss_record_delete_message"] = f"已删除 {len(removed_keys)} 条记录"
             except Exception as exc:
                 st.session_state["boss_record_delete_message"] = f"删除失败：{exc}"
             st.rerun()
@@ -599,8 +591,9 @@ with st.container(border=True):
                     try:
                         with create_session() as session:
                             svc = BossCandidateRecordService(session)
-                            deleted = svc.delete_all_by_platform("boss")
-                        st.session_state["boss_record_delete_message"] = f"已全部删除 {deleted} 条记录"
+                            removed_keys = svc.delete_all_by_platform("boss")
+                        bridge.discard_dedup_keys(removed_keys)
+                        st.session_state["boss_record_delete_message"] = f"已全部删除 {len(removed_keys)} 条记录"
                     except Exception as exc:
                         st.session_state["boss_record_delete_message"] = f"全部删除失败：{exc}"
                     st.session_state["boss_confirm_delete_all"] = False

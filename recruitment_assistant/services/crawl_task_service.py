@@ -189,23 +189,31 @@ class BossCandidateRecordService:
             })
         return records
 
-    def delete_record_by_id(self, record_id: int) -> bool:
-        """按主键删除单条 boss_candidate_record。返回是否实际删除。"""
+    def delete_record_by_id(self, record_id: int) -> str | None:
+        """按主键删除单条 boss_candidate_record。返回被删记录的 candidate_key（用于同步内存去重）。"""
         self.ensure_table()
-        result = self.session.execute(
+        key = self.session.execute(
+            select(BossCandidateRecord.candidate_key).where(BossCandidateRecord.id == int(record_id))
+        ).scalar()
+        if key is None:
+            return None
+        self.session.execute(
             delete(BossCandidateRecord).where(BossCandidateRecord.id == int(record_id))
         )
         self.session.commit()
-        return int(result.rowcount or 0) > 0
+        return str(key)
 
-    def delete_all_by_platform(self, platform_code: str) -> int:
-        """删除指定平台的全部已入库候选人记录。返回删除条数。"""
+    def delete_all_by_platform(self, platform_code: str) -> set[str]:
+        """删除指定平台的全部已入库候选人记录。返回被删记录的 candidate_key 集合。"""
         self.ensure_table()
-        result = self.session.execute(
+        keys = {str(k) for k in self.session.execute(
+            select(BossCandidateRecord.candidate_key).where(BossCandidateRecord.platform_code == platform_code)
+        ).scalars() if k}
+        self.session.execute(
             delete(BossCandidateRecord).where(BossCandidateRecord.platform_code == platform_code)
         )
         self.session.commit()
-        return int(result.rowcount or 0)
+        return keys
 
     def upsert_candidate_record(
         self,

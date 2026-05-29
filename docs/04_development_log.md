@@ -1,5 +1,63 @@
 # 开发日志
 
+## 2026-05-28 — V3.05
+
+### BOSS 作品集下载修复（扩展 v2.48.0 → v2.50.0）
+
+BOSS 直聘聊天页"作品集"卡片包含一个 Vue 组件，简历 URL 存储在 `__vue__` 实例的 `hyperLink.url` 字段中，DOM 上无任何可读属性暴露该链接。
+
+**v2.48.0 — CustomEvent 方案（失败）**
+
+content.js（isolated world）注入 `<script>` 标签在 main world 执行 Vue 遍历，通过 `CustomEvent` 把结果传回 isolated world。实际 Chrome 扩展中 `dispatchEvent` 在 main world 触发的事件 **不会跨世界传递**到 isolated world 的 `addEventListener`（CDP 模拟隔离世界可通过，真实扩展不行），3 秒超时后返回 `url_extraction_failed`。
+
+**v2.49.0 — DOM 属性方案（失败）**
+
+改用 DOM 属性 `data-works-result` 作为跨世界数据通道：content.js 注入 inline `<script>` 写属性，content.js 轮询读取。Chrome MV3 扩展 CSP 阻止 content script 注入的 inline script 执行，属性永远不被写入。
+
+**v2.50.0 — `chrome.scripting.executeScript({ world: "MAIN" })` 方案（成功）**
+
+使用 MV3 官方 API：content.js 在目标卡片上标记 `data-works-extract` 属性后发送 `chrome.runtime.sendMessage({ type: "extract_vue_data" })` 到 background.js；background.js 调用 `chrome.scripting.executeScript({ target: { tabId }, world: "MAIN" })` 在页面主世界中遍历 `__vue__.$parent` 链提取 `hyperLink.url`，通过 `sendResponse` 返回结果。
+
+- `chrome_extension/content.js`：`extractBossWorksDownloadInfo()` 重写为 Promise，发消息给 background
+- `chrome_extension/background.js`：新增 `extract_vue_data` 消息处理器，`executeScript` + Vue 遍历逻辑
+- `chrome_extension/manifest.json`：版本升至 `2.50.0`
+
+**测试结果**：作品集 URL 成功提取并归档，文件名样本 `冼建华-23岁-大专-BOSS直聘-（附件作品）-20260528-165120-001.pdf`。
+
+---
+
+### 移除"清除去重数据库"按钮
+
+BOSS 采集页和 51job 采集页顶部操作栏中的"清除去重数据库"按钮已无业务价值（误触风险高、正常流程不需要手动清空去重表），予以移除。
+
+- `app/pages/08_BOSS采集.py`：删除按钮代码及 `clear_message` 显示，操作栏列布局从 5 列调整为 4 列
+- `app/pages/09_51前程无忧采集.py`：同上
+
+---
+
+### 修复删除候选人后去重缓存未刷新
+
+**现象**：在底部"已入库候选人"表格中删除某候选人后，不刷新页面直接重新采集，该候选人仍被去重跳过。
+
+**根因**：`BossCandidateRecordService.delete_record_by_id()` 只删除 PostgreSQL 中的 `BossCandidateRecord` 行，bridge 的内存集合 `_seen_candidate_records` 未同步移除对应 `candidate_key`，下次采集时内存去重命中 → 跳过。
+
+**修复**：
+
+- `recruitment_assistant/services/crawl_task_service.py`：
+  - `delete_record_by_id()` 返回值从 `bool` 改为 `str | None`（返回被删记录的 `candidate_key`）
+  - `delete_all_by_platform()` 返回值从 `int` 改为 `set[str]`（返回被删记录的 key 集合）
+- `recruitment_assistant/services/boss_ws_bridge.py`、`qiancheng_ws_bridge.py`：新增 `discard_dedup_keys(keys: set[str])` 方法，从 `_seen_candidate_records` 中移除指定 key
+- `app/pages/08_BOSS采集.py`、`09_51前程无忧采集.py`：删除操作后调用 `bridge.discard_dedup_keys(removed_keys)` 同步内存
+
+---
+
+### 版本号与打包
+
+- `recruitment_assistant/version.py`：`APP_VERSION = "V3.05"`
+- `pyproject.toml`：`version = "3.0.5"`
+- `build/installer.iss`：`#define MyAppVersion "3.05"`
+- 生成安装包 `简历智采助手_V3.05_Setup.exe`
+
 ## 2026-05-25（晚）
 
 ### 智联采集模块精确定位 + 滚动加载修复 + completed 双计数 bug 修复

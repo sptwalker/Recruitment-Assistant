@@ -158,6 +158,9 @@ class QianchengWSBridge:
         self._write_event_log("qiancheng_dedup_records_cleared", {"deleted_count": deleted_count})
         return deleted_count
 
+    def discard_dedup_keys(self, keys: set[str]) -> None:
+        self._seen_candidate_records -= keys
+
     def _create_crawl_task(self, config: dict) -> None:
         planned_count = int(config.get("max_resumes") or 0) or None
         task_config = dict(config or {})

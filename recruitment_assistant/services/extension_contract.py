@@ -15,5 +15,5 @@ content.js 每动一行就要同步改三处，漏改任何一处都会让对应
 bridge 各自的 BRIDGE_VERSION 仍由各 bridge 模块独立维护，表达 bridge 自身的代码版本。
 """
 
-EXPECTED_EXTENSION_VERSION = "2.39.3"
-EXPECTED_CONTENT_SCRIPT_VERSION = "2.39.3"
+EXPECTED_EXTENSION_VERSION = "2.50.0"
+EXPECTED_CONTENT_SCRIPT_VERSION = "2.50.0"

@@ -1260,6 +1260,18 @@ class ZhilianWSBridge:
         candidate_key = self._build_boss_candidate_key(candidate_sig, candidate_info)
         download_request_id = str(data.get("download_request_id", "") or "")
 
+        if candidate_key and candidate_key in self._seen_candidate_records:
+            self._log("info", f"去重命中，已存在记录: {candidate_sig}")
+            self._write_event_log("resume_saved_duplicate_skipped", {
+                "signature": candidate_sig,
+                "candidate_key": candidate_key,
+                "info": candidate_info,
+                "status": "duplicate_skipped",
+                "at": datetime.now().isoformat(),
+            })
+            self._send_persist_ack(candidate_sig, candidate_info, "duplicate_skipped", download_request_id, "duplicate_in_run")
+            return
+
         if download_path:
             source = Path(download_path)
             if source.exists():

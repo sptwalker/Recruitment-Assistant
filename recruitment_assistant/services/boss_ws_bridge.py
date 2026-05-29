@@ -31,7 +31,7 @@ from recruitment_assistant.services.extension_contract import (
 )
 
 
-BOSS_BRIDGE_VERSION = "2.05.0"
+BOSS_BRIDGE_VERSION = "2.06.0"
 
 
 class BossWSBridge:
@@ -153,6 +153,9 @@ class BossWSBridge:
         self._log("info", f"已清除 BOSS 去重数据库: {deleted_count} 条")
         self._write_event_log("boss_dedup_records_cleared", {"deleted_count": deleted_count})
         return deleted_count
+
+    def discard_dedup_keys(self, keys: set[str]) -> None:
+        self._seen_candidate_records -= keys
 
     def _create_crawl_task(self, config: dict) -> None:
         planned_count = int(config.get("max_resumes") or 0) or None
@@ -758,6 +761,34 @@ class BossWSBridge:
                 )
             case "resume_attachment_debug":
                 pass
+            case "boss_works_detection_start":
+                sig = data.get("candidate_signature", "未知")
+                imm = data.get("btn_found_immediate", False)
+                total = data.get("total_card_btns", 0)
+                texts = data.get("card_btn_texts", [])
+                self._log("info", f"作品集探测开始: {sig}；立即命中={imm}；card-btn数={total}；文本={texts}")
+            case "boss_works_scroll_attempt":
+                sig = data.get("candidate_signature", "未知")
+                found = data.get("scroll_container_found", False)
+                cls = data.get("scroll_class", "")[:60]
+                sh = data.get("scroll_height", 0)
+                ch = data.get("client_height", 0)
+                self._log("info", f"作品集滚动查找: {sig}；容器找到={found}；class={cls}；scrollH={sh}；clientH={ch}")
+            case "boss_attachment_works_button_found":
+                sig = data.get("candidate_signature", "未知")
+                self._log("info", f"探测到预览作品集按钮: {sig}")
+            case "boss_attachment_works_found":
+                sig = data.get("candidate_signature", "未知")
+                fn = data.get("filename", "")
+                self._log("info", f"作品集URL已提取: {sig}；文件名={fn}")
+            case "boss_attachment_works_downloaded":
+                sig = data.get("candidate_signature", "未知")
+                fn = data.get("filename", "")
+                self._log("success", f"作品集下载成功: {sig}；文件名={fn}")
+            case "boss_attachment_works_skipped":
+                sig = data.get("candidate_signature", "未知")
+                reason = data.get("reason", "")
+                self._log("warning", f"作品集跳过: {sig}；原因={reason}")
             case "download_intent_registered":
                 pass
             case "direct_download_request_received":
@@ -1025,6 +1056,12 @@ class BossWSBridge:
             case "collect_progress":
                 self.runtime_state["current_index"] = data.get("current_index", 0)
                 self.runtime_state["scanned_count"] = data.get("scanned_count", self.runtime_state.get("scanned_count", 0))
+            case "boss_scroll_phase_enter":
+                self._log("info", f"进入滚动加载阶段: 已完成={data.get('completed')}/{data.get('target')}，已处理={data.get('processed_count')}人，文本指纹={data.get('processed_texts_size')}条，state={data.get('state')}")
+            case "boss_list_scroll_exhausted":
+                total = data.get("total_items", "?")
+                retries = data.get("retries", "?")
+                self._log("warning", f"候选人列表滚动已耗尽: 可见元素={total}，重试={retries}次；已处理={data.get('processed_count', '?')}人，文本指纹={data.get('processed_texts_size', '?')}条")
             case "collect_finished":
                 self.runtime_state["running"] = False
                 self.runtime_state["paused"] = False
@@ -1222,6 +1259,10 @@ class BossWSBridge:
             )
 
     def _save_resume(self, data: dict) -> None:
+        if data.get("variant") == "attachment_works":
+            self._save_attachment_works(data)
+            return
+
         candidate_sig = data.get("candidate_signature", "未知")
         candidate_info = data.get("candidate_info", {})
         source_filename = data.get("filename", "")
@@ -1373,6 +1414,109 @@ class BossWSBridge:
         })
         self._send_persist_ack(candidate_sig, candidate_info, "archive_missing", download_request_id, "源文件未找到")
 
+    def _save_attachment_works(self, data: dict) -> None:
+        candidate_sig = data.get("candidate_signature", "未知")
+        candidate_info = data.get("candidate_info", {}) or {}
+        source_filename = data.get("filename", "")
+        download_path = data.get("download_path", "")
+        download_request_id = str(data.get("download_request_id", "") or "")
+        candidate_key = self._build_boss_candidate_key(candidate_sig, candidate_info)
+        works_dedup_key = f"{candidate_key}::works" if candidate_key else ""
+
+        if works_dedup_key and works_dedup_key in self._seen_candidate_records:
+            self._log("info", f"附件作品去重命中，已存在记录: {candidate_sig}")
+            self._send_persist_ack(candidate_sig, candidate_info, "works_duplicate_skipped", download_request_id, "works_duplicate_in_run")
+            return
+
+        if not download_path:
+            self._log("warning", f"附件作品下载完成但未带文件路径，跳过: {candidate_sig}")
+            self._send_persist_ack(candidate_sig, candidate_info, "works_archive_missing", download_request_id, "缺少 download_path")
+            return
+
+        source = Path(download_path)
+        if not source.exists():
+            self._log("warning", f"附件作品源文件未找到，跳过: {candidate_sig}；path={download_path}")
+            self._send_persist_ack(candidate_sig, candidate_info, "works_archive_missing", download_request_id, "源文件未找到")
+            return
+
+        now = datetime.now()
+        project_root = Path(__file__).resolve().parents[2]
+        target_dir = project_root / "data" / "attachments" / "boss" / now.strftime("%Y%m%d")
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        content = source.read_bytes()
+        file_hash = sha256(content).hexdigest()
+        bound_signature = self._saved_resume_hash_signatures.get(file_hash)
+        if bound_signature and bound_signature != candidate_sig:
+            self._log(
+                "warning",
+                f"附件作品 hash 已归属 {bound_signature}，本次为 {candidate_sig}，已拦截",
+            )
+            self._send_persist_ack(
+                candidate_sig,
+                candidate_info,
+                "works_hash_mismatch_blocked",
+                download_request_id,
+                f"内容已归属 {bound_signature}",
+                {"bound_signature": bound_signature, "hash": file_hash},
+            )
+            return
+        self._saved_resume_hash_signatures[file_hash] = candidate_sig
+        suffix = source.suffix.lower() or ".pdf"
+
+        name = self._normalize_resume_filename_part(candidate_info.get("name"), "未知姓名")
+        age = self._normalize_resume_filename_part(candidate_info.get("age"), "未知年龄")
+        education = self._normalize_resume_filename_part(candidate_info.get("education"), "未知学历")
+        talking_position_raw = (
+            candidate_info.get("talking_position")
+            or self._talking_position_by_sig.get(candidate_sig)
+            or candidate_info.get("job_title")
+            or ""
+        ).strip()
+        simplified_position = self._simplify_talking_position(talking_position_raw)
+        position_part = self._normalize_resume_filename_part(simplified_position, simplified_position) if simplified_position else ""
+
+        seq = self.runtime_state["downloaded_count"]
+        stem_parts = [name, age, education]
+        if position_part:
+            stem_parts.append(position_part)
+        stem_parts.extend(["BOSS直聘", "（附件作品）", now.strftime("%Y%m%d"), now.strftime("%H%M%S"), f"{seq:03d}"])
+        filename_stem = "-".join(stem_parts)
+        filename = f"{filename_stem}{suffix}"
+
+        target = target_dir / filename
+        duplicate_index = 1
+        while target.exists() and target != source:
+            target = target_dir / f"{filename_stem}-{duplicate_index}{suffix}"
+            duplicate_index += 1
+        if source.resolve() != target.resolve():
+            shutil.copy2(str(source), str(target))
+            try:
+                source.unlink()
+            except OSError as exc:
+                self._log("warning", f"附件作品归档后删除源文件失败: {source}；原因={exc}")
+
+        if works_dedup_key:
+            self._seen_candidate_records.add(works_dedup_key)
+
+        self._log("success", f"附件作品已归档: {target.name}")
+        self._write_event_log("attachment_works_saved", {
+            "signature": candidate_sig,
+            "candidate_key": candidate_key,
+            "file": target.name,
+            "path": str(target),
+            "hash": file_hash,
+            "status": "works_saved",
+            "at": now.isoformat(),
+        })
+        self._send_persist_ack(
+            candidate_sig,
+            candidate_info,
+            "works_saved",
+            download_request_id,
+            "",
+            {"file": target.name, "hash": file_hash, "variant": "attachment_works"},
+        )
 
     def _translate_skip_reason(self, reason: str) -> str:
         if reason.startswith("button_disabled:"):

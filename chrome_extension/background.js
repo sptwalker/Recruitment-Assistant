@@ -574,6 +574,58 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       connected: Object.values(platforms).some((p) => p.ws?.readyState === WebSocket.OPEN),
       platform_states: Object.fromEntries(Object.entries(platforms).map(([code, p]) => [code, { connected: p.ws?.readyState === WebSocket.OPEN, collectState: p.collectState }])),
     });
+  } else if (msg.type === "extract_vue_data") {
+    const tabId = sender?.tab?.id;
+    if (!tabId) { sendResponse({ ok: false, error: "no_tab" }); return true; }
+    chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      args: [msg.marker],
+      func: (marker) => {
+        function _ex(raw) {
+          if (!raw) return "";
+          if (/^https?:\/\//i.test(raw)) return raw;
+          if (/^bosszp:\/\//i.test(raw)) {
+            try {
+              const q = raw.indexOf("?");
+              if (q < 0) return "";
+              const p = new URLSearchParams(raw.slice(q + 1));
+              const u = p.get("url");
+              if (u && /^https?:\/\//i.test(u)) return u;
+            } catch (e) {}
+          }
+          return "";
+        }
+        const card = document.querySelector('[data-works-extract="' + marker + '"]');
+        if (!card) return null;
+        card.removeAttribute("data-works-extract");
+        let vm = null;
+        for (let el = card; el && !vm; el = el.parentElement) { vm = el.__vue__; }
+        if (!vm) return null;
+        for (let cur = vm; cur; cur = cur.$parent) {
+          const msg = cur.message || (cur.$props && cur.$props.message) || (cur.$data && cur.$data.message);
+          if (!msg) continue;
+          const hl = msg.body && msg.body.hyperLink;
+          if (!hl) continue;
+          let url = _ex(hl.url || hl.hyperLinkUrl || "");
+          if (!url) {
+            try {
+              const extra = typeof hl.extraJson === "string" ? JSON.parse(hl.extraJson) : hl.extraJson;
+              url = _ex((extra && extra.resumeNewUrl) || "") || _ex((extra && extra.resumePreviewH5Url) || "");
+            } catch (e) {}
+          }
+          if (!url) continue;
+          return { url, filename: msg.text || "" };
+        }
+        return null;
+      },
+    }).then((results) => {
+      const val = results?.[0]?.result || null;
+      sendResponse({ ok: true, data: val });
+    }).catch((err) => {
+      sendResponse({ ok: false, error: String(err) });
+    });
+    return true;
   }
   return true;
 });

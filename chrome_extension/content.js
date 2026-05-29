@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  const CONTENT_SCRIPT_VERSION = "2.39.3";
+  const CONTENT_SCRIPT_VERSION = "2.50.0";
 
   // 平台注册表：每个平台的 hostname、WS 端口、文本标记、localStorage key 一站式声明。
   // 这是从单平台升级到多平台的核心入口——新加平台只需在此对象增加一条配置。
@@ -1001,6 +1001,162 @@
     return matches[0] || null;
   }
 
+  function acceptResumeConsentIfNeeded() {
+    const cardBtns = document.querySelectorAll(".message-card-wrap.boss-green .message-card-buttons .card-btn");
+    for (const btn of cardBtns) {
+      if (textOf(btn).trim() === "同意" && isVisible(btn)) return btn;
+    }
+    const noticeBtns = document.querySelectorAll(".notice-list.notice-blue-list .op a.btn");
+    for (const btn of noticeBtns) {
+      if (textOf(btn).trim() === "同意" && isVisible(btn)) return btn;
+    }
+    return null;
+  }
+
+  function findBossWorksPreviewButton() {
+    const btns = document.querySelectorAll(".message-card-wrap.boss-green .message-card-buttons .card-btn");
+    for (const btn of btns) {
+      if (textOf(btn).trim() === "预览作品集") return btn;
+    }
+    return null;
+  }
+
+  function findBossChatScrollContainer() {
+    const anyCard = document.querySelector(".message-card-wrap");
+    if (anyCard) {
+      for (let el = anyCard.parentElement; el; el = el.parentElement) {
+        const style = getComputedStyle(el);
+        if ((style.overflowY === "auto" || style.overflowY === "scroll") && el.scrollHeight > el.clientHeight) {
+          return el;
+        }
+      }
+    }
+    for (const sel of [".chat-conversation", "[class*='chat-container']", "[class*='message-list']"]) {
+      const el = document.querySelector(sel);
+      if (el && el.scrollHeight > el.clientHeight) return el;
+    }
+    return null;
+  }
+
+  function _extractHttpsFromBosszp(raw) {
+    if (!raw) return "";
+    if (/^https?:\/\//i.test(raw)) return raw;
+    if (/^bosszp:\/\//i.test(raw)) {
+      try {
+        const qIdx = raw.indexOf("?");
+        if (qIdx < 0) return "";
+        const params = new URLSearchParams(raw.slice(qIdx + 1));
+        const inner = params.get("url");
+        if (inner && /^https?:\/\//i.test(inner)) return inner;
+      } catch {}
+    }
+    return "";
+  }
+
+  function extractBossWorksDownloadInfo(btn) {
+    // __vue__ is only accessible from main world; use background.js chrome.scripting.executeScript
+    return new Promise((resolve) => {
+      const card = btn.closest(".message-card-wrap");
+      if (!card) { resolve(null); return; }
+      const marker = "__wex_" + Date.now() + "_" + Math.random().toString(36).slice(2);
+      card.setAttribute("data-works-extract", marker);
+      chrome.runtime.sendMessage({ type: "extract_vue_data", marker }, (resp) => {
+        card.removeAttribute("data-works-extract");
+        if (resp?.ok && resp.data) { resolve(resp.data); }
+        else { resolve(null); }
+      });
+    });
+  }
+
+  async function tryDownloadBossAttachmentWorks(candidateId, signature, info) {
+    let btn = findBossWorksPreviewButton();
+    const allCardBtns = document.querySelectorAll(".message-card-wrap.boss-green .message-card-buttons .card-btn");
+    emit({ type: "boss_works_detection_start", data: {
+      candidate_id: candidateId, candidate_signature: signature,
+      btn_found_immediate: !!btn,
+      total_card_btns: allCardBtns.length,
+      card_btn_texts: Array.from(allCardBtns).map(b => b.innerText.trim()).slice(0, 10),
+    }});
+    if (!btn) {
+      const chatScroll = findBossChatScrollContainer();
+      emit({ type: "boss_works_scroll_attempt", data: {
+        candidate_id: candidateId, candidate_signature: signature,
+        scroll_container_found: !!chatScroll,
+        scroll_tag: chatScroll ? chatScroll.tagName : "",
+        scroll_class: chatScroll ? (chatScroll.className || "").toString().slice(0, 80) : "",
+        scroll_height: chatScroll ? chatScroll.scrollHeight : 0,
+        client_height: chatScroll ? chatScroll.clientHeight : 0,
+      }});
+      if (chatScroll) {
+        const originalTop = chatScroll.scrollTop;
+        for (let attempt = 0; attempt < 6 && !btn; attempt++) {
+          chatScroll.scrollTop = Math.max(0, chatScroll.scrollTop - chatScroll.clientHeight * 0.7);
+          chatScroll.dispatchEvent(new Event("scroll", { bubbles: true }));
+          await sleep(300);
+          btn = findBossWorksPreviewButton();
+        }
+        if (!btn) {
+          chatScroll.scrollTop = originalTop;
+          chatScroll.dispatchEvent(new Event("scroll", { bubbles: true }));
+        }
+      }
+    }
+    if (!btn) return false;
+    emit({ type: "boss_attachment_works_button_found", data: {
+      candidate_id: candidateId, candidate_signature: signature
+    }});
+
+    const worksInfo = await extractBossWorksDownloadInfo(btn);
+    if (!worksInfo || !worksInfo.url) {
+      emit({ type: "boss_attachment_works_skipped", data: {
+        candidate_id: candidateId, candidate_signature: signature,
+        reason: "url_extraction_failed"
+      }});
+      return false;
+    }
+
+    emit({ type: "boss_attachment_works_found", data: {
+      candidate_id: candidateId, candidate_signature: signature,
+      url: worksInfo.url, filename: worksInfo.filename
+    }});
+
+    const downloadRequestId = makeDownloadRequestId(candidateId, signature);
+    emit({ type: "download_intent", data: {
+      candidate_id: candidateId,
+      candidate_signature: signature,
+      candidate_info: info,
+      expected_filename: worksInfo.filename || `${signature}_works.pdf`,
+      download_request_id: downloadRequestId,
+      variant: "attachment_works",
+    }});
+
+    const dlResult = await downloadDirectUrl({
+      candidate_id: candidateId,
+      candidate_signature: signature,
+      candidate_info: info,
+      url: worksInfo.url,
+      download_request_id: downloadRequestId,
+      variant: "attachment_works",
+    }, 15000);
+
+    if (!dlResult.ok) {
+      emit({ type: "boss_attachment_works_skipped", data: {
+        candidate_id: candidateId, candidate_signature: signature,
+        reason: dlResult.reason || "download_failed"
+      }});
+      return false;
+    }
+
+    await finalizeDownloadWithPersistAck(
+      candidateId, signature, downloadRequestId, "boss_attachment_works"
+    );
+    emit({ type: "boss_attachment_works_downloaded", data: {
+      candidate_id: candidateId, candidate_signature: signature,
+      url: worksInfo.url, filename: worksInfo.filename
+    }});
+    return true;
+  }
+
   async function waitForResumeRequestSent(timeoutMs = 1800, previousCount = null) {
     const baseline = previousCount ?? getResumeRequestSentCount();
     const deadline = Date.now() + timeoutMs;
@@ -1807,11 +1963,14 @@
 
       function cleanup() {
         resumePreviewLearnState.waitingManualClick = false;
+        resumePreviewLearnState._cancelCapture = null;
         clearTimeout(timer);
         window.removeEventListener("pointerdown", handler, true);
         window.removeEventListener("mousedown", handler, true);
         window.removeEventListener("click", handler, true);
       }
+
+      resumePreviewLearnState._cancelCapture = () => { cleanup(); resolve(null); };
 
       window.addEventListener("pointerdown", handler, true);
       window.addEventListener("mousedown", handler, true);
@@ -1849,11 +2008,11 @@
     const resultPromise = waitForDownloadResult(downloadRequestId, 90000);
     const snapshot = await captureNextManualDownloadClick(candidateId, signature, 90000);
     if (!snapshot) {
-      state = "collecting";
+      if (state === "paused") state = "collecting";
       return false;
     }
     const downloadResult = await resultPromise;
-    state = "collecting";
+    if (state === "paused") state = "collecting";
     if (downloadResult.ok) {
       const learned = { ...snapshot, download_confirmed: true, download_url: findDownloadUrlFromResult(downloadResult), download_data: downloadResult.data || {} };
       saveLearnedDownloadClick(learned);
@@ -2023,6 +2182,30 @@
     return "";
   }
 
+  function _extractDomHref(el) {
+    if (!el) return "";
+    for (let node = el; node && node !== document.body; node = node.parentElement) {
+      const href = node.getAttribute?.("href") || node.getAttribute?.("data-href") || "";
+      if (href && /^https?:\/\//i.test(href)) return href;
+    }
+    return "";
+  }
+
+  function _safeClickNoNavigation(el) {
+    const origOpen = window.open;
+    window.open = function () { return null; };
+    const anchor = el.closest?.("a[href]");
+    let origHref = "";
+    if (anchor) {
+      origHref = anchor.getAttribute("href") || "";
+      anchor.removeAttribute("href");
+    }
+    try { clickElementReliably(el); } finally {
+      window.open = origOpen;
+      if (anchor && origHref) anchor.setAttribute("href", origHref);
+    }
+  }
+
   function tryVueDirectDownload(target) {
     try {
       const candidates = [
@@ -2038,13 +2221,6 @@
         const vm = node.__vue__;
         const href = _extractVueHref(vm);
         if (href) {
-          const a = document.createElement("a");
-          a.href = href;
-          a.download = "";
-          a.style.display = "none";
-          document.body.appendChild(a);
-          a.click();
-          document.body.removeChild(a);
           return href;
         }
       }
@@ -2264,7 +2440,7 @@
     const reqKey = downloadRequestId || "";
     const sigKey = signature || "";
     if (reqKey && persistAckCreditedRequests.has(reqKey)) return false;
-    if (!reqKey && sigKey && persistAckCreditedSignatures.has(sigKey)) return false;
+    if (sigKey && persistAckCreditedSignatures.has(sigKey)) return false;
     if (reqKey) persistAckCreditedRequests.add(reqKey);
     if (sigKey) persistAckCreditedSignatures.add(sigKey);
     results.completed++;
@@ -2274,8 +2450,6 @@
   }
 
   async function finalizeDownloadWithPersistAck(candidateId, signature, downloadRequestId, strategy) {
-    if (downloadRequestId) persistAckCreditedRequests.delete(downloadRequestId);
-    if (signature) persistAckCreditedSignatures.delete(signature);
     const persist = await waitForPersistAck(downloadRequestId, signature, 8000);
     if (persist.ok) {
       creditPersistCompletion(downloadRequestId, signature, "ack_ok");
@@ -2288,6 +2462,11 @@
     // 此处保底再补一次：桥侧无论 saved/timeout 都已经落盘，跑完上层应直接结束本候选人，避免重复点击下载。
     if (persist.status === "persist_ack_timeout") {
       creditPersistCompletion(downloadRequestId, signature, "ack_timeout_fallback");
+      return true;
+    }
+    // bridge 返回 duplicate_in_run / duplicate_skipped 说明文件已落盘（本轮或历史），不是真失败
+    if (persist.status === "duplicate_in_run" || persist.status === "duplicate_skipped") {
+      creditPersistCompletion(downloadRequestId, signature, "ack_duplicate_fallback");
       return true;
     }
     return false;
@@ -2438,9 +2617,14 @@
     const downloadRequestId = makeDownloadRequestId(candidateId, signature);
     emit({ type: "download_intent", data: { candidate_id: candidateId, candidate_signature: signature, candidate_info: info, expected_filename: `${signature}.pdf`, click_strategy: "boss_svg_icon", download_request_id: downloadRequestId } });
     const resultPromise = waitForDownloadResult(downloadRequestId, 20000);
-    const vueUrl = tryVueDirectDownload(target);
-    if (!vueUrl) clickElementReliably(target);
-    emit({ type: "boss_svg_download_icon_clicked", data: { candidate_id: candidateId, candidate_signature: signature, ...snapshot, diagnostics: getDownloadClickDiagnostics(target, "boss_svg_after_click") } });
+    const directUrl = tryVueDirectDownload(target) || _extractDomHref(target);
+    if (directUrl) {
+      const started = await downloadDirectUrl({ candidate_id: candidateId, candidate_signature: signature, candidate_info: info, expected_filename: `${signature}.pdf`, url: directUrl, download_request_id: downloadRequestId });
+      if (!started.ok) _safeClickNoNavigation(target);
+    } else {
+      _safeClickNoNavigation(target);
+    }
+    emit({ type: "boss_svg_download_icon_clicked", data: { candidate_id: candidateId, candidate_signature: signature, ...snapshot, click_had_direct_url: Boolean(directUrl), diagnostics: getDownloadClickDiagnostics(target, "boss_svg_after_click") } });
     await sleep(1000);
     emit({ type: "download_click_post_diagnostics", data: { candidate_id: candidateId, candidate_signature: signature, click_strategy: "boss_svg_icon", diagnostics: getDownloadClickDiagnostics(target, "boss_svg_1s_after_click") } });
     const downloadResult = await resultPromise;
@@ -2518,13 +2702,13 @@
     }
 
     emit({ type: "learned_download_click_used", data: { candidate_id: candidateId, candidate_signature: signature, ...getElementSnapshot(target) } });
-    const downloadRequestId = makeDownloadRequestId(candidateId, signature);
-    emit({ type: "download_intent", data: { candidate_id: candidateId, candidate_signature: signature, candidate_info: info, expected_filename: `${signature}.pdf`, download_request_id: downloadRequestId } });
 
     // If target is an <a> with a download-like href, use direct download API instead of simulated click
     const anchorEl = target.closest?.("a[href]") || (target.tagName === "A" && target.href ? target : null);
     const anchorHref = anchorEl?.href || "";
     if (anchorHref && /^https?:\/\//i.test(anchorHref) && /download|docdownload|attachment|resume/i.test(anchorHref)) {
+      const downloadRequestId = makeDownloadRequestId(candidateId, signature);
+      emit({ type: "download_intent", data: { candidate_id: candidateId, candidate_signature: signature, candidate_info: info, expected_filename: `${signature}.pdf`, download_request_id: downloadRequestId } });
       emit({ type: "learned_download_using_direct_url", data: { candidate_id: candidateId, candidate_signature: signature, url: anchorHref } });
       const resultPromise = waitForDownloadResult(downloadRequestId, 20000);
       const started = await downloadDirectUrl({ candidate_id: candidateId, candidate_signature: signature, candidate_info: info, expected_filename: `${signature}.pdf`, url: anchorHref, download_request_id: downloadRequestId });
@@ -2541,9 +2725,19 @@
       return false;
     }
 
+    const learnedDirectUrl = tryVueDirectDownload(target) || _extractDomHref(target);
+    if (!learnedDirectUrl) {
+      emit({ type: "learned_download_click_no_url", data: { candidate_id: candidateId, candidate_signature: signature, reason: "no_extractable_url_skip_to_next_strategy" } });
+      return false;
+    }
+    const downloadRequestId = makeDownloadRequestId(candidateId, signature);
+    emit({ type: "download_intent", data: { candidate_id: candidateId, candidate_signature: signature, candidate_info: info, expected_filename: `${signature}.pdf`, download_request_id: downloadRequestId } });
     const resultPromise = waitForDownloadResult(downloadRequestId);
-    const vueUrl = tryVueDirectDownload(target);
-    if (!vueUrl) clickElementReliably(target);
+    const started = await downloadDirectUrl({ candidate_id: candidateId, candidate_signature: signature, candidate_info: info, expected_filename: `${signature}.pdf`, url: learnedDirectUrl, download_request_id: downloadRequestId });
+    if (!started.ok) {
+      emit({ type: "learned_download_click_download_failed", data: { candidate_id: candidateId, candidate_signature: signature, reason: started.reason || "direct_url_start_failed" } });
+      return false;
+    }
     const downloadResult = await resultPromise;
     if (downloadResult.ok) {
       const accepted = await finalizeDownloadWithPersistAck(candidateId, signature, downloadRequestId, "learned_click");
@@ -2708,10 +2902,15 @@
     const downloadRequestId = makeDownloadRequestId(candidateId, signature);
     emit({ type: "download_intent", data: { candidate_id: candidateId, candidate_signature: signature, candidate_info: info, expected_filename: `${signature}.pdf`, download_request_id: downloadRequestId } });
     const resultPromise = waitForDownloadResult(downloadRequestId, 20000);
-    const vueUrl = tryVueDirectDownload(downloadButton);
-    if (!vueUrl) clickElementReliably(downloadButton);
+    const autoDirectUrl = tryVueDirectDownload(downloadButton) || _extractDomHref(downloadButton);
+    if (autoDirectUrl) {
+      const started = await downloadDirectUrl({ candidate_id: candidateId, candidate_signature: signature, candidate_info: info, expected_filename: `${signature}.pdf`, url: autoDirectUrl, download_request_id: downloadRequestId });
+      if (!started.ok) _safeClickNoNavigation(downloadButton);
+    } else {
+      _safeClickNoNavigation(downloadButton);
+    }
     await sleep(1000);
-    emit({ type: "download_click_post_diagnostics", data: { candidate_id: candidateId, candidate_signature: signature, click_strategy: "auto_download_button", diagnostics: getDownloadClickDiagnostics(downloadButton, "auto_1s_after_click") } });
+    emit({ type: "download_click_post_diagnostics", data: { candidate_id: candidateId, candidate_signature: signature, click_strategy: "auto_download_button", click_had_direct_url: Boolean(autoDirectUrl), diagnostics: getDownloadClickDiagnostics(downloadButton, "auto_1s_after_click") } });
     const downloadResult = await resultPromise;
     if (downloadResult.ok) {
       await finalizeDownloadWithPersistAck(candidateId, signature, downloadRequestId, "auto_download_button");
@@ -4418,6 +4617,7 @@
 
     const seenSignatures = new Set();
     const processedElements = new WeakSet();
+    const processedTexts = new Set();
     let processedCount = 0;
     let scrollRetries = 0;
     const MAX_SCROLL_RETRIES = 10;
@@ -4431,7 +4631,10 @@
       results.currentIndex = i;
       const item = items[i];
       if (processedElements.has(item)) continue;
+      const itemText = (item.innerText || item.textContent || "").replace(/\s+/g, " ").trim().slice(0, 120);
+      if (itemText && processedTexts.has(itemText)) continue;
       processedElements.add(item);
+      if (itemText) processedTexts.add(itemText);
       processedCount++;
 
       const candidateStepStartedAt = Date.now();
@@ -4517,7 +4720,7 @@
 
       const resumeButtonLookupStartedAt = Date.now();
       emit({ type: "boss_resume_button_lookup_started", data: { candidate_id: candidateId, candidate_signature: signature } });
-      const btn = findResumeButton();
+      let btn = findResumeButton();
       if (!btn) {
         await skipCandidate(candidateId, signature, "no_resume_button", { fast_skip: true, elapsed_ms: Date.now() - resumeButtonLookupStartedAt });
         continue;
@@ -4526,14 +4729,36 @@
       emit({ type: "resume_button_found", data: { candidate_id: candidateId, candidate_signature: signature, button_state: btn.state, button_state_label: btn.state_label, button_text: btn.text, elapsed_ms: Date.now() - resumeButtonLookupStartedAt } });
 
       if (btn.state === "dim") {
-        if (hasResumeRequestSent(getChatDetailRoot())) {
-          await skipCandidate(candidateId, signature, "resume_request_already_sent", { fast_skip: true, button_state: btn.state, button_state_label: btn.state_label, button_text: btn.text });
-        } else if (config.request_resume_if_missing) {
-          await requestResumeAndSkip(btn, candidateId, signature);
+        const consentBtn = acceptResumeConsentIfNeeded();
+        if (consentBtn) {
+          emit({ type: "resume_consent_found", data: { candidate_id: candidateId, candidate_signature: signature } });
+          clickElementReliably(consentBtn);
+          emit({ type: "resume_consent_clicked", data: { candidate_id: candidateId, candidate_signature: signature } });
+          let brightened = false;
+          for (let i = 0; i < 20; i++) {
+            await sleep(300);
+            const refreshed = findResumeButton();
+            if (refreshed && refreshed.state === "bright") {
+              brightened = true;
+              btn = refreshed;
+              break;
+            }
+          }
+          if (!brightened) {
+            await skipCandidate(candidateId, signature, "resume_consent_clicked_but_not_brightened", { elapsed_ms: 6000 });
+            continue;
+          }
+          emit({ type: "resume_consent_accepted", data: { candidate_id: candidateId, candidate_signature: signature, button_state: btn.state } });
         } else {
-          await skipCandidate(candidateId, signature, "no_resume_attachment", { fast_skip: true, button_state: btn.state, button_state_label: btn.state_label, button_text: btn.text });
+          if (hasResumeRequestSent(getChatDetailRoot())) {
+            await skipCandidate(candidateId, signature, "resume_request_already_sent", { fast_skip: true, button_state: btn.state, button_state_label: btn.state_label, button_text: btn.text });
+          } else if (config.request_resume_if_missing) {
+            await requestResumeAndSkip(btn, candidateId, signature);
+          } else {
+            await skipCandidate(candidateId, signature, "no_resume_attachment", { fast_skip: true, button_state: btn.state, button_state_label: btn.state_label, button_text: btn.text });
+          }
+          continue;
         }
-        continue;
       }
 
       emitAttachmentDebug("00_resume_button_ready", candidateId, signature, {
@@ -4577,11 +4802,17 @@
         await tryDownloadResume(candidateId, signature, info, preview, true);
         await closeExistingResumePreview(candidateId, signature);
         forceRemoveStalePdfPreviewFrames(signature);
+        await sleep(500);
+        if (!shouldAbortAsyncStep()) {
+          await tryDownloadBossAttachmentWorks(candidateId, signature, info);
+        }
       } catch (perCandidateErr) {
         emit({ type: "candidate_processing_error", data: { candidate_id: candidateId, candidate_signature: signature, message: String(perCandidateErr?.message || perCandidateErr), stack: String(perCandidateErr?.stack || "").slice(0, 800) } });
         await skipCandidate(candidateId, signature, "per_candidate_exception");
       }
     }
+
+    emit({ type: "boss_scroll_phase_enter", data: { completed: results.completed, target: config.max_resumes, processed_count: processedCount, processed_texts_size: processedTexts.size, state } });
 
     while (results.completed < config.max_resumes && state !== "stopped" && scrollRetries < MAX_SCROLL_RETRIES) {
       const beforeCount = getCandidateItems().length;
@@ -4603,7 +4834,12 @@
       }
       await sleep(1500);
       const newItems = getCandidateItems();
-      const freshItems = newItems.filter((el) => !processedElements.has(el));
+      const isFreshItem = (el) => {
+        const t = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 120);
+        if (t && processedTexts.has(t)) return false;
+        return true;
+      };
+      const freshItems = newItems.filter(isFreshItem);
       if (freshItems.length === 0) {
         // 用 Vue scrollToIndex 尝试跳到更后面的条目
         if (scrollContainer) {
@@ -4622,11 +4858,11 @@
         try { last?.scrollIntoView({ block: "end" }); } catch {}
         await sleep(2000);
         const retryItems = getCandidateItems();
-        const retryFresh = retryItems.filter((el) => !processedElements.has(el));
+        const retryFresh = retryItems.filter(isFreshItem);
         if (retryFresh.length === 0) {
           scrollRetries++;
           if (scrollRetries >= MAX_SCROLL_RETRIES) {
-            emit({ type: "boss_list_scroll_exhausted", data: { total_items: newItems.length, retries: scrollRetries } });
+            emit({ type: "boss_list_scroll_exhausted", data: { total_items: newItems.length, retries: scrollRetries, processed_count: processedCount, processed_texts_size: processedTexts.size, completed: results.completed, target: config.max_resumes } });
             break;
           }
           continue;
@@ -4643,8 +4879,10 @@
 
         results.currentIndex++;
         const item = items[i];
-        if (processedElements.has(item)) continue;
+        const itemText = (item.innerText || item.textContent || "").replace(/\s+/g, " ").trim().slice(0, 120);
+        if (itemText && processedTexts.has(itemText)) continue;
         processedElements.add(item);
+        if (itemText) processedTexts.add(itemText);
         processedCount++;
 
         const candidateStepStartedAt = Date.now();
@@ -4735,6 +4973,9 @@
           await tryDownloadResume(candidateId, signature, info, preview, true);
           await closeExistingResumePreview(candidateId, signature);
           forceRemoveStalePdfPreviewFrames(signature);
+          if (!shouldAbortAsyncStep()) {
+            await tryDownloadBossAttachmentWorks(candidateId, signature, info);
+          }
         } catch (perCandidateErr) {
           emit({ type: "candidate_processing_error", data: { candidate_id: candidateId, candidate_signature: signature, message: String(perCandidateErr?.message || perCandidateErr), stack: String(perCandidateErr?.stack || "").slice(0, 800) } });
           await skipCandidate(candidateId, signature, "per_candidate_exception");
@@ -4832,6 +5073,8 @@
           break;
         }
         results = { downloaded: 0, skipped: 0, currentIndex: 0, completed: 0 };
+        persistAckCreditedRequests.clear();
+        persistAckCreditedSignatures.clear();
         resumePreviewLearnState.learningStage = resumePreviewLearnState.learnedClick ? "learned" : "auto_download";
         resumePreviewLearnState.waitingManualClick = false;
         try {
@@ -4864,6 +5107,7 @@
         pendingDownloadWaiters.clear();
         pendingPersistAcks.forEach((resolve) => resolve({ ok: false, status: "collect_stopped" }));
         pendingPersistAcks.clear();
+        if (resumePreviewLearnState._cancelCapture) resumePreviewLearnState._cancelCapture();
         if (pauseResolve) { pauseResolve(); pauseResolve = null; }
         break;
       case "skip_current_candidate": {
@@ -4938,8 +5182,8 @@
             if (data.candidate_signature) receivedPersistAcks.delete(data.candidate_signature);
           }, 45000);
         }
-        // 桥侧 saved 是权威信号；finalizeDownloadWithPersistAck 已超时返回时这里兜底回写。
-        if (data.status === "saved") {
+        // 桥侧 saved 是权威信号；只在无 waiter 时兜底回写 completed（有 waiter 时由 finalizeDownloadWithPersistAck 统一 credit）。
+        if (!resolver && data.status === "saved" && state === "collecting") {
           creditPersistCompletion(data.download_request_id || "", data.candidate_signature || "", "ack_late");
         }
         break;

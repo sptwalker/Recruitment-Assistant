@@ -6,6 +6,7 @@ Tab 3: 招聘岗位录入/匹配（录入岗位 → AI 匹配候选人）
 """
 
 import importlib
+import io
 import os
 import re
 from collections import defaultdict
@@ -20,8 +21,10 @@ import recruitment_assistant.parsers.pdf_resume_parser as resume_parser_module
 from recruitment_assistant.schemas.resume_archive import ResumeSourceCreate
 import recruitment_assistant.services.resume_ai_service as resume_ai_service_module
 from recruitment_assistant.services.resume_archive_service import ResumeArchiveService
+from recruitment_assistant.services.job_service import JobService
+from recruitment_assistant.storage.db import create_session
 from recruitment_assistant.storage.resume_db import create_resume_session, init_resume_database
-from recruitment_assistant.storage.resume_models import JobPosition
+from recruitment_assistant.storage.models import JobPosition
 
 resume_parser_module = importlib.reload(resume_parser_module)
 extract_doc_text = resume_parser_module.extract_doc_text
@@ -701,8 +704,11 @@ def _open_invite_dialog():
         if already_pending:
             st.warning("⚠️ 该候选人已有进行中的邀约，请先到「面试管理」页面取消或完成。")
 
-        # 岗位下拉（可不选）
-        positions = svc.list_positions(status="open")
+        # 岗位下拉（可不选）— 从 PostgreSQL 获取
+        pg_sess = create_session()
+        invite_job_svc = JobService(pg_sess)
+        positions = invite_job_svc.list_positions(status="active")
+        pg_sess.close()
         pos_options = ["（不指定岗位）"] + [
             f"{p.position_id} | {p.title}（{p.department or '-'} · {p.work_city or '-'}）"
             for p in positions
@@ -1040,6 +1046,156 @@ EDU_OPTIONS = ["不限", "大专", "本科", "硕士以上"]
 EXP_OPTIONS = ["不限", "1-3年", "3-5年", "5-10年", "10年以上"]
 
 
+# ---------- Excel 批量导入工具函数 ----------
+
+def _parse_jd_sections(jd_text: str) -> tuple[str, str]:
+    """将 JD 文本按「岗位职责」「任职要求」关键词拆分为两段。
+
+    返回 (responsibilities, job_requirements)。
+    若未找到分隔标记，整段文本归入 job_requirements。
+    """
+    if not jd_text or not jd_text.strip():
+        return "", ""
+
+    # 常见的任职要求段落标题模式
+    req_pattern = re.compile(
+        r"\n\s*(任职要求|任职资格|岗位要求|招聘要求|职位要求)\s*[:：]?\s*\n",
+        re.IGNORECASE,
+    )
+    match = req_pattern.search(jd_text)
+    if match:
+        resp_part = jd_text[:match.start()].strip()
+        req_part = jd_text[match.end():].strip()
+        # 去掉岗位职责段落自身的标题行
+        resp_part = re.sub(
+            r"^(岗位职责|工作职责|职位职责|主要职责)\s*[:：]?\s*\n?",
+            "", resp_part, count=1, flags=re.IGNORECASE,
+        ).strip()
+        return resp_part, req_part
+
+    # 无法拆分时，整段归入 job_requirements
+    return "", jd_text.strip()
+
+
+def _format_salary_wan(low, high) -> str:
+    """将万元数值对 (1.5, 3) 转为 UI 格式字符串 '15K-30K'。"""
+    def _wan_to_k(val) -> str | None:
+        if val is None:
+            return None
+        try:
+            k = int(float(val) * 10)
+            return f"{k}K"
+        except (ValueError, TypeError):
+            return None
+
+    low_k = _wan_to_k(low)
+    high_k = _wan_to_k(high)
+    if low_k and high_k:
+        return f"{low_k}-{high_k}"
+    if low_k:
+        return f"≥{low_k}"
+    if high_k:
+        return f"≤{high_k}"
+    return ""
+
+
+def _format_experience(val) -> str | None:
+    """将工作年限值规范化为字符串。"""
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return f"{int(val)}年"
+    s = str(val).strip()
+    return s if s else None
+
+
+def _parse_excel_positions(file_bytes: bytes, file_name: str) -> tuple[list[dict], list[str]]:
+    """解析上传的 xlsx 文件，返回 (positions_list, errors_list)。
+
+    每个 position 是可直接传给 JobService.create_position() 的关键字字典。
+    """
+    import openpyxl
+
+    errors: list[str] = []
+    positions: list[dict] = []
+
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True)
+    except Exception as exc:
+        return [], [f"无法打开 Excel 文件：{exc}"]
+
+    ws = wb.active
+    if ws is None:
+        wb.close()
+        return [], ["Excel 文件中没有工作表"]
+
+    # 读取表头并建立列名→索引映射
+    header_row = next(ws.iter_rows(min_row=1, max_row=1), None)
+    if not header_row:
+        wb.close()
+        return [], ["Excel 文件第一行为空（缺少表头）"]
+
+    headers = [str(cell.value or "").strip() for cell in header_row]
+
+    # 查找必要列（岗位名称）
+    col_map: dict[str, int] = {}
+    KNOWN_HEADERS = {
+        "岗位名称": "title",
+        "部门": "department",
+        "JD": "jd",
+        "薪资下限": "salary_low",
+        "薪资上限": "salary_high",
+        "学历要求": "education",
+        "工作年限": "experience",
+        "工作经验": "experience",
+    }
+    # 处理可能存在的重复列名（如两个"薪资范围"列）
+    salary_range_count = 0
+    for idx, h in enumerate(headers):
+        if h in KNOWN_HEADERS:
+            col_map[KNOWN_HEADERS[h]] = idx
+        elif h == "薪资范围":
+            salary_range_count += 1
+            if salary_range_count == 1:
+                col_map["salary_low"] = idx
+            elif salary_range_count == 2:
+                col_map["salary_high"] = idx
+
+    if "title" not in col_map:
+        wb.close()
+        return [], [f"未找到「岗位名称」列。当前表头：{headers}"]
+
+    # 逐行解析
+    for row_idx, row in enumerate(ws.iter_rows(min_row=2), start=2):
+        cells = [cell.value for cell in row]
+        title_val = cells[col_map["title"]] if col_map.get("title") is not None else None
+        if not title_val or not str(title_val).strip():
+            continue  # 跳过空行
+
+        jd_text = str(cells[col_map["jd"]]) if col_map.get("jd") is not None and cells[col_map["jd"]] else ""
+        resp, req = _parse_jd_sections(jd_text)
+
+        sal_low = cells[col_map["salary_low"]] if col_map.get("salary_low") is not None else None
+        sal_high = cells[col_map["salary_high"]] if col_map.get("salary_high") is not None else None
+
+        dept = str(cells[col_map["department"]]).strip() if col_map.get("department") is not None and cells[col_map["department"]] else ""
+        edu = str(cells[col_map["education"]]).strip() if col_map.get("education") is not None and cells[col_map["education"]] else None
+        exp_val = cells[col_map["experience"]] if col_map.get("experience") is not None else None
+
+        positions.append({
+            "title": str(title_val).strip(),
+            "department": dept,
+            "responsibilities": resp,
+            "job_requirements": req,
+            "salary_range": _format_salary_wan(sal_low, sal_high),
+            "min_education": edu,
+            "min_experience": _format_experience(exp_val),
+        })
+
+    wb.close()
+    return positions, errors
+
+
 def _render_position_form(prefill=None, key_suffix: str = "new"):
     """录入/编辑岗位表单。prefill 为 JobPosition 实例则做编辑预填，否则空表单。
     返回 (clicked, dict) — clicked=True 表示用户点了保存按钮。"""
@@ -1047,8 +1203,10 @@ def _render_position_form(prefill=None, key_suffix: str = "new"):
                           key=f"posf_title_{key_suffix}")
     dept = st.text_input("部门", value=getattr(prefill, "department", "") or "",
                          key=f"posf_dept_{key_suffix}")
-    req = st.text_area("岗位要求", value=getattr(prefill, "requirements", "") or "",
-                       height=300, key=f"posf_req_{key_suffix}")
+    responsibilities = st.text_area("岗位职责", value=getattr(prefill, "responsibilities", "") or "",
+                                    height=200, key=f"posf_resp_{key_suffix}")
+    job_req = st.text_area("任职要求", value=getattr(prefill, "job_requirements", "") or "",
+                           height=200, key=f"posf_jobreq_{key_suffix}")
 
     sal_cols = st.columns([1, 0.2, 1])
 
@@ -1092,7 +1250,8 @@ def _render_position_form(prefill=None, key_suffix: str = "new"):
         salary_range = f"{sal_low}-{sal_high}"
 
     return clicked, {
-        "title": title, "department": dept, "requirements": req,
+        "title": title, "department": dept,
+        "responsibilities": responsibilities, "job_requirements": job_req,
         "salary_range": salary_range,
         "min_education": None if edu == "不限" else edu,
         "min_experience": None if exp == "不限" else exp,
@@ -1105,11 +1264,11 @@ def _open_edit_position_dialog():
     if not pos_id:
         st.error("缺少岗位 ID")
         return
-    session = create_resume_session()
-    svc = ResumeArchiveService(session)
-    pos = session.get(JobPosition, pos_id)
+    pg_session = create_session()
+    job_svc = JobService(pg_session)
+    pos = job_svc.get_by_id(pos_id)
     if not pos:
-        session.close()
+        pg_session.close()
         st.error("岗位不存在")
         return
     clicked, data = _render_position_form(prefill=pos, key_suffix=f"edit_{pos_id}")
@@ -1117,17 +1276,72 @@ def _open_edit_position_dialog():
         if not data["title"]:
             st.warning("请填写岗位名称")
         else:
-            svc.update_position(pos_id, **data)
-            session.close()
+            job_svc.update_position(pos_id, **data)
+            pg_session.close()
             st.session_state.pop("edit_pos_id", None)
             st.success("修改已保存")
             st.rerun()
     else:
-        session.close()
+        pg_session.close()
 
 
 with tabs[2]:
     st.markdown("### 招聘岗位录入/匹配")
+
+    # ---- Excel 批量导入 ----
+    with st.expander("📥 从 Excel 批量导入岗位", expanded=False):
+        uploaded = st.file_uploader(
+            "上传 .xlsx 文件",
+            type=["xlsx"],
+            key="pos_excel_upload",
+            help="支持包含「岗位名称」列的 Excel 文件，可自动识别部门、JD、薪资、学历、工作年限等列",
+        )
+        if uploaded is not None:
+            file_bytes = uploaded.getvalue()
+            parsed_positions, parse_errors = _parse_excel_positions(file_bytes, uploaded.name)
+
+            if parse_errors:
+                for err in parse_errors:
+                    st.error(err)
+            elif not parsed_positions:
+                st.warning("未从文件中解析到有效岗位数据。")
+            else:
+                # 预览表格
+                preview_rows = []
+                for p in parsed_positions:
+                    resp_preview = (p["responsibilities"][:50] + "…") if len(p["responsibilities"]) > 50 else p["responsibilities"]
+                    req_preview = (p["job_requirements"][:50] + "…") if len(p["job_requirements"]) > 50 else p["job_requirements"]
+                    preview_rows.append({
+                        "岗位名称": p["title"],
+                        "部门": p["department"],
+                        "薪资": p["salary_range"],
+                        "学历": p["min_education"] or "",
+                        "经验": p["min_experience"] or "",
+                        "岗位职责": resp_preview,
+                        "任职要求": req_preview,
+                    })
+                st.dataframe(preview_rows, use_container_width=True, hide_index=True)
+                st.caption(f"共 {len(parsed_positions)} 条岗位，来源文件：{uploaded.name}")
+
+                if st.button("✅ 确认导入", type="primary", key="pos_excel_import_btn"):
+                    pg_sess_import = create_session()
+                    import_svc = JobService(pg_sess_import)
+                    success_count = 0
+                    error_count = 0
+                    for pos_data in parsed_positions:
+                        try:
+                            import_svc.create_position(
+                                source_file_name=uploaded.name,
+                                **pos_data,
+                            )
+                            success_count += 1
+                        except Exception as exc:
+                            error_count += 1
+                            st.warning(f"导入「{pos_data['title']}」失败：{exc}")
+                    pg_sess_import.close()
+                    if success_count:
+                        st.success(f"成功导入 {success_count} 条岗位！" + (f"（{error_count} 条失败）" if error_count else ""))
+                    st.rerun()
 
     with st.expander("➕ 录入新岗位", expanded=False):
         clicked, data = _render_position_form(prefill=None, key_suffix="new")
@@ -1135,21 +1349,21 @@ with tabs[2]:
             if not data["title"]:
                 st.warning("请填写岗位名称")
             else:
-                session = create_resume_session()
-                svc = ResumeArchiveService(session)
-                svc.create_position(**data)
-                session.close()
+                pg_session = create_session()
+                job_svc = JobService(pg_session)
+                job_svc.create_position(**data)
+                pg_session.close()
                 st.success(f"岗位「{data['title']}」已保存")
                 st.rerun()
 
     # ---- 两栏布局：左 1/3 岗位列表，右 2/3 匹配结果 ----
-    session = create_resume_session()
-    svc = ResumeArchiveService(session)
-    positions = svc.list_positions()
+    pg_session = create_session()
+    job_svc = JobService(pg_session)
+    positions = job_svc.list_positions()
 
     if not positions:
         st.info("暂无岗位。请先录入招聘岗位。")
-        session.close()
+        pg_session.close()
     else:
         if "match_selected_pos" not in st.session_state or \
            st.session_state.match_selected_pos not in {p.position_id for p in positions}:
@@ -1222,10 +1436,12 @@ with tabs[2]:
                         meta_bits.append(f"年限：{pos.min_experience}")
                     if meta_bits:
                         st.caption(" | ".join(meta_bits))
-                    if pos.requirements:
-                        st.markdown(pos.requirements)
-                    else:
-                        st.caption("（无岗位要求说明）")
+                    if pos.responsibilities:
+                        st.markdown(f"**岗位职责：**\n\n{pos.responsibilities}")
+                    if pos.job_requirements:
+                        st.markdown(f"**任职要求：**\n\n{pos.job_requirements}")
+                    if not pos.responsibilities and not pos.job_requirements:
+                        st.caption("（无岗位职责/任职要求说明）")
 
                     pos_btn_cols = st.columns(2)
                     if pos_btn_cols[0].button("🎯 智能匹配", key=f"pos_match_{pos.position_id}",
@@ -1248,9 +1464,9 @@ with tabs[2]:
                         _open_edit_position_dialog()
                     if pos_btn_cols2[1].button("🗑️ 删除", key=f"pos_del_{pos.position_id}",
                                                use_container_width=True):
-                        svc.delete_position(pos.position_id)
+                        job_svc.delete_position(pos.position_id)
                         st.session_state.pop("match_selected_pos", None)
-                        session.close()
+                        pg_session.close()
                         st.rerun()
 
         # ---- 右栏：只放匹配的候选人简历 ----
@@ -1263,18 +1479,54 @@ with tabs[2]:
         with match_col:
             sel_pos = next((p for p in positions if p.position_id == st.session_state.match_selected_pos), None)
             if not sel_pos:
-                session.close()
+                pg_session.close()
             else:
+                # SQLite session for candidate data and position matching
+                resume_session = create_resume_session()
+                svc = ResumeArchiveService(resume_session)
+
                 # 如果左栏触发了匹配，执行 AI 评估
                 if st.session_state.pop("trigger_match", None) == sel_pos.position_id:
                     all_candidates, _ = svc.list_candidates(page=1, page_size=10000)
                     candidate_dicts = []
                     for c in all_candidates:
+                        # 技能摘要
                         skills_str = "、".join(s.skill_name or "" for s in c.skills if s.skill_name)[:100]
+
+                        # ✨ 核心技能（is_core=1）
+                        core_skills = [s.skill_name for s in c.skills if s.is_core and s.skill_name][:8]
+                        core_skills_str = "、".join(core_skills) if core_skills else "-"
+
+                        # 工作经历摘要
                         work_str = "; ".join(
                             f"{w.company_name}({w.position or '-'})"
                             for w in (c.work_experiences or [])[:3]
                         )
+
+                        # ✨ 核心项目经验（最近2个）
+                        projects = c.project_experiences[:2] if c.project_experiences else []
+                        projects_str = "; ".join(
+                            f"{p.project_name}（{p.role or '参与'}）"
+                            for p in projects if p.project_name
+                        ) or "-"
+
+                        # ✨ 荣誉证书（前3条）
+                        honors = [h.honor_name for h in (c.honors or []) if h.honor_name][:3]
+                        honors_str = "、".join(honors) if honors else "-"
+
+                        # ✨ 工作年限估算
+                        years_exp = "-"
+                        if c.work_experiences:
+                            from datetime import date
+                            total_months = 0
+                            for w in c.work_experiences:
+                                if w.start_date:
+                                    end = w.end_date or date.today()
+                                    months = (end.year - w.start_date.year) * 12 + (end.month - w.start_date.month)
+                                    total_months += max(0, months)
+                            if total_months > 0:
+                                years_exp = f"{round(total_months / 12, 1)}年"
+
                         candidate_dicts.append({
                             "candidate_id": c.candidate_id,
                             "name": c.name,
@@ -1282,33 +1534,71 @@ with tabs[2]:
                             "current_city": c.current_city or "-",
                             "position": c.work_experiences[0].position if c.work_experiences else "-",
                             "skills": skills_str or "-",
+                            "core_skills": core_skills_str,
                             "work_summary": work_str or "-",
+                            "years_of_experience": years_exp,
+                            "projects": projects_str,
+                            "honors": honors_str,
                         })
                     svc.clear_position_matches(sel_pos.position_id)
                     total = len(candidate_dicts)
                     chunk_size = max(3, min(20, total // 5))
                     progress_bar = st.progress(0)
                     status_text = st.empty()
+
+                    # ✨ 并行批次匹配优化
+                    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+                    chunks = [candidate_dicts[i:i + chunk_size] for i in range(0, total, chunk_size)]
                     all_results = []
-                    for i in range(0, total, chunk_size):
-                        chunk = candidate_dicts[i:i + chunk_size]
-                        done = min(i + chunk_size, total)
-                        status_text.markdown(f"AI 正在评估候选人匹配度… **{i}/{total}**")
-                        progress_bar.progress(i / total if total > 0 else 0)
-                        results = ai_service.match_candidates(
-                            sel_pos.requirements or sel_pos.title, chunk
-                        )
-                        all_results.extend(results)
+                    completed = 0
+
+                    with ThreadPoolExecutor(max_workers=3) as executor:
+                        # 提交所有批次任务
+                        future_to_chunk = {
+                            executor.submit(
+                                ai_service.match_candidates,
+                                sel_pos.job_requirements or sel_pos.title,
+                                chunk
+                            ): idx for idx, chunk in enumerate(chunks)
+                        }
+
+                        # 收集结果（按完成顺序）
+                        for future in as_completed(future_to_chunk):
+                            try:
+                                results = future.result()
+                                all_results.extend(results)
+                                completed += len(future_to_chunk[future])
+                                processed = min(completed * chunk_size, total)
+                                status_text.markdown(f"AI 正在评估候选人匹配度… **{processed}/{total}**")
+                                progress_bar.progress(processed / total if total > 0 else 0)
+                            except Exception as exc:
+                                st.error(f"批次匹配失败: {exc}")
+
                     progress_bar.progress(1.0)
                     status_text.markdown(f"AI 评估完成 **{total}/{total}**，正在保存…")
+                    save_ok, save_fail = 0, 0
                     for r in all_results:
                         cid = r.get("candidate_id")
                         score = r.get("match_score", 0)
                         reason = r.get("reason", "")
+                        dimensions = r.get("dimensions")  # ✨ 获取多维度评分
                         if cid and isinstance(score, (int, float)):
-                            svc.save_position_match(sel_pos.position_id, int(cid), int(score), reason)
+                            try:
+                                svc.save_position_match(
+                                    sel_pos.position_id,
+                                    int(cid),
+                                    int(score),
+                                    reason,
+                                    dimensions=dimensions,  # ✨ 传递维度数据
+                                )
+                                save_ok += 1
+                            except Exception:
+                                save_fail += 1
                     progress_bar.empty()
                     status_text.empty()
+                    if save_fail:
+                        st.warning(f"匹配结果保存完成：成功 {save_ok} 条，失败 {save_fail} 条")
                     st.rerun()
 
                 # 展示匹配结果 Banner
@@ -1342,6 +1632,23 @@ with tabs[2]:
                             color = _score_color(score)
                             h_cols[1].markdown(
                                 f"<div style='text-align:right;'>"
+                                f"<span style='font-size:13px; color:{color}; font-weight:600;'>匹配度 {score}%</span>"
+                                f"</div>",
+                                unsafe_allow_html=True,
+                            )
+
+                            # ✨ 多维度评分展示
+                            if hasattr(match_row, 'skill_match') and match_row.skill_match is not None:
+                                dim_cols = st.columns(4)
+                                dimensions = [
+                                    ("技能", match_row.skill_match),
+                                    ("经验", match_row.experience_match),
+                                    ("学历", match_row.education_match),
+                                    ("地域", match_row.location_match),
+                                ]
+                                for idx, (label, score_val) in enumerate(dimensions):
+                                    if score_val is not None:
+                                        dim_cols[idx].metric(label, f"{score_val}%", delta=None)
                                 f"<span style='font-size:12px; color:var(--color-text-muted);'>匹配度 </span>"
                                 f"<span style='font-size:32px; font-weight:700; color:{color};'>{score}%</span>"
                                 f"</div>",
@@ -1453,4 +1760,5 @@ with tabs[2]:
                 else:
                     st.info("暂无匹配结果。在左侧岗位中点击「🎯 智能匹配」开始 AI 评估。")
 
-                session.close()
+                resume_session.close()
+                pg_session.close()

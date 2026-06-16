@@ -2,6 +2,9 @@
 
 9 张表：candidates / education / work_experience / project_experience /
 skills_certificates / job_intention / honors / resume_source / system_evaluation
+
+岗位(JobPosition)已迁移至 PostgreSQL (storage.models.JobPosition)，此处仅保留
+面试/匹配等表的 position_id 列（存储 PG 的 job_position.id，无 FK 约束）。
 """
 
 from datetime import date, datetime
@@ -171,27 +174,12 @@ class SystemEvaluation(ResumeBase):
     candidate: Mapped["Candidate"] = relationship(back_populates="system_evaluation")
 
 
-class JobPosition(ResumeBase):
-    __tablename__ = "job_positions"
-
-    position_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    title: Mapped[str] = mapped_column(String(100), nullable=False)
-    department: Mapped[str | None] = mapped_column(String(100))
-    requirements: Mapped[str | None] = mapped_column(Text)
-    salary_range: Mapped[str | None] = mapped_column(String(50))
-    work_city: Mapped[str | None] = mapped_column(String(50))
-    min_education: Mapped[str | None] = mapped_column(String(20))
-    min_experience: Mapped[str | None] = mapped_column(String(20))
-    status: Mapped[str] = mapped_column(String(20), default="open")
-    create_time: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
-
-
 class InterviewEvaluation(ResumeBase):
     __tablename__ = "interview_evaluations"
 
     eval_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     candidate_id: Mapped[int] = mapped_column(ForeignKey("candidates.candidate_id"), nullable=False, index=True)
-    position_id: Mapped[int | None] = mapped_column(ForeignKey("job_positions.position_id"))
+    position_id: Mapped[int | None] = mapped_column(Integer)  # references PG job_position.id (cross-DB)
     interviewer: Mapped[str | None] = mapped_column(String(50))
     interview_round: Mapped[str | None] = mapped_column(String(20))
     score: Mapped[int | None] = mapped_column(Integer)
@@ -219,9 +207,7 @@ class InterviewInvitation(ResumeBase):
         nullable=False,
         index=True,
     )
-    position_id: Mapped[int | None] = mapped_column(
-        ForeignKey("job_positions.position_id", ondelete="SET NULL")
-    )
+    position_id: Mapped[int | None] = mapped_column(Integer)  # references PG job_position.id (cross-DB)
     status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
     notes: Mapped[str | None] = mapped_column(Text)
     create_time: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
@@ -238,15 +224,22 @@ class PositionMatch(ResumeBase):
 
     match_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     position_id: Mapped[int] = mapped_column(
-        ForeignKey("job_positions.position_id", ondelete="CASCADE"),
+        Integer,
         nullable=False, index=True,
-    )
+    )  # references PG job_position.id (cross-DB)
     candidate_id: Mapped[int] = mapped_column(
         ForeignKey("candidates.candidate_id", ondelete="CASCADE"),
         nullable=False, index=True,
     )
     score: Mapped[int] = mapped_column(Integer, index=True)
     reason: Mapped[str | None] = mapped_column(Text)
+
+    # ✨ 多维度评分字段
+    skill_match: Mapped[int | None] = mapped_column(Integer)
+    experience_match: Mapped[int | None] = mapped_column(Integer)
+    education_match: Mapped[int | None] = mapped_column(Integer)
+    location_match: Mapped[int | None] = mapped_column(Integer)
+
     create_time: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
@@ -262,9 +255,7 @@ class InterviewOutline(ResumeBase):
         ForeignKey("candidates.candidate_id", ondelete="CASCADE"),
         nullable=False, index=True,
     )
-    position_id: Mapped[int | None] = mapped_column(
-        ForeignKey("job_positions.position_id", ondelete="SET NULL"),
-    )
+    position_id: Mapped[int | None] = mapped_column(Integer)  # references PG job_position.id (cross-DB)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     create_time: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     update_time: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())

@@ -38,7 +38,18 @@ JOB_HINTS = [
     "编辑", "编剧", "剪辑", "摄像", "摄影", "原画", "动画", "插画", "美术", "策划", "编导", "导演", "视频",
     "招聘", "采购", "市场", "营销", "品牌", "公关", "翻译", "校对", "记者", "主播", "客户经理", "项目经理", "项目管理",
 ]
-KNOWN_CITIES = {"广州", "深圳", "上海", "北京", "杭州", "南京", "苏州", "成都", "重庆", "武汉", "长沙", "西安", "盐城"}
+KNOWN_CITIES = {
+    # 一线城市
+    "北京", "上海", "广州", "深圳",
+    # 新一线城市
+    "成都", "杭州", "重庆", "西安", "苏州", "武汉", "南京", "天津", "郑州", "长沙", "东莞", "沈阳", "青岛", "合肥", "佛山",
+    # 二线城市（常见）
+    "昆明", "福州", "无锡", "厦门", "哈尔滨", "长春", "南昌", "济南", "宁波", "大连", "贵阳", "温州", "石家庄", "泉州", "南宁",
+    "金华", "常州", "珠海", "惠州", "嘉兴", "南通", "中山", "保定", "兰州", "台州", "徐州", "太原", "绍兴", "烟台", "廊坊",
+    # 支持"市"后缀
+    "北京市", "上海市", "广州市", "深圳市", "成都市", "杭州市", "重庆市", "西安市", "苏州市", "武汉市", "南京市",
+    "天津市", "郑州市", "长沙市", "东莞市", "青岛市", "厦门市", "宁波市", "福州市", "济南市", "昆明市",
+}
 STATUS_WORDS = ["离职", "在职", "全职", "兼职", "正在找工作", "求职状态", "目前状态", "随时到岗"]
 CITY_SUFFIX_RE = re.compile(r"([\u4e00-\u9fa5]{2,12}(?:省|市|区|县))")
 DATE_LINE_RE = re.compile(r"(?:19|20)\d{2}[./年/-]\s*\d{1,2}|至今")
@@ -470,8 +481,26 @@ def is_company_name(value: str | None) -> bool:
 
 
 def find_phone(text: str) -> str | None:
+    """增强型手机号识别，支持空格/短横线分隔"""
+    # 优先使用原有正则
     match = PHONE_RE.search(text)
-    return match.group(0) if match else None
+    if match:
+        return match.group(0)
+
+    # ✨ 补充规则：空格/短横线分隔的手机号
+    patterns = [
+        r'1[3-9]\d[\s\-]?\d{4}[\s\-]?\d{4}',  # 138 1234 5678 或 138-1234-5678
+        r'(?:手机|电话|联系方式)[：:]\s*(\d{11})',
+        r'(?:Tel|Mobile|Phone)[：:]\s*(\d{11})',
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, re.I)
+        if m:
+            # 提取纯数字
+            phone = re.sub(r'\D', '', m.group(1) if m.lastindex else m.group(0))
+            if len(phone) == 11 and phone[0] == '1':
+                return phone
+    return None
 
 
 
@@ -481,8 +510,20 @@ def find_phone(text: str) -> str | None:
 
 
 def find_email(text: str) -> str | None:
+    """增强型邮箱识别"""
     match = EMAIL_RE.search(text)
-    return match.group(0) if match else None
+    if match:
+        return match.group(0)
+
+    # ✨ 补充规则：标签化邮箱
+    patterns = [
+        r'(?:邮箱|Email|E-mail)[：:]\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})',
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, re.I)
+        if m:
+            return m.group(1)
+    return None
 
 
 def find_name(lines: list[str], phone: str | None, email: str | None) -> str | None:

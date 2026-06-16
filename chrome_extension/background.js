@@ -626,6 +626,42 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       sendResponse({ ok: false, error: String(err) });
     });
     return true;
+  } else if (msg.type === "click_consent_via_vue") {
+    const tabId = sender?.tab?.id;
+    if (!tabId) { sendResponse({ ok: false, error: "no_tab" }); return true; }
+    // 使用 CDP Input.dispatchMouseEvent 生成 isTrusted:true 的点击
+    const x = msg.x;
+    const y = msg.y;
+    if (!x || !y) { sendResponse({ ok: false, error: "no_coordinates" }); return true; }
+
+    const debugTarget = { tabId };
+    chrome.debugger.attach(debugTarget, "1.3", () => {
+      if (chrome.runtime.lastError) {
+        sendResponse({ ok: false, error: "debugger_attach_failed: " + chrome.runtime.lastError.message });
+        return;
+      }
+      const dispatchMouse = (type, opts) => new Promise((resolve) => {
+        chrome.debugger.sendCommand(debugTarget, "Input.dispatchMouseEvent", {
+          type, x, y, button: "left", clickCount: 1, ...opts,
+        }, () => resolve());
+      });
+
+      (async () => {
+        try {
+          await dispatchMouse("mousePressed");
+          await dispatchMouse("mouseReleased");
+          // 短暂延迟后断开 debugger
+          setTimeout(() => {
+            try { chrome.debugger.detach(debugTarget); } catch (e) {}
+          }, 200);
+          sendResponse({ ok: true, method: "cdp_input", x, y });
+        } catch (err) {
+          try { chrome.debugger.detach(debugTarget); } catch (e) {}
+          sendResponse({ ok: false, error: String(err) });
+        }
+      })();
+    });
+    return true;
   }
   return true;
 });

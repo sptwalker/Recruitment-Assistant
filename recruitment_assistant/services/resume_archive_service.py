@@ -12,7 +12,6 @@ from recruitment_assistant.storage.resume_models import (
     InterviewInvitation,
     InterviewOutline,
     JobIntention,
-    JobPosition,
     PositionMatch,
     ProjectExperience,
     ResumeSource,
@@ -170,42 +169,9 @@ class ResumeArchiveService:
         self.session.commit()
         return result.rowcount > 0
 
-    # --- 岗位 CRUD ---
-
-    def create_position(self, title: str, department: str = "", requirements: str = "",
-                        salary_range: str = "", work_city: str = "",
-                        min_education: str | None = None,
-                        min_experience: str | None = None) -> JobPosition:
-        pos = JobPosition(
-            title=title, department=department, requirements=requirements,
-            salary_range=salary_range, work_city=work_city,
-            min_education=min_education, min_experience=min_experience,
-        )
-        self.session.add(pos)
-        self.session.commit()
-        self.session.refresh(pos)
-        return pos
-
-    def update_position(self, position_id: int, **fields) -> bool:
-        stmt = update(JobPosition).where(JobPosition.position_id == position_id).values(**fields)
-        result = self.session.execute(stmt)
-        self.session.commit()
-        return result.rowcount > 0
-
-    def list_positions(self, status: str | None = None) -> list[JobPosition]:
-        stmt = select(JobPosition)
-        if status:
-            stmt = stmt.where(JobPosition.status == status)
-        stmt = stmt.order_by(JobPosition.position_id.desc())
-        return list(self.session.scalars(stmt).all())
-
-    def delete_position(self, position_id: int) -> bool:
-        pos = self.session.get(JobPosition, position_id)
-        if not pos:
-            return False
-        self.session.delete(pos)
-        self.session.commit()
-        return True
+    # --- 岗位 CRUD 已迁移到 JobService (PostgreSQL) ---
+    # create_position / update_position / list_positions / delete_position
+    # 请使用 recruitment_assistant.services.job_service.JobService
 
     # --- 面试评价 CRUD ---
 
@@ -313,12 +279,34 @@ class ResumeArchiveService:
         self.session.commit()
         return result.rowcount
 
-    def save_position_match(self, position_id: int, candidate_id: int, score: int, reason: str) -> None:
-        self.session.merge(PositionMatch(
-            position_id=position_id, candidate_id=candidate_id,
-            score=score, reason=reason,
-        ))
-        self.session.commit()
+    def save_position_match(
+        self,
+        position_id: int,
+        candidate_id: int,
+        score: int,
+        reason: str,
+        dimensions: dict | None = None,
+    ) -> None:
+        """保存岗位匹配结果，支持多维度评分"""
+        try:
+            match_data = {
+                "position_id": position_id,
+                "candidate_id": candidate_id,
+                "score": score,
+                "reason": reason,
+            }
+            # ✨ 添加多维度评分
+            if dimensions:
+                match_data["skill_match"] = dimensions.get("skill_match")
+                match_data["experience_match"] = dimensions.get("experience_match")
+                match_data["education_match"] = dimensions.get("education_match")
+                match_data["location_match"] = dimensions.get("location_match")
+
+            self.session.merge(PositionMatch(**match_data))
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
 
     def list_position_matches(self, position_id: int, min_score: int = 50) -> list[tuple]:
         stmt = (

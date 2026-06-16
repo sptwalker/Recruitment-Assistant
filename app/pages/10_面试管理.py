@@ -14,7 +14,9 @@ from recruitment_assistant.config.settings import get_settings
 from recruitment_assistant.services.resume_ai_service import ResumeAIService
 from recruitment_assistant.services.resume_archive_service import ResumeArchiveService
 from recruitment_assistant.storage.resume_db import create_resume_session, init_resume_database
-from recruitment_assistant.storage.resume_models import Candidate, InterviewEvaluation, InterviewOutline, JobPosition
+from recruitment_assistant.storage.resume_models import Candidate, InterviewEvaluation, InterviewOutline
+from recruitment_assistant.storage.models import JobPosition
+from recruitment_assistant.storage.db import create_session as create_pg_session
 
 
 @st.cache_resource
@@ -207,6 +209,7 @@ def _open_outline_dialog():
         return
     session = create_resume_session()
     svc = ResumeArchiveService(session)
+    pg_session = create_pg_session()
     try:
         inv = svc.get_invitation(inv_id)
         if not inv:
@@ -216,7 +219,7 @@ def _open_outline_dialog():
         if not cand:
             st.error("候选人不存在")
             return
-        pos = session.get(JobPosition, inv.position_id) if inv.position_id else None
+        pos = pg_session.get(JobPosition, inv.position_id) if inv.position_id else None
         evals = svc.list_interview_evals(cand.candidate_id)
 
         regenerate_key = f"outline_regen_{inv_id}"
@@ -226,7 +229,7 @@ def _open_outline_dialog():
         if need_generate or not outline_row:
             with st.spinner("正在生成面试大纲…"):
                 position_name = pos.title if pos else "未指定岗位"
-                requirements = pos.requirements or "" if pos else ""
+                requirements = pos.job_requirements or "" if pos else ""
                 eval_text = _format_evaluations(evals)
                 content = ai_service.generate_interview_outline(
                     _candidate_summary(cand, pos),
@@ -280,6 +283,7 @@ def _open_outline_dialog():
             )
     finally:
         session.close()
+        pg_session.close()
 
 
 @st.dialog("记录面试评价", width="large")
@@ -290,6 +294,7 @@ def _open_eval_dialog():
         return
     session = create_resume_session()
     svc = ResumeArchiveService(session)
+    pg_session_eval = create_pg_session()
     try:
         inv = svc.get_invitation(inv_id)
         if not inv:
@@ -299,7 +304,7 @@ def _open_eval_dialog():
         if not cand:
             st.error("候选人不存在")
             return
-        pos = session.get(JobPosition, inv.position_id) if inv.position_id else None
+        pos = pg_session_eval.get(JobPosition, inv.position_id) if inv.position_id else None
         evals = svc.list_interview_evals(cand.candidate_id)
         eval_count = len(evals)
         default_round = _progress_label(eval_count)
@@ -401,6 +406,7 @@ def _open_eval_dialog():
                 )
     finally:
         session.close()
+        pg_session_eval.close()
 
 
 @st.dialog("查看面试评价", width="large")
@@ -486,9 +492,15 @@ st.markdown(
 
 session = create_resume_session()
 svc = ResumeArchiveService(session)
+pg_session_main = create_pg_session()
 try:
     all_invitations = svc.list_invitations(status=None)
-    positions_map = {p.position_id: p for p in session.scalars(select(JobPosition)).all()}
+    positions_map = {
+        p.id: p
+        for p in pg_session_main.scalars(
+            select(JobPosition).where(JobPosition.deleted_at.is_(None))
+        ).all()
+    }
     candidate_ids = sorted({inv.candidate_id for inv in all_invitations if inv.candidate_id})
     candidates_map = {}
     evals_map = {}
@@ -666,3 +678,4 @@ try:
 
 finally:
     session.close()
+    pg_session_main.close()

@@ -48,6 +48,7 @@ class BossWSBridge:
         self._watchdog: WatchdogState = WatchdogState()
         self._watchdog_task: "Future[None] | None" = None  # concurrent.futures.Future from run_coroutine_threadsafe
         self._watchdog_poll_interval: float = 5.0
+        self._target_candidate_names: set[str] = set()
 
         self.runtime_state: dict[str, Any] = {
             "running": False,
@@ -156,6 +157,25 @@ class BossWSBridge:
 
     def discard_dedup_keys(self, keys: set[str]) -> None:
         self._seen_candidate_records -= keys
+
+    def set_target_candidates(self, names: set[str]) -> None:
+        self._target_candidate_names = set(names)
+        if names:
+            self._log("info", f"已设置目标候选人白名单（{len(names)}人）：{'、'.join(sorted(names))}；非目标候选人将被跳过")
+
+    def clear_target_candidates(self) -> None:
+        self._target_candidate_names.clear()
+
+    def _is_candidate_in_target(self, candidate_sig: str, candidate_info: dict) -> bool:
+        if not self._target_candidate_names:
+            return True
+        name = (candidate_info.get("name") or "").strip()
+        if name and any(t in name or name in t for t in self._target_candidate_names):
+            return True
+        sig_name = (candidate_sig or "").split("/")[0].strip()
+        if sig_name and any(t in sig_name or sig_name in t for t in self._target_candidate_names):
+            return True
+        return False
 
     def _create_crawl_task(self, config: dict) -> None:
         planned_count = int(config.get("max_resumes") or 0) or None
@@ -461,6 +481,8 @@ class BossWSBridge:
         config["boss_candidate_keys"] = sorted(self._seen_candidate_records)
         config["boss_candidate_signatures"] = sorted(boss_candidate_signatures)
         config["boss_pre_dedup_ready"] = True
+        if self._target_candidate_names:
+            config["target_candidate_names"] = sorted(self._target_candidate_names)
         self._create_crawl_task(config)
         self._log_task_initialization(config, collect_mode, collect_minutes)
         command = {"type": "start_collect", "config": config, "run_id": self.runtime_state.get("run_id", "")}
@@ -617,6 +639,8 @@ class BossWSBridge:
             "boss_svg_download_icon_not_found",
             "download_button_candidates_detailed",
             "boss_diag",
+            "boss_cooldown_start",
+            "boss_cooldown_end",
             "stale_pdf_preview_frame_removed",
             "pdf_iframe_resource_id_claimed",
             "persist_completion_credited",
@@ -718,11 +742,20 @@ class BossWSBridge:
             case "boss_talking_position_skip":
                 sig = data.get("candidate_signature", "?")
                 reason = data.get("reason", "?")
+                self._log("warning", f"沟通职位未提取到: {sig}；reason={reason}")
                 logger.debug("沟通职位未找到: sig={} reason={}", sig, reason)
             case "resume_downloaded":
                 self._save_resume(data)
             case "candidate_skipped":
                 self._record_skip(data)
+            case "candidate_processing_timeout":
+                sig = data.get("candidate_signature", "未知")
+                timeout_ms = data.get("timeout_ms", 60000)
+                self._log("error", f"候选人处理超时（{timeout_ms/1000:.0f}s），已强制跳过: {sig}")
+            case "candidate_processing_error":
+                sig = data.get("candidate_signature", "未知")
+                msg = data.get("message", "未知错误")
+                self._log("error", f"候选人处理异常，已跳过: {sig}；错误={msg[:200]}")
             case "candidate_list_scanned":
                 pass
             case "resume_button_found":
@@ -789,6 +822,26 @@ class BossWSBridge:
                 sig = data.get("candidate_signature", "未知")
                 reason = data.get("reason", "")
                 self._log("warning", f"作品集跳过: {sig}；原因={reason}")
+            case "boss_multi_attachment_scan":
+                sig = data.get("candidate_signature", "未知")
+                extracted = data.get("extracted", [])
+                labels = [f"{e.get('filename', '?')}({'作品' if e.get('isWorks') else '简历' if e.get('isResume') else '附件'})" for e in extracted]
+                self._log("highlight", f"多附件扫描: {sig}；发现 {len(extracted)} 个附件：{'、'.join(labels)}")
+            case "boss_multi_attachment_downloading":
+                sig = data.get("candidate_signature", "未知")
+                fn = data.get("filename", "")
+                label = data.get("typeLabel", "")
+                self._log("info", f"多附件下载中: {sig}；{label}；文件名={fn}")
+            case "boss_multi_attachment_downloaded":
+                sig = data.get("candidate_signature", "未知")
+                fn = data.get("filename", "")
+                label = data.get("typeLabel", "")
+                self._log("success", f"多附件下载成功: {sig}；{label}；文件名={fn}")
+            case "boss_multi_attachment_failed":
+                sig = data.get("candidate_signature", "未知")
+                fn = data.get("filename", "")
+                reason = data.get("reason", "")
+                self._log("warning", f"多附件下载失败: {sig}；文件名={fn}；原因={reason}")
             case "download_intent_registered":
                 pass
             case "direct_download_request_received":
@@ -804,6 +857,51 @@ class BossWSBridge:
             case "resume_request_confirm_clicked":
                 sig = data.get("candidate_signature", "未知")
                 self._log("info", f"已点击索要简历确认: {sig}")
+            case "resume_consent_found":
+                sig = data.get("candidate_signature", "未知")
+                consent_tag = data.get("consent_tag", "?")
+                consent_cls = data.get("consent_class", "")
+                consent_rect = data.get("consent_rect", {})
+                consent_visible = data.get("consent_visible")
+                consent_disabled = data.get("consent_disabled")
+                click_method = data.get("click_method", "?")
+                resume_before = data.get("resume_btn_before", {})
+                self._log("highlight", f"检测到「同意」按钮: {sig}；tag={consent_tag}；class={consent_cls[:80]}；rect={consent_rect}；visible={consent_visible}；disabled={consent_disabled}；click={click_method}")
+                self._log("info", f"同意前简历按钮状态: state={resume_before.get('state')}；text={resume_before.get('text')}；opacity_chain={resume_before.get('opacity_chain')}；descriptor={resume_before.get('descriptor', '')[:100]}")
+            case "resume_consent_clicked":
+                sig = data.get("candidate_signature", "未知")
+                self._log("info", f"已点击「同意」按钮: {sig}，开始轮询等待简历按钮变亮...")
+            case "resume_consent_vue_click_result":
+                sig = data.get("candidate_signature", "未知")
+                bg = data.get("bg_result", {})
+                cx = data.get("click_x", "?")
+                cy = data.get("click_y", "?")
+                self._log("highlight", f"CDP真实点击结果: {sig}；ok={bg.get('ok')}；method={bg.get('method', '')}；error={bg.get('error', '')}；坐标=({cx},{cy})")
+            case "resume_consent_cdp_fallback":
+                sig = data.get("candidate_signature", "未知")
+                bg = data.get("bg_result", {})
+                cx = data.get("click_x", "?")
+                cy = data.get("click_y", "?")
+                self._log("highlight", f"同意按钮CDP兜底点击: {sig}；ok={bg.get('ok')}；error={bg.get('error', '')}；坐标=({cx},{cy})")
+            case "resume_consent_force_click_done":
+                sig = data.get("candidate_signature", "未知")
+                cls_after = data.get("class_after_remove", "")
+                still_in_dom = data.get("consent_still_in_dom")
+                self._log("highlight", f"强制点击完成: {sig}；移除disabled后class={cls_after[:60]}；按钮仍在DOM={still_in_dom}")
+            case "resume_consent_poll":
+                sig = data.get("candidate_signature", "未知")
+                idx = data.get("poll_index", "?")
+                btn_found = data.get("resume_btn_found")
+                btn_state = data.get("resume_btn_state")
+                btn_text = data.get("resume_btn_text")
+                opacity = data.get("resume_btn_opacity_chain", [])
+                btn_disabled = data.get("resume_btn_disabled")
+                btn_cls = data.get("resume_btn_class", "")
+                consent_still = data.get("consent_btn_still_present")
+                self._log("info", f"同意后轮询 #{idx}: btn_found={btn_found}；state={btn_state}；text={btn_text}；opacity={opacity}；disabled={btn_disabled}；class={btn_cls[:60]}；同意按钮仍在={consent_still}")
+            case "resume_consent_accepted":
+                sig = data.get("candidate_signature", "未知")
+                self._log("success", f"「同意」按钮生效，简历按钮已激活: {sig}")
             case "resume_attachment_clicked":
                 pass
             case "unknown_resume_preview_probe_started":
@@ -1111,6 +1209,17 @@ class BossWSBridge:
                     logger.debug("诊断: 沟通中标签点击结果={} URL={}", data.get("result"), data.get("url", ""))
                 elif step == "retry_scan":
                     logger.debug("诊断: 重试扫描 #{} 找到候选人={}", data.get("retry"), data.get("found", 0))
+                elif step == "dom_snapshot_on_fail":
+                    snapshot = data.get("snapshot", {})
+                    self._save_dom_snapshot(snapshot)
+                    sel_counts = snapshot.get("selector_counts", {})
+                    self._log("warning", f"DOM诊断快照已保存: 选择器命中={sel_counts}")
+                elif step == "talking_position_fallback_hits":
+                    hits = data.get("hits", [])
+                    texts = [h.get("text", "")[:40] for h in hits[:3]]
+                    self._log("warning", f"沟通职位关键词在扩大范围找到但未通过正则: {texts}")
+                elif step == "talking_position_no_keyword":
+                    self._log("warning", f"沟通职位关键词未在右侧面板找到; rightLeft={data.get('rightLeft')}")
                 else:
                     logger.debug("诊断: {}", data)
             case "resume_persist_confirmed":
@@ -1119,6 +1228,15 @@ class BossWSBridge:
                 file_name = data.get("file") or ""
                 # 链路确认；"文件下载成功并保存归档"已在 success 级输出，UI 不再重复
                 logger.debug("持久化确认: sig={} 策略={} 文件={}", sig, strategy, file_name)
+            case "boss_cooldown_start":
+                completed = data.get("completed", 0)
+                wait_sec = data.get("wait_sec", "?")
+                rng = data.get("range", "?")
+                rd = data.get("round", 0)
+                self._log("info", f"安全缓冲: 已下载 {completed} 份，第 {rd} 轮等待 {wait_sec}s（区间 {rng}）")
+            case "boss_cooldown_end":
+                completed = data.get("completed", 0)
+                self._log("info", f"安全缓冲结束，继续采集（已完成 {completed} 份）")
             case "resume_persist_rejected":
                 sig = data.get("candidate_signature", "未知")
                 status = data.get("status") or "?"
@@ -1259,9 +1377,17 @@ class BossWSBridge:
             )
 
     def _save_resume(self, data: dict) -> None:
-        if data.get("variant") == "attachment_works":
+        variant = data.get("variant") or ""
+        if variant == "attachment_works":
             self._save_attachment_works(data)
             return
+        skip_dedup = False
+        if variant == "attachment_resume_extra":
+            self._log("info", f"多附件补充下载（简历）: {data.get('candidate_signature', '未知')}")
+            skip_dedup = True
+        if variant == "attachment_extra":
+            self._log("info", f"多附件补充下载（附件）: {data.get('candidate_signature', '未知')}")
+            skip_dedup = True
 
         candidate_sig = data.get("candidate_signature", "未知")
         candidate_info = data.get("candidate_info", {})
@@ -1271,7 +1397,20 @@ class BossWSBridge:
         candidate_key = self._build_boss_candidate_key(candidate_sig, candidate_info)
         download_request_id = str(data.get("download_request_id", "") or "")
 
-        if candidate_key and candidate_key in self._seen_candidate_records:
+        if not self._is_candidate_in_target(candidate_sig, candidate_info):
+            self._log("info", f"非目标候选人，跳过: {candidate_sig}")
+            if download_path:
+                try:
+                    Path(download_path).unlink(missing_ok=True)
+                except OSError:
+                    pass
+            self._send_persist_ack(candidate_sig, candidate_info, "target_filter_skipped", download_request_id, "不在目标白名单中")
+            self.runtime_state["skipped_count"] = int(self.runtime_state.get("skipped_count") or 0) + 1
+            counts = self.runtime_state.setdefault("skip_reason_counts", {})
+            counts["target_filter"] = int(counts.get("target_filter") or 0) + 1
+            return
+
+        if candidate_key and candidate_key in self._seen_candidate_records and not skip_dedup:
             self._log("info", f"BOSS 去重命中，已存在记录: {candidate_sig}")
             self._write_event_log("resume_saved_duplicate_skipped", {
                 "signature": candidate_sig,
@@ -1381,6 +1520,21 @@ class BossWSBridge:
                 logger.debug("简历已保存: {}", final_filename)
                 self.runtime_state["downloaded_count"] = seq
                 self._log("success", f"文件下载成功并保存归档: {final_filename}")
+
+                file_size_bytes = len(content)
+                file_size_mb = file_size_bytes / (1024 * 1024)
+                size_warning = file_size_mb > 10
+                works_keywords = ("作品集", "作品", "portfolio", "works")
+                combined_names = f"{source_filename} {download_path}".lower()
+                filename_warning = any(kw in combined_names for kw in works_keywords)
+                if filename_warning:
+                    self._log("warning", f"疑似作品集被当作简历下载: {candidate_sig}；原始文件名含作品集关键词；file={source_filename}")
+                elif size_warning:
+                    self._log("warning", f"下载文件偏大（{file_size_mb:.1f} MB），可能是作品集而非简历: {candidate_sig}")
+                if (size_warning or filename_warning) and candidate_key:
+                    works_dedup_key = f"{candidate_key}::works"
+                    self._seen_candidate_records.add(works_dedup_key)
+
                 record = {
                     "signature": candidate_sig,
                     "info": candidate_info,
@@ -1390,6 +1544,9 @@ class BossWSBridge:
                     "status": "downloaded",
                     "candidate_key": candidate_key,
                     "at": now.isoformat(),
+                    "file_size_bytes": file_size_bytes,
+                    "size_warning": size_warning,
+                    "filename_warning": filename_warning,
                 }
                 self.runtime_state["candidates"].append(record)
                 self._write_event_log("resume_saved", record)
@@ -1420,6 +1577,17 @@ class BossWSBridge:
         source_filename = data.get("filename", "")
         download_path = data.get("download_path", "")
         download_request_id = str(data.get("download_request_id", "") or "")
+
+        if not self._is_candidate_in_target(candidate_sig, candidate_info):
+            self._log("info", f"非目标候选人作品，跳过: {candidate_sig}")
+            if download_path:
+                try:
+                    Path(download_path).unlink(missing_ok=True)
+                except OSError:
+                    pass
+            self._send_persist_ack(candidate_sig, candidate_info, "target_filter_skipped", download_request_id, "不在目标白名单中")
+            return
+
         candidate_key = self._build_boss_candidate_key(candidate_sig, candidate_info)
         works_dedup_key = f"{candidate_key}::works" if candidate_key else ""
 
@@ -1593,6 +1761,19 @@ class BossWSBridge:
         }
         self.runtime_state["candidates"].append(record)
         self._write_event_log("candidate_skipped_recorded", record)
+
+    def _save_dom_snapshot(self, snapshot: dict) -> None:
+        """采集失败时保存 DOM 快照到诊断文件，用于分析选择器失效原因。"""
+        try:
+            from recruitment_assistant.config.settings import get_settings
+            diag_dir = get_settings().attachment_dir / "boss" / "_diagnostics"
+            diag_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = diag_dir / f"dom_snapshot_{ts}.json"
+            path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+            logger.info("DOM 诊断快照已保存: {}", path)
+        except Exception as exc:
+            logger.warning("保存 DOM 诊断快照失败: {}", exc)
 
     def _log(self, level: str, message: str) -> None:
         now = datetime.now()

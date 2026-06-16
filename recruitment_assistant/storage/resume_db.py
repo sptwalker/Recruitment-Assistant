@@ -40,6 +40,7 @@ def init_resume_database() -> None:
     from recruitment_assistant.storage.resume_models import ResumeBase as _  # noqa: F401 ensure models registered
     ResumeBase.metadata.create_all(bind=resume_engine)
     _migrate_add_attachment_works_path()
+    _migrate_add_match_dimensions()
 
 
 def _migrate_add_attachment_works_path() -> None:
@@ -51,3 +52,20 @@ def _migrate_add_attachment_works_path() -> None:
         cols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(resume_source)").fetchall()}
         if "attachment_works_path" not in cols:
             conn.exec_driver_sql("ALTER TABLE resume_source ADD COLUMN attachment_works_path TEXT")
+
+
+def _migrate_add_match_dimensions() -> None:
+    """✨ 旧库 idempotent 加列：position_matches 多维度评分字段。
+
+    添加 skill_match, experience_match, education_match, location_match 四个维度字段。
+    """
+    with resume_engine.begin() as conn:
+        cols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(position_matches)").fetchall()}
+        if "skill_match" not in cols:
+            conn.exec_driver_sql("ALTER TABLE position_matches ADD COLUMN skill_match INTEGER")
+        if "experience_match" not in cols:
+            conn.exec_driver_sql("ALTER TABLE position_matches ADD COLUMN experience_match INTEGER")
+        if "education_match" not in cols:
+            conn.exec_driver_sql("ALTER TABLE position_matches ADD COLUMN education_match INTEGER")
+        if "location_match" not in cols:
+            conn.exec_driver_sql("ALTER TABLE position_matches ADD COLUMN location_match INTEGER")

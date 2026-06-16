@@ -16,9 +16,9 @@ from recruitment_assistant.storage.resume_models import (
     Candidate,
     InterviewEvaluation,
     InterviewInvitation,
-    JobPosition,
     ResumeSource,
 )
+from recruitment_assistant.storage.models import JobPosition
 
 settings = get_settings()
 st.set_page_config(page_title="简历智采助手", layout="wide", initial_sidebar_state="collapsed")
@@ -119,7 +119,7 @@ def load_home_dashboard_data() -> dict:
             )
             data["interviews"] = {
                 "total": int(session.scalar(select(func.count(InterviewInvitation.invitation_id))) or 0),
-                "positions": int(session.scalar(select(func.count(JobPosition.position_id))) or 0),
+                "positions": 0,  # filled from PG below
                 "pending": int(
                     session.scalar(
                         select(func.count(InterviewInvitation.invitation_id)).where(InterviewInvitation.status == "pending")
@@ -153,6 +153,18 @@ def load_home_dashboard_data() -> dict:
             }
     except Exception as exc:
         data["errors"].append(f"简历/面试统计读取失败：{exc}")
+
+    # 岗位数量从 PostgreSQL 查询
+    try:
+        with create_session() as pg_session:
+            data.setdefault("interviews", {})["positions"] = int(
+                pg_session.scalar(
+                    select(func.count(JobPosition.id)).where(JobPosition.deleted_at.is_(None))
+                )
+                or 0
+            )
+    except Exception as exc:
+        data["errors"].append(f"岗位统计读取失败：{exc}")
 
     try:
         with create_session() as session:

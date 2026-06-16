@@ -236,40 +236,84 @@ class ResumeAIService:
     def is_configured(self) -> bool:
         return bool(self.api_key)
 
-    def parse_resume_text(self, raw_text: str, source_name: str | None = None) -> CandidateCreate | None:
-        """调 LLM 将纯文本简历结构化为 CandidateCreate。"""
+    def parse_resume_text(self, raw_text: str, source_name: str | None = None, retry: int = 2) -> CandidateCreate | None:
+        """调 LLM 将纯文本简历结构化为 CandidateCreate。
+
+        Args:
+            raw_text: 简历原始文本
+            source_name: 文件名
+            retry: 失败重试次数，默认 2 次
+        """
         if not self.is_configured:
             raise RuntimeError("AI API Key 未配置，请在 .env 文件中设置 AI_API_KEY")
         if not raw_text or len(raw_text.strip()) < 20:
             return None
-        try:
-            resp = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": f"附件文件名：{source_name or '-'}\n\n请解析以下简历：\n\n{raw_text[:MAX_RESUME_TEXT_CHARS]}"},
-                ],
-                temperature=0.1,
-                timeout=60,
-                response_format={"type": "json_object"},
-            )
-            content = resp.choices[0].message.content.strip()
-            # 去掉可能的 markdown 代码块标记
-            if content.startswith("```"):
-                content = content.split("\n", 1)[1] if "\n" in content else content[3:]
-            if content.endswith("```"):
-                content = content[:-3]
-            content = content.strip()
-            data = json.loads(content)
-            data = _unwrap_candidate_envelope(data)
-            data = _ensure_candidate_name(data, source_name)
-            return CandidateCreate(**data)
-        except json.JSONDecodeError as exc:
-            logger.warning("AI 返回内容非合法 JSON：{}", exc)
-            return None
-        except Exception as exc:
-            logger.error("AI 解析简历失败：{}", exc)
-            raise
+
+        # ✨ 重试机制
+        for attempt in range(retry + 1):
+            try:
+                resp = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": f"附件文件名：{source_name or '-'}\n\n请解析以下简历：\n\n{raw_text[:MAX_RESUME_TEXT_CHARS]}"},
+                    ],
+                    temperature=0.1,
+                    timeout=60,
+                    response_format={"type": "json_object"},
+                )
+                content = resp.choices[0].message.content.strip()
+
+                # ✨ 增强 JSON 清理逻辑
+                content = self._clean_json_response(content)
+
+                data = json.loads(content)
+                data = _unwrap_candidate_envelope(data)
+                data = _ensure_candidate_name(data, source_name)
+
+                # ✨ 验证必填字段
+                if not data.get('name'):
+                    if attempt < retry:
+                        logger.warning(f"AI 解析缺少必填字段 name（尝试 {attempt+1}/{retry+1}）")
+                        continue
+                    raise ValueError("姓名字段缺失")
+
+                return CandidateCreate(**data)
+
+            except json.JSONDecodeError as exc:
+                if attempt < retry:
+                    logger.warning(f"AI 返回内容非合法 JSON（尝试 {attempt+1}/{retry+1}）：{exc}")
+                    continue
+                logger.error(f"AI 返回内容非合法 JSON（最终失败）：{exc}")
+                return None
+            except ValueError as exc:
+                if attempt < retry:
+                    logger.warning(f"数据验证失败（尝试 {attempt+1}/{retry+1}）：{exc}")
+                    continue
+                logger.error(f"数据验证失败（最终失败）：{exc}")
+                return None
+            except Exception as exc:
+                if attempt < retry:
+                    logger.warning(f"AI 解析简历失败（尝试 {attempt+1}/{retry+1}）：{exc}")
+                    continue
+                logger.error(f"AI 解析简历失败（最终失败）：{exc}")
+                raise
+
+        return None
+
+    def _clean_json_response(self, content: str) -> str:
+        """清理 AI 返回的 JSON 响应"""
+        # 去掉 markdown 代码块标记
+        if content.startswith("```"):
+            content = content.split("\n", 1)[1] if "\n" in content else content[3:]
+        if content.endswith("```"):
+            content = content[:-3]
+
+        # 去掉可能的 json 标记
+        if content.startswith("json"):
+            content = content[4:]
+
+        return content.strip()
 
     def match_candidates(
         self, position_requirements: str, candidates: list[dict]
@@ -278,7 +322,17 @@ class ResumeAIService:
 
         每个 candidate dict 应包含：candidate_id, name, education_level, current_city,
         position (最近职位), skills (技能摘要), work_summary (工作经历摘要)。
-        返回：[{"candidate_id": int, "match_score": 0-100, "reason": str}, ...]
+        返回：[{
+            "candidate_id": int,
+            "match_score": 0-100,
+            "dimensions": {
+                "skill_match": 0-100,
+                "experience_match": 0-100,
+                "education_match": 0-100,
+                "location_match": 0-100
+            },
+            "reason": str
+        }, ...]
         """
         if not self.is_configured:
             raise RuntimeError("AI API Key 未配置")
@@ -289,18 +343,33 @@ class ResumeAIService:
             f"工作摘要={c.get('work_summary', '-')}"
             for c in candidates
         )
+        # ✨ 多维度评分 Prompt
         prompt = (
             f"岗位要求：\n{position_requirements}\n\n"
             f"候选人列表（共 {len(candidates)} 人）：\n{candidates_text}\n\n"
-            "请对每位候选人评估与该岗位的匹配度（0-100 分），并给出简短评语。\n"
-            "输出 JSON 数组，包含所有候选人：\n"
-            '[{"candidate_id": ID, "match_score": 0-100, "reason": "一句话匹配评语"}]'
+            "请对每位候选人进行多维度评估，每个维度独立评分（0-100 分）：\n"
+            "1. skill_match (技能匹配度): 技能与岗位要求的匹配程度\n"
+            "2. experience_match (经验匹配度): 工作经验与岗位要求的匹配程度\n"
+            "3. education_match (学历匹配度): 学历背景与岗位要求的匹配程度\n"
+            "4. location_match (地域匹配度): 工作城市与岗位地点的匹配程度\n\n"
+            "输出完整 JSON 数组，包含所有候选人：\n"
+            '[{\n'
+            '  "candidate_id": ID,\n'
+            '  "match_score": 综合得分(0-100),\n'
+            '  "dimensions": {\n'
+            '    "skill_match": 分数,\n'
+            '    "experience_match": 分数,\n'
+            '    "education_match": 分数,\n'
+            '    "location_match": 分数\n'
+            '  },\n'
+            '  "reason": "一句话综合评语"\n'
+            '}]'
         )
         try:
             resp = self.client.chat.completions.create(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": "你是招聘匹配助手。对每位候选人评估岗位匹配度（0-100），输出完整 JSON 数组，不要遗漏任何候选人。"},
+                    {"role": "system", "content": "你是招聘匹配助手。对每位候选人进行多维度评估（技能/经验/学历/地域），输出完整 JSON 数组，不要遗漏任何候选人。"},
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.2,
@@ -316,6 +385,18 @@ class ResumeAIService:
                 results = results["candidates"]
             if isinstance(results, dict) and "results" in results:
                 results = results["results"]
+
+            # ✨ 向后兼容：如果 AI 没有返回 dimensions，自动填充默认值
+            for r in results if isinstance(results, list) else []:
+                if "dimensions" not in r:
+                    score = r.get("match_score", 50)
+                    r["dimensions"] = {
+                        "skill_match": score,
+                        "experience_match": score,
+                        "education_match": score,
+                        "location_match": score,
+                    }
+
             return results if isinstance(results, list) else []
         except Exception as exc:
             logger.error("AI 岗位匹配失败：{}", exc)

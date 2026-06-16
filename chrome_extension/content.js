@@ -846,7 +846,12 @@
   function extractBossTalkingPosition() {
     const pageWidth = window.innerWidth || document.documentElement.clientWidth || 1440;
     const rightLeft = Math.max(380, pageWidth * 0.28);
-    const re = /沟通的职位[\s\-：:—–]*([^\n\r]{1,80})/;
+    const rePatterns = [
+      /沟通的职位[\s\-：:—–]*([^\n\r]{1,80})/,
+      /沟通职位[\s\-：:—–]*[：:]?\s*([^\n\r]{1,80})/,
+      /聊天职位[\s\-：:—–]*[：:]?\s*([^\n\r]{1,80})/,
+    ];
+    const textKeywords = ["沟通的职位", "沟通职位", "聊天职位"];
     const candidates = [];
     const nodes = document.querySelectorAll("div, span, p, header, section");
     for (const el of nodes) {
@@ -857,14 +862,36 @@
       if (rect.width < 100 || rect.width > pageWidth) continue;
       const text = (el.innerText || el.textContent || "").trim();
       if (!text || text.length > 240) continue;
-      if (!text.includes("沟通的职位")) continue;
-      const m = text.match(re);
-      if (!m) continue;
-      const raw = m[1].trim();
-      if (!raw) continue;
-      candidates.push({ el, rect, raw, top: rect.top, len: text.length });
+      if (!textKeywords.some(kw => text.includes(kw))) continue;
+      for (const re of rePatterns) {
+        const m = text.match(re);
+        if (!m) continue;
+        const raw = m[1].trim();
+        if (!raw) continue;
+        candidates.push({ el, rect, raw, top: rect.top, len: text.length });
+        break;
+      }
     }
-    if (candidates.length === 0) return "";
+    if (candidates.length === 0) {
+      // 宽范围兜底：扫描右半侧 top 40-500 区间是否有任何包含职位关键词的文本
+      const fallbackHits = [];
+      for (const el of nodes) {
+        if (!isVisible(el)) continue;
+        const rect = el.getBoundingClientRect();
+        if (rect.left < rightLeft || rect.top < 40 || rect.top > 500) continue;
+        const text = (el.innerText || el.textContent || "").trim();
+        if (text.length > 240 || text.length < 2) continue;
+        if (textKeywords.some(kw => text.includes(kw))) {
+          fallbackHits.push({ tag: el.tagName, cls: (el.className || "").toString().slice(0, 80), text: text.slice(0, 120), rect: { l: Math.round(rect.left), t: Math.round(rect.top), w: Math.round(rect.width), h: Math.round(rect.height) } });
+        }
+      }
+      if (fallbackHits.length > 0) {
+        emit({ type: "boss_diag", data: { step: "talking_position_fallback_hits", hits: fallbackHits.slice(0, 5) } });
+      } else {
+        emit({ type: "boss_diag", data: { step: "talking_position_no_keyword", rightLeft, viewport: { w: pageWidth, h: window.innerHeight } } });
+      }
+      return "";
+    }
     candidates.sort((a, b) => a.top - b.top || a.len - b.len);
     return candidates[0].raw;
   }
@@ -1101,6 +1128,66 @@
         }
       }
     }
+
+    // ── 多附件扫描：当"预览作品集"按钮不存在时，扫描所有"点击预览附件简历"卡片 ──
+    // 通过 Vue 数据读取每张卡片的原始文件名，按关键词分类后分别下载简历和作品集。
+    const WORKS_KW = ["作品集", "作品", "portfolio", "works"];
+    const RESUME_KW = ["简历", "resume", "cv"];
+    const previewBtns = Array.from(allCardBtns).filter(b => textOf(b).trim() === "点击预览附件简历");
+    if (!btn && previewBtns.length >= 2) {
+      const attachments = [];
+      for (const pb of previewBtns) {
+        const extractedInfo = await extractBossWorksDownloadInfo(pb);
+        if (extractedInfo && extractedInfo.url) {
+          const fn = (extractedInfo.filename || "").toLowerCase();
+          const isWorks = WORKS_KW.some(kw => fn.includes(kw));
+          const isResume = RESUME_KW.some(kw => fn.includes(kw));
+          attachments.push({ btn: pb, info: extractedInfo, isWorks, isResume, filename: extractedInfo.filename || "" });
+        }
+      }
+      emit({ type: "boss_multi_attachment_scan", data: {
+        candidate_id: candidateId, candidate_signature: signature,
+        total_preview_btns: previewBtns.length,
+        extracted: attachments.map(a => ({ filename: a.filename, isWorks: a.isWorks, isResume: a.isResume })),
+      }});
+
+      let downloadedCount = 0;
+      for (const att of attachments) {
+        const variant = att.isWorks ? "attachment_works" : (att.isResume ? "attachment_resume_extra" : "attachment_extra");
+        const typeLabel = att.isWorks ? "作品集" : (att.isResume ? "简历(补充下载)" : "附件");
+        emit({ type: "boss_multi_attachment_downloading", data: {
+          candidate_id: candidateId, candidate_signature: signature,
+          filename: att.filename, variant, typeLabel,
+        }});
+        const dlReqId = makeDownloadRequestId(candidateId, signature) + "_" + variant + "_" + downloadedCount;
+        emit({ type: "download_intent", data: {
+          candidate_id: candidateId, candidate_signature: signature,
+          candidate_info: info,
+          expected_filename: att.filename || `${signature}_${variant}.pdf`,
+          download_request_id: dlReqId, variant,
+        }});
+        const dlResult = await downloadDirectUrl({
+          candidate_id: candidateId, candidate_signature: signature,
+          candidate_info: info, url: att.info.url,
+          download_request_id: dlReqId, variant,
+        }, 15000);
+        if (dlResult.ok) {
+          await finalizeDownloadWithPersistAck(candidateId, signature, dlReqId, "boss_" + variant);
+          emit({ type: "boss_multi_attachment_downloaded", data: {
+            candidate_id: candidateId, candidate_signature: signature,
+            filename: att.filename, variant, typeLabel,
+          }});
+          downloadedCount++;
+        } else {
+          emit({ type: "boss_multi_attachment_failed", data: {
+            candidate_id: candidateId, candidate_signature: signature,
+            filename: att.filename, variant, reason: dlResult.reason || "download_failed",
+          }});
+        }
+      }
+      return downloadedCount > 0;
+    }
+
     if (!btn) return false;
     emit({ type: "boss_attachment_works_button_found", data: {
       candidate_id: candidateId, candidate_signature: signature
@@ -1273,6 +1360,111 @@
     const attrs = ["class", "id", "href", "xlink:href", "aria-label", "title", "data-icon", "data-name", "data-testid"];
     const attrText = attrs.map((name) => el.getAttribute?.(name) || "").join(" ");
     return `${textOf(el)} ${attrText} ${el.className || ""}`.replace(/\s+/g, " ").trim();
+  }
+
+  function collectDomSnapshot() {
+    const result = {};
+    const maxLeft = Math.min(window.innerWidth * 0.45, 520);
+
+    // 旧选择器全量检测
+    const selectors = {
+      "div.user-list.b-scroll-stable": 0,
+      "div.user-list": 0,
+      ".geek-item-wrap > .geek-item": 0,
+      ".geek-item-wrap": 0,
+      ".geek-item": 0,
+      '.chat-label-item[title="沟通中"]': 0,
+      ".chat-label-item": 0,
+      'dl.menu-chat a[href*="/web/chat"]': 0,
+      "dl.menu-chat": 0,
+      '[class*="user-list"]': 0,
+      '[class*="conversation"]': 0,
+      '[class*="geek"]': 0,
+    };
+    for (const sel of Object.keys(selectors)) {
+      try { selectors[sel] = document.querySelectorAll(sel).length; } catch (_) { /* ignore */ }
+    }
+    result.selector_counts = selectors;
+
+    // 页面信息
+    result.page = {
+      url: location.href,
+      title: document.title.slice(0, 100),
+      viewport: { w: window.innerWidth, h: window.innerHeight },
+    };
+
+    // body 直属 div
+    result.body_children = Array.from(document.body.children).slice(0, 15).map(el => {
+      const r = el.getBoundingClientRect();
+      return {
+        tag: el.tagName,
+        cls: (el.className || "").toString().slice(0, 120),
+        id: el.id || "",
+        children: el.children.length,
+        rect: { l: Math.round(r.left), t: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height) },
+      };
+    });
+
+    // 左侧区域大容器
+    const leftContainers = [];
+    document.querySelectorAll("div, ul, section, nav").forEach(el => {
+      const r = el.getBoundingClientRect();
+      if (r.left < maxLeft && r.width > 80 && r.height > 150 && r.top > 40 && el.children.length > 2) {
+        leftContainers.push({
+          tag: el.tagName,
+          cls: (el.className || "").toString().slice(0, 120),
+          children: el.children.length,
+          scrollH: el.scrollHeight,
+          clientH: el.clientHeight,
+          rect: { l: Math.round(r.left), t: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height) },
+          firstKids: Array.from(el.children).slice(0, 3).map(c => ({
+            tag: c.tagName,
+            cls: (c.className || "").toString().slice(0, 60),
+          })),
+        });
+      }
+    });
+    leftContainers.sort((a, b) => b.children - a.children);
+    result.left_containers = leftContainers.slice(0, 15);
+
+    // 含年龄/学历文本的元素
+    const ageRe = /\d{2}\s*岁/;
+    const eduRe = /本科|大专|硕士|博士|研究生|专科|高中|中专/;
+    const textHits = [];
+    document.querySelectorAll("li, div, span, a").forEach(el => {
+      const r = el.getBoundingClientRect();
+      if (r.width < 50 || r.height < 20 || r.left > maxLeft) return;
+      const t = (el.textContent || "").trim();
+      if (t.length > 10 && t.length < 200 && (ageRe.test(t) || eduRe.test(t))) {
+        textHits.push({
+          tag: el.tagName,
+          cls: (el.className || "").toString().slice(0, 100),
+          text: t.replace(/\s+/g, " ").slice(0, 100),
+          rect: { l: Math.round(r.left), t: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height) },
+          path: getElementDomPath(el),
+        });
+      }
+    });
+    result.candidate_text_hits = textHits.slice(0, 20);
+
+    // 含"沟通中"文本的元素
+    const chattingHits = [];
+    document.querySelectorAll("div, span, a, li, label, button").forEach(el => {
+      const t = (el.textContent || "").trim();
+      if (t === "沟通中") {
+        const r = el.getBoundingClientRect();
+        if (r.width > 0) chattingHits.push({
+          tag: el.tagName,
+          cls: (el.className || "").toString().slice(0, 100),
+          title: el.getAttribute("title") || "",
+          rect: { l: Math.round(r.left), t: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height) },
+          path: getElementDomPath(el),
+        });
+      }
+    });
+    result.chatting_tab_hits = chattingHits;
+
+    return result;
   }
 
   function getElementDomPath(el) {
@@ -2449,11 +2641,32 @@
     return true;
   }
 
+  const BOSS_COOLDOWN_BATCH = 5;
+  const BOSS_COOLDOWN_BASE_MIN_MS = 30000;
+  const BOSS_COOLDOWN_BASE_MAX_MS = 60000;
+  const BOSS_COOLDOWN_ESCALATION = 0.20;
+
+  async function maybeBossCooldown() {
+    if (PLATFORM.code !== "boss") return;
+    const completed = results.completed;
+    if (completed <= 0 || completed % BOSS_COOLDOWN_BATCH !== 0) return;
+    const round = Math.floor(completed / BOSS_COOLDOWN_BATCH) - 1;
+    const multiplier = Math.pow(1 + BOSS_COOLDOWN_ESCALATION, round);
+    const minMs = Math.round(BOSS_COOLDOWN_BASE_MIN_MS * multiplier);
+    const maxMs = Math.round(BOSS_COOLDOWN_BASE_MAX_MS * multiplier);
+    const waitMs = minMs + Math.floor(Math.random() * (maxMs - minMs + 1));
+    const waitSec = (waitMs / 1000).toFixed(1);
+    emit({ type: "boss_cooldown_start", data: { completed, round: round + 1, wait_ms: waitMs, wait_sec: waitSec, multiplier: multiplier.toFixed(2), range: `${(minMs/1000).toFixed(0)}-${(maxMs/1000).toFixed(0)}s` } });
+    await sleep(waitMs);
+    emit({ type: "boss_cooldown_end", data: { completed, wait_ms: waitMs } });
+  }
+
   async function finalizeDownloadWithPersistAck(candidateId, signature, downloadRequestId, strategy) {
     const persist = await waitForPersistAck(downloadRequestId, signature, 8000);
     if (persist.ok) {
       creditPersistCompletion(downloadRequestId, signature, "ack_ok");
       emit({ type: "resume_persist_confirmed", data: { candidate_id: candidateId, candidate_signature: signature, download_request_id: downloadRequestId, strategy, ...(persist.data || {}) } });
+      await maybeBossCooldown();
       await sleep(Math.min(Math.max(config.interval_ms || 0, 300), 900));
       return true;
     }
@@ -2462,6 +2675,7 @@
     // 此处保底再补一次：桥侧无论 saved/timeout 都已经落盘，跑完上层应直接结束本候选人，避免重复点击下载。
     if (persist.status === "persist_ack_timeout") {
       creditPersistCompletion(downloadRequestId, signature, "ack_timeout_fallback");
+      await maybeBossCooldown();
       return true;
     }
     // bridge 返回 duplicate_in_run / duplicate_skipped 说明文件已落盘（本轮或历史），不是真失败
@@ -2634,11 +2848,12 @@
       return accepted;
     }
     emit({ type: "boss_svg_download_link_capture_failed", data: { candidate_id: candidateId, candidate_signature: signature, reason: downloadResult.reason || "download_failed", ...(downloadResult.data || {}) } });
-    if (resumePreviewLearnState.learnedClick) {
-      return false;
-    }
-    if (await learnManualDownloadClickAfterFailure(candidateId, signature, info, downloadResult.reason || "boss_svg_download_failed")) {
-      return true;
+    // 下载已触发但失败（文件损坏/网络错误）→ 直接返回 false，不进 manual learning
+    // 仅当 download_timeout（Chrome 从未创建下载）才认为点击目标可能有误，尝试学习
+    if (downloadResult.reason === "download_timeout" && !resumePreviewLearnState.learnedClick) {
+      if (await learnManualDownloadClickAfterFailure(candidateId, signature, info, "boss_svg_download_timeout")) {
+        return true;
+      }
     }
     return false;
   }
@@ -2914,7 +3129,7 @@
     const downloadResult = await resultPromise;
     if (downloadResult.ok) {
       await finalizeDownloadWithPersistAck(candidateId, signature, downloadRequestId, "auto_download_button");
-    } else if (await learnManualDownloadClickAfterFailure(candidateId, signature, info, downloadResult.reason || "auto_download_failed")) {
+    } else if (downloadResult.reason === "download_timeout" && await learnManualDownloadClickAfterFailure(candidateId, signature, info, "auto_download_timeout")) {
       return;
     } else {
       await skipCandidate(candidateId, signature, downloadResult.reason || "download_failed", downloadResult.data || {});
@@ -4606,6 +4821,11 @@
         selector: s,
         count: document.querySelectorAll(s).length,
       })).filter(x => x.count > 0);
+
+      // 收集完整 DOM 结构快照以诊断选择器失效原因
+      const domSnapshot = collectDomSnapshot();
+      emit({ type: "boss_diag", data: { step: "dom_snapshot_on_fail", snapshot: domSnapshot } });
+
       emit({ type: "error", data: {
         message: "未找到候选人列表",
         stage: "scan",
@@ -4718,6 +4938,16 @@
         continue;
       }
 
+      // ── 白名单过滤：只处理目标候选人 ──
+      if (Array.isArray(config.target_candidate_names) && config.target_candidate_names.length > 0) {
+        const candidateName = (info.name || signature.split("/")[0] || "").trim();
+        const isTarget = config.target_candidate_names.some(t => candidateName.includes(t) || t.includes(candidateName));
+        if (!isTarget) {
+          await skipCandidate(candidateId, signature, "target_whitelist_skip", { fast_skip: true });
+          continue;
+        }
+      }
+
       const resumeButtonLookupStartedAt = Date.now();
       emit({ type: "boss_resume_button_lookup_started", data: { candidate_id: candidateId, candidate_signature: signature } });
       let btn = findResumeButton();
@@ -4731,21 +4961,82 @@
       if (btn.state === "dim") {
         const consentBtn = acceptResumeConsentIfNeeded();
         if (consentBtn) {
-          emit({ type: "resume_consent_found", data: { candidate_id: candidateId, candidate_signature: signature } });
-          clickElementReliably(consentBtn);
-          emit({ type: "resume_consent_clicked", data: { candidate_id: candidateId, candidate_signature: signature } });
+          const consentRect = consentBtn.getBoundingClientRect();
+          const consentIsDisabled = isDisabled(consentBtn);
+          const origClass = (consentBtn.className || "").toString();
+          emit({ type: "resume_consent_found", data: {
+            candidate_id: candidateId, candidate_signature: signature,
+            consent_tag: consentBtn.tagName,
+            consent_text: textOf(consentBtn),
+            consent_class: origClass.slice(0, 200),
+            consent_rect: { left: Math.round(consentRect.left), top: Math.round(consentRect.top), width: Math.round(consentRect.width), height: Math.round(consentRect.height) },
+            consent_visible: isVisible(consentBtn),
+            consent_disabled: consentIsDisabled,
+            consent_parent_class: (consentBtn.parentElement?.className || "").toString().slice(0, 200),
+            consent_pointer_events: getComputedStyle(consentBtn).pointerEvents,
+            resume_btn_before: { state: btn.state, text: btn.text, descriptor: btn.el ? getElementDescriptor(btn.el).slice(0, 200) : "", opacity_chain: btn.el ? getOpacityChain(btn.el) : [] },
+            click_method: "direct_click_then_cdp_fallback",
+          } });
+          // 第一步：直接 .click() — 与正常流程（非 disabled 按钮）走的是同一条路径
+          // clickElementReliably 内部最终也是调用 node.click()，但它有 isDisabled 守卫会跳过 disabled 按钮
+          // 这里绕过守卫，直接点击
+          consentBtn.click();
+          emit({ type: "resume_consent_clicked", data: { candidate_id: candidateId, candidate_signature: signature, method: "direct_click" } });
           let brightened = false;
           for (let i = 0; i < 20; i++) {
             await sleep(300);
             const refreshed = findResumeButton();
+            const consentStill = acceptResumeConsentIfNeeded();
+            emit({ type: "resume_consent_poll", data: {
+              candidate_id: candidateId, candidate_signature: signature,
+              poll_index: i,
+              resume_btn_found: !!refreshed,
+              resume_btn_state: refreshed ? refreshed.state : null,
+              resume_btn_text: refreshed ? refreshed.text : null,
+              resume_btn_opacity_chain: (refreshed && refreshed.el) ? getOpacityChain(refreshed.el) : [],
+              resume_btn_disabled: (refreshed && refreshed.el) ? isDisabled(refreshed.el) : null,
+              resume_btn_class: (refreshed && refreshed.el) ? (refreshed.el.className || "").toString().slice(0, 200) : "",
+              consent_btn_still_present: !!consentStill,
+              consent_still_text: consentStill ? textOf(consentStill) : null,
+            } });
             if (refreshed && refreshed.state === "bright") {
               brightened = true;
               btn = refreshed;
               break;
             }
+            // 直接 .click() 在第3次 poll 后仍未生效 → CDP 兜底（生成 isTrusted:true 的真实鼠标事件）
+            if (i === 3 && consentIsDisabled) {
+              const cdpBtn = acceptResumeConsentIfNeeded() || consentBtn;
+              const cdpRect = cdpBtn.getBoundingClientRect();
+              const clickX = Math.round(cdpRect.left + cdpRect.width / 2);
+              const clickY = Math.round(cdpRect.top + cdpRect.height / 2);
+              const bgResult = await new Promise((resolve) => {
+                try {
+                  chrome.runtime.sendMessage({ type: "click_consent_via_vue", x: clickX, y: clickY }, (resp) => {
+                    resolve(resp || { ok: false, error: "no_response" });
+                  });
+                } catch (e) { resolve({ ok: false, error: String(e) }); }
+              });
+              emit({ type: "resume_consent_cdp_fallback", data: {
+                candidate_id: candidateId, candidate_signature: signature,
+                bg_result: bgResult, click_x: clickX, click_y: clickY,
+              } });
+            }
           }
           if (!brightened) {
-            await skipCandidate(candidateId, signature, "resume_consent_clicked_but_not_brightened", { elapsed_ms: 6000 });
+            const finalBtn = findResumeButton();
+            const finalConsent = acceptResumeConsentIfNeeded();
+            await skipCandidate(candidateId, signature, "resume_consent_clicked_but_not_brightened", {
+              elapsed_ms: 6000,
+              final_resume_btn_found: !!finalBtn,
+              final_resume_btn_state: finalBtn ? finalBtn.state : null,
+              final_resume_btn_text: finalBtn ? finalBtn.text : null,
+              final_resume_btn_opacity: (finalBtn && finalBtn.el) ? getOpacityChain(finalBtn.el) : [],
+              final_resume_btn_class: (finalBtn && finalBtn.el) ? (finalBtn.el.className || "").toString().slice(0, 200) : "",
+              final_resume_btn_descriptor: (finalBtn && finalBtn.el) ? getElementDescriptor(finalBtn.el).slice(0, 200) : "",
+              final_consent_still_present: !!finalConsent,
+              final_consent_text: finalConsent ? textOf(finalConsent) : null,
+            });
             continue;
           }
           emit({ type: "resume_consent_accepted", data: { candidate_id: candidateId, candidate_signature: signature, button_state: btn.state } });
@@ -4792,19 +5083,29 @@
       } });
       await sleep(350);
       try {
-        const preview = await startResumePreviewRecognition(candidateId, signature, info, btn, beforeUrl, stalePreview.closed, beforePreviewFingerprint);
-        if (shouldAbortAsyncStep()) break;
-        if (!preview) {
-          await skipCandidate(candidateId, signature, "resume_preview_not_found");
-          continue;
-        }
-
-        await tryDownloadResume(candidateId, signature, info, preview, true);
-        await closeExistingResumePreview(candidateId, signature);
-        forceRemoveStalePdfPreviewFrames(signature);
-        await sleep(500);
-        if (!shouldAbortAsyncStep()) {
-          await tryDownloadBossAttachmentWorks(candidateId, signature, info);
+        const _candidateResult = await Promise.race([
+          (async () => {
+            const preview = await startResumePreviewRecognition(candidateId, signature, info, btn, beforeUrl, stalePreview.closed, beforePreviewFingerprint);
+            if (shouldAbortAsyncStep()) return "abort";
+            if (!preview) {
+              await skipCandidate(candidateId, signature, "resume_preview_not_found");
+              return "skipped";
+            }
+            await tryDownloadResume(candidateId, signature, info, preview, true);
+            await closeExistingResumePreview(candidateId, signature);
+            forceRemoveStalePdfPreviewFrames(signature);
+            await sleep(500);
+            if (!shouldAbortAsyncStep()) {
+              await tryDownloadBossAttachmentWorks(candidateId, signature, info);
+            }
+            return "done";
+          })(),
+          new Promise(resolve => setTimeout(() => resolve("timeout"), 60000)),
+        ]);
+        if (_candidateResult === "abort") break;
+        if (_candidateResult === "timeout") {
+          emit({ type: "candidate_processing_timeout", data: { candidate_id: candidateId, candidate_signature: signature, timeout_ms: 60000 } });
+          await skipCandidate(candidateId, signature, "per_candidate_timeout");
         }
       } catch (perCandidateErr) {
         emit({ type: "candidate_processing_error", data: { candidate_id: candidateId, candidate_signature: signature, message: String(perCandidateErr?.message || perCandidateErr), stack: String(perCandidateErr?.stack || "").slice(0, 800) } });
@@ -4913,7 +5214,15 @@
 
         const candidateId = `${activeRunId || "run"}_${results.currentIndex}_${signature}`;
 
-        emit({ type: "candidate_clicked", data: { ...info, candidate_id: candidateId, candidate_signature: signature, index: results.currentIndex, elapsed_ms: infoElapsedMs } });
+        const talkingRaw = extractBossTalkingPosition();
+        const talkingSimplified = simplifyBossTalkingPosition(talkingRaw);
+        if (talkingSimplified) {
+          emit({ type: "boss_talking_position", data: { candidate_signature: signature, raw: talkingRaw, simplified: talkingSimplified } });
+        } else {
+          emit({ type: "boss_talking_position_skip", data: { candidate_signature: signature, reason: "not_found" } });
+        }
+
+        emit({ type: "candidate_clicked", data: { ...info, candidate_id: candidateId, candidate_signature: signature, talking_position: talkingSimplified, talking_position_raw: talkingRaw, index: results.currentIndex, elapsed_ms: infoElapsedMs } });
 
         if (signature === "待识别/待识别/待识别") {
           emit({ type: "candidate_skipped", data: { candidate_id: candidateId, candidate_signature: signature, reason: "candidate_info_unrecognized", raw_text: info.raw_text || "" } });
@@ -4942,6 +5251,16 @@
           continue;
         }
 
+        // ── 白名单过滤：只处理目标候选人 ──
+        if (Array.isArray(config.target_candidate_names) && config.target_candidate_names.length > 0) {
+          const candidateName = (info.name || signature.split("/")[0] || "").trim();
+          const isTarget = config.target_candidate_names.some(t => candidateName.includes(t) || t.includes(candidateName));
+          if (!isTarget) {
+            await skipCandidate(candidateId, signature, "target_whitelist_skip", { fast_skip: true });
+            continue;
+          }
+        }
+
         const btnStartedAt = Date.now();
         const btn = findResumeButton();
         const btnElapsedMs = Date.now() - btnStartedAt;
@@ -4963,18 +5282,28 @@
         emit({ type: "resume_attachment_click_dispatched", data: { candidate_id: candidateId, candidate_signature: signature, click_ok: clickOk, button_state: btn.state } });
         await sleep(350);
         try {
-          const preview = await startResumePreviewRecognition(candidateId, signature, info, btn, beforeUrl, stalePreview.closed, beforePreviewFingerprint);
-          if (shouldAbortAsyncStep()) break;
-          if (!preview) {
-            await skipCandidate(candidateId, signature, "resume_preview_not_found");
-            continue;
-          }
-
-          await tryDownloadResume(candidateId, signature, info, preview, true);
-          await closeExistingResumePreview(candidateId, signature);
-          forceRemoveStalePdfPreviewFrames(signature);
-          if (!shouldAbortAsyncStep()) {
-            await tryDownloadBossAttachmentWorks(candidateId, signature, info);
+          const _candidateResult = await Promise.race([
+            (async () => {
+              const preview = await startResumePreviewRecognition(candidateId, signature, info, btn, beforeUrl, stalePreview.closed, beforePreviewFingerprint);
+              if (shouldAbortAsyncStep()) return "abort";
+              if (!preview) {
+                await skipCandidate(candidateId, signature, "resume_preview_not_found");
+                return "skipped";
+              }
+              await tryDownloadResume(candidateId, signature, info, preview, true);
+              await closeExistingResumePreview(candidateId, signature);
+              forceRemoveStalePdfPreviewFrames(signature);
+              if (!shouldAbortAsyncStep()) {
+                await tryDownloadBossAttachmentWorks(candidateId, signature, info);
+              }
+              return "done";
+            })(),
+            new Promise(resolve => setTimeout(() => resolve("timeout"), 60000)),
+          ]);
+          if (_candidateResult === "abort") break;
+          if (_candidateResult === "timeout") {
+            emit({ type: "candidate_processing_timeout", data: { candidate_id: candidateId, candidate_signature: signature, timeout_ms: 60000 } });
+            await skipCandidate(candidateId, signature, "per_candidate_timeout");
           }
         } catch (perCandidateErr) {
           emit({ type: "candidate_processing_error", data: { candidate_id: candidateId, candidate_signature: signature, message: String(perCandidateErr?.message || perCandidateErr), stack: String(perCandidateErr?.stack || "").slice(0, 800) } });

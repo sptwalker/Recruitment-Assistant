@@ -1,17 +1,15 @@
-from decimal import Decimal
-
 from pydantic import BaseModel, ConfigDict
 
 
 class JobPositionCreate(BaseModel):
-    job_name: str
+    title: str
     department: str | None = None
-    city: str | None = None
-    salary_min: int | None = None
-    salary_max: int | None = None
-    degree_requirement: str | None = None
-    experience_min_years: Decimal | None = None
-    experience_max_years: Decimal | None = None
+    work_city: str | None = None
+    salary_range: str | None = None
+    min_education: str | None = None
+    min_experience: str | None = None
+    responsibilities: str | None = None
+    job_requirements: str | None = None
     required_skills: list[str] | None = None
     preferred_skills: list[str] | None = None
     description: str | None = None

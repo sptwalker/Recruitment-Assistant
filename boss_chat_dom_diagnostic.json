@@ -1,0 +1,473 @@
+{
+  "chatting_tab": {
+    "old_selector_match": {
+      "tag": "DIV",
+      "class": "chat-label-item",
+      "text": "沟通中",
+      "rect": {
+        "l": 607,
+        "t": 60,
+        "w": 72,
+        "h": 30
+      }
+    },
+    "text_search": [
+      {
+        "tag": "DIV",
+        "class": "chat-label-item",
+        "id": "",
+        "title": "沟通中",
+        "role": "",
+        "text": "沟通中",
+        "rect": {
+          "l": 607,
+          "t": 60,
+          "w": 72,
+          "h": 30
+        },
+        "parentTag": "DIV",
+        "parentClass": "label-list",
+        "path": "DIV.chat-label-item < DIV.label-list < DIV.chat-label < DIV.chat-label-top"
+      },
+      {
+        "tag": "SPAN",
+        "class": "badge",
+        "id": "",
+        "title": "",
+        "role": "",
+        "text": "沟通中",
+        "rect": {
+          "l": 623,
+          "t": 60,
+          "w": 39,
+          "h": 30
+        },
+        "parentTag": "DIV",
+        "parentClass": "chat-label-item",
+        "path": "SPAN.badge < DIV.chat-label-item < DIV.label-list < DIV.chat-label"
+      },
+      {
+        "tag": "SPAN",
+        "class": "content",
+        "id": "",
+        "title": "",
+        "role": "",
+        "text": "沟通中",
+        "rect": {
+          "l": 623,
+          "t": 60,
+          "w": 39,
+          "h": 30
+        },
+        "parentTag": "SPAN",
+        "parentClass": "badge",
+        "path": "SPAN.content < SPAN.badge < DIV.chat-label-item < DIV.label-list"
+      }
+    ]
+  },
+  "chat_menu": {
+    "old_selector_match": {
+      "tag": "A",
+      "class": "router-link-exact-active router-link-active router-link-active",
+      "text": "沟通  188",
+      "href": "/web/chat/index?ka=menu-im"
+    },
+    "chat_links": [
+      {
+        "tag": "A",
+        "class": "",
+        "href": "/web/chat/job/list",
+        "text": "职位管理",
+        "rect": {
+          "l": 6,
+          "t": 80,
+          "w": 156,
+          "h": 46
+        },
+        "parentTag": "DT",
+        "parentClass": ""
+      },
+      {
+        "tag": "A",
+        "class": "router-link-exact-active router-link-active router-link-active",
+        "href": "/web/chat/index?ka=menu-im",
+        "text": "沟通  188",
+        "rect": {
+          "l": 6,
+          "t": 224,
+          "w": 156,
+          "h": 46
+        },
+        "parentTag": "DT",
+        "parentClass": ""
+      },
+      {
+        "tag": "A",
+        "class": "",
+        "href": "/web/chat/intention",
+        "text": "意向沟通  新",
+        "rect": {
+          "l": 6,
+          "t": 272,
+          "w": 156,
+          "h": 46
+        },
+        "parentTag": "DT",
+        "parentClass": ""
+      },
+      {
+        "tag": "A",
+        "class": "",
+        "href": "/web/chat/interaction",
+        "text": "互动",
+        "rect": {
+          "l": 6,
+          "t": 320,
+          "w": 156,
+          "h": 46
+        },
+        "parentTag": "DT",
+        "parentClass": ""
+      },
+      {
+        "tag": "A",
+        "class": "",
+        "href": "/web/chat/geek/manage_v2",
+        "text": "牛人管理",
+        "rect": {
+          "l": 6,
+          "t": 368,
+          "w": 156,
+          "h": 46
+        },
+        "parentTag": "DT",
+        "parentClass": ""
+      },
+      {
+        "tag": "A",
+        "class": "",
+        "href": "/web/chat/business/mall",
+        "text": "道具 ·0  首充礼",
+        "rect": {
+          "l": 6,
+          "t": 416,
+          "w": 156,
+          "h": 46
+        },
+        "parentTag": "DT",
+        "parentClass": ""
+      },
+      {
+        "tag": "A",
+        "class": "",
+        "href": "/web/chat/toolbox_v2",
+        "text": "工具箱",
+        "rect": {
+          "l": 6,
+          "t": 464,
+          "w": 156,
+          "h": 46
+        },
+        "parentTag": "DT",
+        "parentClass": ""
+      }
+    ]
+  },
+  "list_container": {
+    "old_selector_match": {
+      "tag": "DIV",
+      "class": "user-list b-scroll-stable",
+      "childCount": 4,
+      "scrollHeight": 7830,
+      "clientHeight": 729,
+      "rect": {
+        "l": 444,
+        "t": 196,
+        "w": 359,
+        "h": 729
+      }
+    },
+    "potential": [
+      {
+        "tag": "DIV",
+        "class": "menu-list",
+        "id": "",
+        "childCount": 12,
+        "scrollable": true,
+        "scrollH": 945,
+        "clientH": 945,
+        "rect": {
+          "l": 0,
+          "t": 68,
+          "w": 168,
+          "h": 945
+        },
+        "firstChildren": [
+          {
+            "tag": "DIV",
+            "class": "top-hunter"
+          },
+          {
+            "tag": "DL",
+            "class": "menu-position"
+          },
+          {
+            "tag": "DL",
+            "class": "menu-recommend"
+          }
+        ]
+      },
+      {
+        "tag": "DIV",
+        "class": "user-list b-scroll-stable",
+        "id": "",
+        "childCount": 4,
+        "scrollable": true,
+        "scrollH": 7830,
+        "clientH": 729,
+        "rect": {
+          "l": 444,
+          "t": 196,
+          "w": 359,
+          "h": 729
+        },
+        "firstChildren": [
+          {
+            "tag": "DIV",
+            "class": ""
+          },
+          {
+            "tag": "DIV",
+            "class": ""
+          },
+          {
+            "tag": "DIV",
+            "class": ""
+          }
+        ]
+      },
+      {
+        "tag": "DIV",
+        "class": "",
+        "id": "",
+        "childCount": 40,
+        "scrollable": false,
+        "scrollH": 7800,
+        "clientH": 7800,
+        "rect": {
+          "l": 444,
+          "t": 196,
+          "w": 353,
+          "h": 7800
+        },
+        "firstChildren": [
+          {
+            "tag": "DIV",
+            "class": ""
+          },
+          {
+            "tag": "DIV",
+            "class": ""
+          },
+          {
+            "tag": "DIV",
+            "class": ""
+          }
+        ]
+      }
+    ]
+  },
+  "candidate_items": {
+    "old_selector_count": 40,
+    "old_wrap_count": 40,
+    "text_search": [
+      {
+        "tag": "DIV",
+        "class": "geek-item-wrap",
+        "text": "1 12:43 林迪辉 ai数据标注员 您好，我是深圳职业技术大学的大专生，对您发布的岗位很有兴趣，可以把简历发给您吗？",
+        "rect": {
+          "l": 444,
+          "t": 274,
+          "w": 353,
+          "h": 78
+        },
+        "parentTag": "DIV",
+        "parentClass": "",
+        "childCount": 1,
+        "path": "DIV.geek-item-wrap < DIV < DIV < DIV.user-list.b-scroll-stable < DIV.user-container"
+      },
+      {
+        "tag": "DIV",
+        "class": "geek-item",
+        "text": "1 12:43 林迪辉 ai数据标注员 您好，我是深圳职业技术大学的大专生，对您发布的岗位很有兴趣，可以把简历发给您吗？",
+        "rect": {
+          "l": 454,
+          "t": 276,
+          "w": 339,
+          "h": 74
+        },
+        "parentTag": "DIV",
+        "parentClass": "geek-item-wrap",
+        "childCount": 2,
+        "path": "DIV.geek-item < DIV.geek-item-wrap < DIV < DIV < DIV.user-list.b-scroll-stable"
+      },
+      {
+        "tag": "DIV",
+        "class": "geek-item-wrap",
+        "text": "1 昨天 冯宇晗 ai数据标注员 boss您好，我是安徽大学（211）硕士毕业生，对工作岗位很感兴趣，希望可以进一步沟通。",
+        "rect": {
+          "l": 444,
+          "t": 430,
+          "w": 353,
+          "h": 78
+        },
+        "parentTag": "DIV",
+        "parentClass": "",
+        "childCount": 1,
+        "path": "DIV.geek-item-wrap < DIV < DIV < DIV.user-list.b-scroll-stable < DIV.user-container"
+      },
+      {
+        "tag": "DIV",
+        "class": "geek-item",
+        "text": "1 昨天 冯宇晗 ai数据标注员 boss您好，我是安徽大学（211）硕士毕业生，对工作岗位很感兴趣，希望可以进一步沟通。",
+        "rect": {
+          "l": 454,
+          "t": 432,
+          "w": 339,
+          "h": 74
+        },
+        "parentTag": "DIV",
+        "parentClass": "geek-item-wrap",
+        "childCount": 2,
+        "path": "DIV.geek-item < DIV.geek-item-wrap < DIV < DIV < DIV.user-list.b-scroll-stable"
+      },
+      {
+        "tag": "DIV",
+        "class": "geek-item-wrap",
+        "text": "1 06月05日 黄锦东 ai数据标注员 BOSS您好，我叫黄锦东，为香港岭南大学数据科学专业准研究生，本科软件工程，现在寻找一份暑期实习，看到您的岗位觉得我较为匹配。可以给您发一份简历看看吗？",
+        "rect": {
+          "l": 444,
+          "t": 1054,
+          "w": 353,
+          "h": 78
+        },
+        "parentTag": "DIV",
+        "parentClass": "",
+        "childCount": 1,
+        "path": "DIV.geek-item-wrap < DIV < DIV < DIV.user-list.b-scroll-stable < DIV.user-container"
+      },
+      {
+        "tag": "DIV",
+        "class": "geek-item",
+        "text": "1 06月05日 黄锦东 ai数据标注员 BOSS您好，我叫黄锦东，为香港岭南大学数据科学专业准研究生，本科软件工程，现在寻找一份暑期实习，看到您的岗位觉得我较为匹配。可以给您发一份简历看看吗？",
+        "rect": {
+          "l": 454,
+          "t": 1056,
+          "w": 339,
+          "h": 74
+        },
+        "parentTag": "DIV",
+        "parentClass": "geek-item-wrap",
+        "childCount": 2,
+        "path": "DIV.geek-item < DIV.geek-item-wrap < DIV < DIV < DIV.user-list.b-scroll-stable"
+      },
+      {
+        "tag": "DIV",
+        "class": "geek-item-wrap",
+        "text": "1 06月01日 陈新颖 ai数据标注员 您好，我是郑州商贸旅游职业学院大专生，可以和您进一步沟通ai数据标注员职位吗？",
+        "rect": {
+          "l": 444,
+          "t": 3082,
+          "w": 353,
+          "h": 78
+        },
+        "parentTag": "DIV",
+        "parentClass": "",
+        "childCount": 1,
+        "path": "DIV.geek-item-wrap < DIV < DIV < DIV.user-list.b-scroll-stable < DIV.user-container"
+      },
+      {
+        "tag": "DIV",
+        "class": "geek-item",
+        "text": "1 06月01日 陈新颖 ai数据标注员 您好，我是郑州商贸旅游职业学院大专生，可以和您进一步沟通ai数据标注员职位吗？",
+        "rect": {
+          "l": 454,
+          "t": 3084,
+          "w": 339,
+          "h": 74
+        },
+        "parentTag": "DIV",
+        "parentClass": "geek-item-wrap",
+        "childCount": 2,
+        "path": "DIV.geek-item < DIV.geek-item-wrap < DIV < DIV < DIV.user-list.b-scroll-stable"
+      }
+    ]
+  },
+  "old_selectors_count": {
+    "div.user-list.b-scroll-stable": 1,
+    "div.user-list": 1,
+    ".geek-item-wrap > .geek-item": 40,
+    ".geek-item-wrap": 40,
+    ".geek-item": 40,
+    ".chat-label-item[title=\"沟通中\"]": 1,
+    ".chat-label-item": 6,
+    "dl.menu-chat a[href*=\"/web/chat\"]": 1,
+    "dl.menu-chat": 1,
+    ".chat-list": 0,
+    ".chat-list li": 0,
+    ".friend-list": 0,
+    ".friend-list li": 0,
+    "[class*=\"chat-list\"]": 0,
+    "[class*=\"user-list\"]": 1,
+    "[class*=\"friend-list\"]": 0,
+    "[class*=\"conversation\"]": 2,
+    "[class*=\"geek\"]": 162
+  },
+  "page_info": {
+    "url": "https://www.zhipin.com/web/chat/index",
+    "title": "BOSS直聘",
+    "viewport": {
+      "w": 1920,
+      "h": 945
+    },
+    "bodyClasses": "",
+    "mainDivs": [
+      {
+        "class": "__wm",
+        "id": "",
+        "childCount": 0,
+        "rect": {
+          "w": 1920,
+          "h": 945
+        }
+      },
+      {
+        "class": "wrap-v2",
+        "id": "wrap",
+        "childCount": 4,
+        "rect": {
+          "w": 1920,
+          "h": 945
+        }
+      },
+      {
+        "class": "",
+        "id": "guide-wrap",
+        "childCount": 2,
+        "rect": {
+          "w": 0,
+          "h": 0
+        }
+      },
+      {
+        "class": "crop_wrap",
+        "id": "cropWrap",
+        "childCount": 1,
+        "rect": {
+          "w": 0,
+          "h": 0
+        }
+      }
+    ]
+  }
+}

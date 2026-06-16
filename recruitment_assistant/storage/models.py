@@ -15,7 +15,7 @@ from sqlalchemy import (
     func,
 )
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column, relationship, synonym
 
 from recruitment_assistant.storage.db import Base
 
@@ -279,20 +279,33 @@ class JobPosition(Base, TimestampMixin):
     __tablename__ = "job_position"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    job_name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+
+    # -- UI-facing fields (renamed to match front-end expectations) --
+    title: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     department: Mapped[str | None] = mapped_column(String(255))
-    city: Mapped[str | None] = mapped_column(String(128))
-    salary_min: Mapped[int | None] = mapped_column(Integer)
-    salary_max: Mapped[int | None] = mapped_column(Integer)
-    degree_requirement: Mapped[str | None] = mapped_column(String(64))
-    experience_min_years: Mapped[Decimal | None] = mapped_column(Numeric(4, 1))
-    experience_max_years: Mapped[Decimal | None] = mapped_column(Numeric(4, 1))
+    work_city: Mapped[str | None] = mapped_column(String(128))
+    salary_range: Mapped[str | None] = mapped_column(String(100))
+    min_education: Mapped[str | None] = mapped_column(String(64))
+    min_experience: Mapped[str | None] = mapped_column(String(64))
+
+    # -- NEW: 岗位职责 & 任职要求 --
+    responsibilities: Mapped[str | None] = mapped_column(Text)
+    job_requirements: Mapped[str | None] = mapped_column(Text)
+
+    # -- Existing PG-only fields --
     required_skills: Mapped[list | None] = mapped_column(JSONB)
     preferred_skills: Mapped[list | None] = mapped_column(JSONB)
     description: Mapped[str | None] = mapped_column(Text)
     source_file_name: Mapped[str | None] = mapped_column(String(255))
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="active", index=True)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    # -- Aliases for backward-compatible attribute access --
+    position_id = synonym("id")
+
+    @property
+    def create_time(self) -> datetime:
+        return self.created_at
 
 
 class ResumeScore(Base):

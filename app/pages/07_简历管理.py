@@ -1649,11 +1649,7 @@ with tabs[2]:
                                 for idx, (label, score_val) in enumerate(dimensions):
                                     if score_val is not None:
                                         dim_cols[idx].metric(label, f"{score_val}%", delta=None)
-                                f"<span style='font-size:12px; color:var(--color-text-muted);'>匹配度 </span>"
-                                f"<span style='font-size:32px; font-weight:700; color:{color};'>{score}%</span>"
-                                f"</div>",
-                                unsafe_allow_html=True,
-                            )
+
                             # 第 3 列空白做气口
                             with h_cols[3]:
                                 st.markdown("<div style='padding-top:10px;'></div>",

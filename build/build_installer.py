@@ -72,9 +72,6 @@ def create_data_dirs() -> None:
     for d in DATA_DIRS:
         (DIST_DIR / d).mkdir(parents=True, exist_ok=True)
     (DIST_DIR / "logs").mkdir(parents=True, exist_ok=True)
-    db_src = PROJECT_ROOT / "data" / "resume_archive.db"
-    if db_src.exists():
-        shutil.copy2(db_src, DIST_DIR / "data" / "resume_archive.db")
 
 
 def create_env_file() -> None:

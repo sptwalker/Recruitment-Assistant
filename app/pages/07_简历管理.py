@@ -1506,7 +1506,7 @@ with tabs[2]:
                         # ✨ 核心项目经验（最近2个）
                         projects = c.project_experiences[:2] if c.project_experiences else []
                         projects_str = "; ".join(
-                            f"{p.project_name}（{p.role or '参与'}）"
+                            f"{p.project_name}（{p.project_role or '参与'}）"
                             for p in projects if p.project_name
                         ) or "-"
 
@@ -1568,7 +1568,7 @@ with tabs[2]:
                             try:
                                 results = future.result()
                                 all_results.extend(results)
-                                completed += len(future_to_chunk[future])
+                                completed += 1
                                 processed = min(completed * chunk_size, total)
                                 status_text.markdown(f"AI 正在评估候选人匹配度… **{processed}/{total}**")
                                 progress_bar.progress(processed / total if total > 0 else 0)

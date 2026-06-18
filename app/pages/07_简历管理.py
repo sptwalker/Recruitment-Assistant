@@ -1553,12 +1553,20 @@ with tabs[2]:
                     all_results = []
                     completed = 0
 
+                    # 拼接完整 JD：岗位职责 + 任职要求
+                    jd_parts = []
+                    if sel_pos.responsibilities:
+                        jd_parts.append(f"【岗位职责】\n{sel_pos.responsibilities}")
+                    if sel_pos.job_requirements:
+                        jd_parts.append(f"【任职要求】\n{sel_pos.job_requirements}")
+                    full_jd = "\n\n".join(jd_parts) if jd_parts else sel_pos.title
+
                     with ThreadPoolExecutor(max_workers=3) as executor:
                         # 提交所有批次任务
                         future_to_chunk = {
                             executor.submit(
                                 ai_service.match_candidates,
-                                sel_pos.job_requirements or sel_pos.title,
+                                full_jd,
                                 chunk
                             ): idx for idx, chunk in enumerate(chunks)
                         }
@@ -1582,7 +1590,7 @@ with tabs[2]:
                         cid = r.get("candidate_id")
                         score = r.get("match_score", 0)
                         reason = r.get("reason", "")
-                        dimensions = r.get("dimensions")  # ✨ 获取多维度评分
+                        dimensions = r.get("dimensions")
                         if cid and isinstance(score, (int, float)):
                             try:
                                 svc.save_position_match(
@@ -1590,21 +1598,23 @@ with tabs[2]:
                                     int(cid),
                                     int(score),
                                     reason,
-                                    dimensions=dimensions,  # ✨ 传递维度数据
+                                    dimensions=dimensions,
                                 )
                                 save_ok += 1
-                            except Exception:
+                            except Exception as exc:
                                 save_fail += 1
+                                if save_fail <= 3:
+                                    st.toast(f"保存失败 (cid={cid}): {exc}", icon="⚠️")
                     progress_bar.empty()
                     status_text.empty()
-                    if save_fail:
-                        st.warning(f"匹配结果保存完成：成功 {save_ok} 条，失败 {save_fail} 条")
+                    st.success(f"AI 匹配完成：评估 {len(all_results)} 人，保存 {save_ok} 条"
+                               + (f"，失败 {save_fail} 条" if save_fail else ""))
                     st.rerun()
 
                 # 展示匹配结果 Banner
-                matches = svc.list_position_matches(sel_pos.position_id, min_score=50)
+                matches = svc.list_position_matches(sel_pos.position_id, min_score=30)
                 if matches:
-                    st.markdown(f"**{sel_pos.title}** — 匹配结果（≥50%，共 {len(matches)} 人）")
+                    st.markdown(f"**{sel_pos.title}** — 匹配结果（≥30%，共 {len(matches)} 人）")
                     for match_row, cand in matches:
                         score = match_row.score
                         reason = match_row.reason or ""

@@ -233,7 +233,11 @@ def ensure_database() -> None:
         mig.check_returncode()
 
 
-def start_streamlit() -> subprocess.Popen:
+def start_streamlit() -> subprocess.Popen | None:
+    if is_port_open(STREAMLIT_PORT):
+        # 端口已被上次残留的 Streamlit 占用：复用它，不再 spawn 第二个（会 10048 崩溃）
+        log(f"Streamlit already running on {STREAMLIT_PORT}, reusing.")
+        return None
     log("Starting Streamlit...")
     env = get_env()
     proc = subprocess.Popen(
@@ -273,7 +277,8 @@ def main() -> None:
         proc = start_streamlit()
         wait_and_open_browser()
         log("All services started. Waiting for Streamlit process...")
-        proc.wait()
+        if proc is not None:
+            proc.wait()
     except Exception as e:
         log(f"ERROR: {e}")
         import traceback

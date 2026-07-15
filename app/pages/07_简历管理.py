@@ -9,11 +9,13 @@ import importlib
 import io
 import os
 import re
+import time as _time
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import streamlit as st
+from loguru import logger
 
 from components.layout import inject_vibe_style, page_header
 from recruitment_assistant.config.settings import get_settings
@@ -1046,6 +1048,231 @@ EDU_OPTIONS = ["不限", "大专", "本科", "硕士以上"]
 EXP_OPTIONS = ["不限", "1-3年", "3-5年", "5-10年", "10年以上"]
 
 
+# ---------- 岗位匹配工具函数 ----------
+
+def _build_candidate_dicts(all_candidates) -> list[dict]:
+    """将 ORM Candidate 列表转换为 AI 匹配所需的字典列表。"""
+    candidate_dicts = []
+    for c in all_candidates:
+        skills_str = "、".join(s.skill_name or "" for s in c.skills if s.skill_name)[:100]
+
+        core_skills = [s.skill_name for s in c.skills if s.is_core and s.skill_name][:8]
+        core_skills_str = "、".join(core_skills) if core_skills else "-"
+
+        work_str = "; ".join(
+            f"{w.company_name}({w.position or '-'})"
+            for w in (c.work_experiences or [])[:3]
+        )
+
+        projects = c.project_experiences[:2] if c.project_experiences else []
+        projects_str = "; ".join(
+            f"{p.project_name}（{p.project_role or '参与'}）"
+            for p in projects if p.project_name
+        ) or "-"
+
+        honors = [h.honor_name for h in (c.honors or []) if h.honor_name][:3]
+        honors_str = "、".join(honors) if honors else "-"
+
+        years_exp = "-"
+        if c.work_experiences:
+            from datetime import date as _date
+            total_months = 0
+            for w in c.work_experiences:
+                if w.start_date:
+                    end = w.end_date or _date.today()
+                    months = (end.year - w.start_date.year) * 12 + (end.month - w.start_date.month)
+                    total_months += max(0, months)
+            if total_months > 0:
+                years_exp = f"{round(total_months / 12, 1)}年"
+
+        candidate_dicts.append({
+            "candidate_id": c.candidate_id,
+            "name": c.name,
+            "education_level": c.education_level or "-",
+            "current_city": c.current_city or "-",
+            "position": c.work_experiences[0].position if c.work_experiences else "-",
+            "skills": skills_str or "-",
+            "core_skills": core_skills_str,
+            "work_summary": work_str or "-",
+            "years_of_experience": years_exp,
+            "projects": projects_str,
+            "honors": honors_str,
+        })
+    return candidate_dicts
+
+
+def _build_full_jd(pos) -> str:
+    """拼接岗位的完整 JD 文本（岗位职责 + 任职要求）。"""
+    parts = []
+    if pos.responsibilities:
+        parts.append(f"【岗位职责】\n{pos.responsibilities}")
+    if pos.job_requirements:
+        parts.append(f"【任职要求】\n{pos.job_requirements}")
+    return "\n\n".join(parts) if parts else pos.title
+
+
+def _diagnose_fk_failure(debug_logger, svc, position_id: int, failed_cid: int):
+    """首次保存失败时执行一次性 FK 诊断，结果写入调试日志。"""
+    from sqlalchemy import text
+    diag = {}
+    try:
+        sess = svc.session
+        diag["pragma_foreign_keys"] = sess.execute(text("PRAGMA foreign_keys")).scalar()
+
+        row = sess.execute(
+            text("SELECT candidate_id FROM candidates WHERE candidate_id = :cid"),
+            {"cid": failed_cid},
+        ).fetchone()
+        diag["candidate_exists_raw"] = row is not None
+
+        fk_issues = sess.execute(text("PRAGMA foreign_key_check(position_matches)")).fetchall()
+        diag["fk_check_issues"] = [list(r) for r in fk_issues[:20]] if fk_issues else []
+
+        tbl_info = sess.execute(text("SELECT sql FROM sqlite_master WHERE name='position_matches'")).scalar()
+        diag["table_ddl"] = tbl_info
+
+        cnt = sess.execute(text("SELECT COUNT(*) FROM candidates")).scalar()
+        diag["candidates_total"] = cnt
+
+        id_range = sess.execute(
+            text("SELECT MIN(candidate_id), MAX(candidate_id) FROM candidates")
+        ).fetchone()
+        diag["candidates_id_range"] = list(id_range) if id_range else []
+
+        sample_around = sess.execute(
+            text("SELECT candidate_id FROM candidates WHERE candidate_id BETWEEN :lo AND :hi ORDER BY candidate_id"),
+            {"lo": failed_cid - 5, "hi": failed_cid + 5},
+        ).fetchall()
+        diag["candidates_near_failed_id"] = [r[0] for r in sample_around]
+
+    except Exception as exc:
+        diag["diag_error"] = str(exc)
+
+    debug_logger.log("fk_diagnosis", f"首次保存失败的 FK 诊断 (candidate_id={failed_cid})", diag)
+
+
+def _run_single_position_match(pos, svc, ai_service, candidate_dicts) -> tuple[int, int, bool]:
+    """对单个岗位执行 AI 匹配（串行批次），返回 (save_ok, save_fail, timed_out)。"""
+    from recruitment_assistant.utils.match_debug_logger import MatchDebugLogger
+    from sqlalchemy import text
+
+    POSITION_MATCH_TIMEOUT = 180
+
+    # ✨ 创建独立的调试日志记录器
+    logger.info("[调试日志] 开始为岗位 {} (id={}) 创建调试日志", pos.title, pos.position_id)
+    debug_logger = MatchDebugLogger(pos.position_id, pos.title)
+    logger.info("[调试日志] MatchDebugLogger 已创建")
+
+    try:
+        svc.clear_position_matches(pos.position_id)
+        total = len(candidate_dicts)
+        if total == 0:
+            debug_logger.log("empty", "候选人列表为空，跳过匹配")
+            return 0, 0, False
+
+        # ✨ 验证数据一致性：获取数据库中实际存在的候选人ID集合
+        resume_session = create_resume_session()
+        try:
+            result = resume_session.execute(text("SELECT candidate_id FROM candidates"))
+            valid_ids = {row[0] for row in result.fetchall()}
+            logger.info("[数据验证] 数据库中实际有 {} 个候选人", len(valid_ids))
+            debug_logger.log("data_validation", f"数据库实际候选人数量: {len(valid_ids)}", {
+                "db_count": len(valid_ids),
+                "orm_count": total,
+                "id_sample": list(valid_ids)[:20] if valid_ids else []
+            })
+
+            # 过滤掉不存在的候选人
+            candidate_dicts = [c for c in candidate_dicts if c.get("candidate_id") in valid_ids]
+            filtered_count = len(candidate_dicts)
+            if filtered_count < total:
+                logger.warning("[数据验证] 过滤掉 {} 个不存在的候选人，剩余 {}",
+                              total - filtered_count, filtered_count)
+                debug_logger.log("data_filter", f"过滤掉不存在的候选人", {
+                    "original_count": total,
+                    "filtered_count": filtered_count,
+                    "removed_count": total - filtered_count
+                })
+
+            if filtered_count == 0:
+                debug_logger.log("empty_after_filter", "过滤后无有效候选人")
+                return 0, 0, False
+
+            total = filtered_count
+        finally:
+            resume_session.close()
+
+        chunk_size = max(3, min(20, total // 5))
+        full_jd = _build_full_jd(pos)
+
+        # ✨ 记录候选人数据
+        resume_session = create_resume_session()
+        try:
+            resume_svc = ResumeArchiveService(resume_session)
+            candidates_orm, _ = resume_svc.list_candidates(page=1, page_size=9999)
+            debug_logger.log_candidates(candidates_orm, candidate_dicts)
+        finally:
+            resume_session.close()
+
+        chunks = [candidate_dicts[i:i + chunk_size] for i in range(0, total, chunk_size)]
+        all_results = []
+        start_time = _time.monotonic()
+        timed_out = False
+        for chunk_idx, chunk in enumerate(chunks):
+            elapsed = _time.monotonic() - start_time
+            if elapsed > POSITION_MATCH_TIMEOUT:
+                logger.warning("[岗位匹配] 岗位 '{}' 超时(已用{:.0f}s>{}s)，已完成 {}/{} 批次",
+                               pos.title, elapsed, POSITION_MATCH_TIMEOUT, chunk_idx, len(chunks))
+                debug_logger.log("timeout", f"岗位匹配超时，已完成 {chunk_idx}/{len(chunks)} 批次")
+                timed_out = True
+                break
+            try:
+                # ✨ 传递 debug_logger 给 AI 服务
+                results = ai_service.match_candidates(full_jd, chunk, debug_logger=debug_logger)
+                all_results.extend(results)
+            except Exception as exc:
+                logger.warning("[岗位匹配] 批次失败({}): {}", pos.title, exc)
+                debug_logger.log_error(f"batch_{chunk_idx}", exc)
+
+        # ✨ 记录保存尝试
+        candidate_ids = [r.get("candidate_id") for r in all_results if r.get("candidate_id")]
+        debug_logger.log_save_attempt(len(all_results), candidate_ids)
+
+        save_ok, save_fail = 0, 0
+        failed_ids = []
+        fk_diagnosed = False
+        for r in all_results:
+            cid = r.get("candidate_id")
+            score = r.get("match_score", 0)
+            reason = r.get("reason", "")
+            dimensions = r.get("dimensions")
+            if cid and isinstance(score, (int, float)):
+                try:
+                    svc.save_position_match(
+                        pos.position_id, int(cid), int(score), reason,
+                        dimensions=dimensions,
+                    )
+                    save_ok += 1
+                except Exception as exc:
+                    save_fail += 1
+                    failed_ids.append(int(cid))
+                    debug_logger.log_error(f"save_candidate_{cid}", exc)
+
+                    if not fk_diagnosed:
+                        fk_diagnosed = True
+                        _diagnose_fk_failure(debug_logger, svc, pos.position_id, int(cid))
+
+        # ✨ 记录保存结果
+        debug_logger.log_save_result(save_ok, save_fail, failed_ids)
+
+        return save_ok, save_fail, timed_out
+
+    finally:
+        # ✨ 完成日志记录并保存
+        log_path = debug_logger.finalize()
+        logger.info("[调试日志] 匹配调试日志已保存: {}", log_path)
+
+
 # ---------- Excel 批量导入工具函数 ----------
 
 def _parse_jd_sections(jd_text: str) -> tuple[str, str]:
@@ -1285,6 +1512,21 @@ def _open_edit_position_dialog():
         pg_session.close()
 
 
+@st.dialog("确认清除")
+def _confirm_clear_all_matches():
+    st.warning("该操作会清除所有岗位的已匹配信息，是否确认清除?")
+    cols = st.columns(2)
+    if cols[0].button("确认清除", type="primary", use_container_width=True, key="confirm_clear_all"):
+        session_tmp = create_resume_session()
+        svc_tmp = ResumeArchiveService(session_tmp)
+        for pos in st.session_state.get("_all_positions", []):
+            svc_tmp.clear_position_matches(pos.position_id)
+        session_tmp.close()
+        logger.info("[清除匹配] 已清除所有岗位的匹配数据")
+        st.rerun()
+    if cols[1].button("取消", use_container_width=True, key="cancel_clear_all"):
+        st.rerun()
+
 with tabs[2]:
     st.markdown("### 招聘岗位录入/匹配")
 
@@ -1374,6 +1616,56 @@ with tabs[2]:
         # ---- 左栏：岗位 expander 列表 ----
         with pos_col:
             st.markdown("**招聘岗位**")
+
+            # ---- 批量匹配：多选岗位（最多5个）----
+            is_running = st.session_state.get("auto_match_running", False)
+
+            if not is_running:
+                # 构建选项列表，处理重名岗位
+                _seen_titles: dict[str, int] = {}
+                _pos_labels: list[str] = []
+                _label_to_id: dict[str, int] = {}
+                for p in positions:
+                    _seen_titles[p.title] = _seen_titles.get(p.title, 0) + 1
+                _dup_titles = {t for t, c in _seen_titles.items() if c > 1}
+                for p in positions:
+                    label = f"{p.title} (ID:{p.position_id})" if p.title in _dup_titles else p.title
+                    _pos_labels.append(label)
+                    _label_to_id[label] = p.position_id
+
+                selected_labels = st.multiselect(
+                    "选择要匹配的岗位（最多5个）",
+                    options=_pos_labels,
+                    max_selections=5,
+                    key="batch_match_selected",
+                )
+                selected_ids = [_label_to_id[lb] for lb in selected_labels]
+
+            btn_cols = st.columns(2)
+            with btn_cols[0]:
+                if is_running:
+                    if st.button("⏹ 停止自动匹配", type="secondary", use_container_width=True,
+                                 key="stop_auto_match"):
+                        st.session_state["auto_match_running"] = False
+                        st.session_state.pop("auto_match_candidates", None)
+                        logger.info("[自动匹配] 用户手动停止")
+                        st.rerun()
+                else:
+                    btn_label = f"🚀 开始匹配（{len(selected_ids)}个岗位）" if selected_ids else "🚀 开始匹配"
+                    if st.button(btn_label, type="primary", use_container_width=True,
+                                 key="start_auto_match",
+                                 disabled=not selected_ids or not ai_service.is_configured):
+                        st.session_state["auto_match_running"] = True
+                        st.session_state["auto_match_queue"] = selected_ids
+                        st.session_state["auto_match_done"] = 0
+                        st.session_state["auto_match_total"] = len(selected_ids)
+                        logger.info("[自动匹配] 开始，共 {} 个岗位: {}", len(selected_ids), selected_ids)
+                        st.rerun()
+            with btn_cols[1]:
+                if st.button("🗑️ 清除所有匹配", use_container_width=True,
+                             key="clear_all_matches", disabled=is_running):
+                    st.session_state["_all_positions"] = positions
+                    _confirm_clear_all_matches()
             # 缩小左栏岗位 expander 内的 markdown / caption 字体（保留 streamlit 原生排版）
             st.markdown(
                 """<style>
@@ -1485,130 +1777,77 @@ with tabs[2]:
                 resume_session = create_resume_session()
                 svc = ResumeArchiveService(resume_session)
 
+                # ---- 自动匹配逻辑（逐岗位 rerun 模式）----
+                if st.session_state.get("auto_match_running"):
+                    queue = st.session_state.get("auto_match_queue", [])
+                    done = st.session_state.get("auto_match_done", 0)
+                    total = st.session_state.get("auto_match_total", 1)
+
+                    st.progress(done / total if total > 0 else 0)
+
+                    if queue:
+                        current_id = queue[0]
+                        current_pos = next((p for p in positions if p.position_id == current_id), None)
+
+                        try:
+                            if current_pos:
+                                st.info(f"正在匹配 {done + 1}/{total}：{current_pos.title}")
+                                if "auto_match_candidates" not in st.session_state:
+                                    all_cands, _ = svc.list_candidates(page=1, page_size=10000)
+                                    st.session_state["auto_match_candidates"] = _build_candidate_dicts(all_cands)
+
+                                cand_dicts = st.session_state["auto_match_candidates"]
+                                save_ok, save_fail, timed_out = _run_single_position_match(
+                                    current_pos, svc, ai_service, cand_dicts
+                                )
+                                logger.info("[自动匹配] {}/{} 完成: {} — 保存 {} 条, 失败 {} 条{}",
+                                            done + 1, total, current_pos.title, save_ok, save_fail,
+                                            ", 超时截断" if timed_out else "")
+                                if save_fail > 0:
+                                    st.warning(f"岗位「{current_pos.title}」有 {save_fail} 条匹配结果保存失败。调试日志已保存到 logs/match_debug/ 目录")
+                                if timed_out:
+                                    st.warning(f"岗位「{current_pos.title}」匹配超时（>180s），已保存部分结果，继续下一个岗位")
+                        except Exception as exc:
+                            logger.error("[自动匹配] 岗位 '{}' 异常终止: {}", current_pos.title if current_pos else current_id, exc)
+                            st.error(f"岗位匹配出错：{exc}")
+
+                        st.session_state["auto_match_queue"] = queue[1:]
+                        st.session_state["auto_match_done"] = done + 1
+                        st.rerun()
+                    else:
+                        st.session_state["auto_match_running"] = False
+                        st.session_state.pop("auto_match_candidates", None)
+                        logger.info("[自动匹配] 全部完成，共 {} 个岗位", total)
+                        st.balloons()
+                        st.rerun()
+
                 # 如果左栏触发了匹配，执行 AI 评估
                 if st.session_state.pop("trigger_match", None) == sel_pos.position_id:
                     all_candidates, _ = svc.list_candidates(page=1, page_size=10000)
-                    candidate_dicts = []
-                    for c in all_candidates:
-                        # 技能摘要
-                        skills_str = "、".join(s.skill_name or "" for s in c.skills if s.skill_name)[:100]
+                    candidate_dicts = _build_candidate_dicts(all_candidates)
+                    logger.info("[手动匹配] 岗位='{}' (id={}), 候选人={}, 候选人摘要={}",
+                                sel_pos.title, sel_pos.position_id,
+                                len(all_candidates), len(candidate_dicts))
 
-                        # ✨ 核心技能（is_core=1）
-                        core_skills = [s.skill_name for s in c.skills if s.is_core and s.skill_name][:8]
-                        core_skills_str = "、".join(core_skills) if core_skills else "-"
-
-                        # 工作经历摘要
-                        work_str = "; ".join(
-                            f"{w.company_name}({w.position or '-'})"
-                            for w in (c.work_experiences or [])[:3]
-                        )
-
-                        # ✨ 核心项目经验（最近2个）
-                        projects = c.project_experiences[:2] if c.project_experiences else []
-                        projects_str = "; ".join(
-                            f"{p.project_name}（{p.project_role or '参与'}）"
-                            for p in projects if p.project_name
-                        ) or "-"
-
-                        # ✨ 荣誉证书（前3条）
-                        honors = [h.honor_name for h in (c.honors or []) if h.honor_name][:3]
-                        honors_str = "、".join(honors) if honors else "-"
-
-                        # ✨ 工作年限估算
-                        years_exp = "-"
-                        if c.work_experiences:
-                            from datetime import date
-                            total_months = 0
-                            for w in c.work_experiences:
-                                if w.start_date:
-                                    end = w.end_date or date.today()
-                                    months = (end.year - w.start_date.year) * 12 + (end.month - w.start_date.month)
-                                    total_months += max(0, months)
-                            if total_months > 0:
-                                years_exp = f"{round(total_months / 12, 1)}年"
-
-                        candidate_dicts.append({
-                            "candidate_id": c.candidate_id,
-                            "name": c.name,
-                            "education_level": c.education_level or "-",
-                            "current_city": c.current_city or "-",
-                            "position": c.work_experiences[0].position if c.work_experiences else "-",
-                            "skills": skills_str or "-",
-                            "core_skills": core_skills_str,
-                            "work_summary": work_str or "-",
-                            "years_of_experience": years_exp,
-                            "projects": projects_str,
-                            "honors": honors_str,
-                        })
-                    svc.clear_position_matches(sel_pos.position_id)
-                    total = len(candidate_dicts)
-                    chunk_size = max(3, min(20, total // 5))
+                    # ✨ 使用统一的匹配函数（包含调试日志）
                     progress_bar = st.progress(0)
                     status_text = st.empty()
+                    status_text.markdown(f"AI 正在评估候选人匹配度…")
 
-                    # ✨ 并行批次匹配优化
-                    from concurrent.futures import ThreadPoolExecutor, as_completed
+                    save_ok, save_fail, timed_out = _run_single_position_match(
+                        sel_pos, svc, ai_service, candidate_dicts
+                    )
 
-                    chunks = [candidate_dicts[i:i + chunk_size] for i in range(0, total, chunk_size)]
-                    all_results = []
-                    completed = 0
-
-                    # 拼接完整 JD：岗位职责 + 任职要求
-                    jd_parts = []
-                    if sel_pos.responsibilities:
-                        jd_parts.append(f"【岗位职责】\n{sel_pos.responsibilities}")
-                    if sel_pos.job_requirements:
-                        jd_parts.append(f"【任职要求】\n{sel_pos.job_requirements}")
-                    full_jd = "\n\n".join(jd_parts) if jd_parts else sel_pos.title
-
-                    with ThreadPoolExecutor(max_workers=3) as executor:
-                        # 提交所有批次任务
-                        future_to_chunk = {
-                            executor.submit(
-                                ai_service.match_candidates,
-                                full_jd,
-                                chunk
-                            ): idx for idx, chunk in enumerate(chunks)
-                        }
-
-                        # 收集结果（按完成顺序）
-                        for future in as_completed(future_to_chunk):
-                            try:
-                                results = future.result()
-                                all_results.extend(results)
-                                completed += 1
-                                processed = min(completed * chunk_size, total)
-                                status_text.markdown(f"AI 正在评估候选人匹配度… **{processed}/{total}**")
-                                progress_bar.progress(processed / total if total > 0 else 0)
-                            except Exception as exc:
-                                st.error(f"批次匹配失败: {exc}")
-
-                    progress_bar.progress(1.0)
-                    status_text.markdown(f"AI 评估完成 **{total}/{total}**，正在保存…")
-                    save_ok, save_fail = 0, 0
-                    for r in all_results:
-                        cid = r.get("candidate_id")
-                        score = r.get("match_score", 0)
-                        reason = r.get("reason", "")
-                        dimensions = r.get("dimensions")
-                        if cid and isinstance(score, (int, float)):
-                            try:
-                                svc.save_position_match(
-                                    sel_pos.position_id,
-                                    int(cid),
-                                    int(score),
-                                    reason,
-                                    dimensions=dimensions,
-                                )
-                                save_ok += 1
-                            except Exception as exc:
-                                save_fail += 1
-                                if save_fail <= 3:
-                                    st.toast(f"保存失败 (cid={cid}): {exc}", icon="⚠️")
                     progress_bar.empty()
                     status_text.empty()
-                    st.success(f"AI 匹配完成：评估 {len(all_results)} 人，保存 {save_ok} 条"
-                               + (f"，失败 {save_fail} 条" if save_fail else ""))
+
+                    if save_fail > 0:
+                        st.warning(f"AI 匹配完成：保存 {save_ok} 条，失败 {save_fail} 条"
+                                   + (f"（匹配超时）" if timed_out else "")
+                                   + "\n\n💡 **提示**：调试日志已保存在 logs/match_debug/ 目录，可用于远程排查问题")
+                    else:
+                        st.success(f"AI 匹配完成：保存 {save_ok} 条"
+                                   + (f"（匹配超时）" if timed_out else ""))
                     st.rerun()
 
                 # 展示匹配结果 Banner

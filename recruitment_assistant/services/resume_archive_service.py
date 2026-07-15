@@ -287,26 +287,35 @@ class ResumeArchiveService:
         reason: str,
         dimensions: dict | None = None,
     ) -> None:
-        """保存岗位匹配结果，支持多维度评分"""
-        try:
-            match_data = {
-                "position_id": position_id,
-                "candidate_id": candidate_id,
-                "score": score,
-                "reason": reason,
-            }
-            # ✨ 添加多维度评分
-            if dimensions:
-                match_data["skill_match"] = dimensions.get("skill_match")
-                match_data["experience_match"] = dimensions.get("experience_match")
-                match_data["education_match"] = dimensions.get("education_match")
-                match_data["location_match"] = dimensions.get("location_match")
+        """保存岗位匹配结果，使用原始 SQL 绕过可能存在的 FK 架构问题。
 
-            self.session.merge(PositionMatch(**match_data))
-            self.session.commit()
-        except Exception:
-            self.session.rollback()
-            raise
+        position_id 引用 PostgreSQL (跨库)，candidate_id 已在调用方预验证。
+        """
+        import sqlite3
+        from recruitment_assistant.storage.resume_db import RESUME_DB_PATH
+
+        params = (
+            position_id,
+            candidate_id,
+            score,
+            reason,
+            dimensions.get("skill_match") if dimensions else None,
+            dimensions.get("experience_match") if dimensions else None,
+            dimensions.get("education_match") if dimensions else None,
+            dimensions.get("location_match") if dimensions else None,
+        )
+        conn = sqlite3.connect(str(RESUME_DB_PATH))
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO position_matches"
+                " (position_id, candidate_id, score, reason,"
+                "  skill_match, experience_match, education_match, location_match)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                params,
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
     def list_position_matches(self, position_id: int, min_score: int = 50) -> list[tuple]:
         stmt = (

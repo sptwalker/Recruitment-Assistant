@@ -2,7 +2,7 @@
 ; Compile with Inno Setup 6: https://jrsoftware.org/isinfo.php
 
 #define MyAppName "简历智采助手"
-#define MyAppVersion "3.05"
+#define MyAppVersion "3.14"
 #define MyAppPublisher "Resume AI Collector"
 #define MyAppURL "https://github.com/sptwalker/Recruitment-Assistant"
 #define MyAppExeName "launcher.pyw"

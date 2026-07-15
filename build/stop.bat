@@ -1,8 +1,8 @@
 @echo off
 cd /d "%~dp0"
 echo Stopping Streamlit...
-taskkill /F /IM python.exe /FI "WINDOWTITLE eq *streamlit*" >nul 2>&1
-taskkill /F /IM pythonw.exe /FI "WINDOWTITLE eq *streamlit*" >nul 2>&1
+REM 按端口杀：Streamlit 无窗口运行，靠窗口标题杀不掉，只能按占用 8501 的 PID 杀
+for /f "tokens=5" %%p in ('netstat -ano ^| findstr ":8501" ^| findstr "LISTENING"') do taskkill /F /PID %%p >nul 2>&1
 
 echo Stopping PostgreSQL...
 set "PGCTL="

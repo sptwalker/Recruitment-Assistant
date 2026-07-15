@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import re
+import time as _time
 from datetime import datetime
 
 from loguru import logger
@@ -316,34 +317,35 @@ class ResumeAIService:
         return content.strip()
 
     def match_candidates(
-        self, position_requirements: str, candidates: list[dict]
+        self, position_requirements: str, candidates: list[dict], debug_logger=None
     ) -> list[dict]:
         """AI 匹配岗位需求与候选人列表，返回全部候选人的评分结果。
 
-        每个 candidate dict 应包含：candidate_id, name, education_level, current_city,
-        position (最近职位), skills (技能摘要), work_summary (工作经历摘要)。
-        返回：[{
-            "candidate_id": int,
-            "match_score": 0-100,
-            "dimensions": {
-                "skill_match": 0-100,
-                "experience_match": 0-100,
-                "education_match": 0-100,
-                "location_match": 0-100
-            },
-            "reason": str
-        }, ...]
+        Args:
+            position_requirements: 岗位要求描述
+            candidates: 候选人字典列表
+            debug_logger: 可选的 MatchDebugLogger 实例，用于记录调试信息
         """
         if not self.is_configured:
             raise RuntimeError("AI API Key 未配置")
+
+        logger.info("[岗位匹配] ===== 开始匹配 =====")
+        logger.info("[岗位匹配] 模型={}, base_url={}", self.model, self.base_url)
+        logger.info("[岗位匹配] 候选人数量: {}", len(candidates))
+        logger.info("[岗位匹配] JD 前200字: {}", position_requirements[:200])
+
+        if debug_logger:
+            debug_logger.log_ai_request(0, len(candidates), position_requirements[:200])
+
         candidates_text = "\n".join(
             f"ID={c.get('candidate_id')} 姓名={c.get('name')} "
             f"学历={c.get('education_level', '-')} 城市={c.get('current_city', '-')} "
             f"最近职位={c.get('position', '-')} 技能={c.get('skills', '-')} "
-            f"工作摘要={c.get('work_summary', '-')}"
+            f"核心技能={c.get('core_skills', '-')} 工作年限={c.get('years_of_experience', '-')} "
+            f"工作摘要={c.get('work_summary', '-')} "
+            f"项目经验={c.get('projects', '-')} 荣誉证书={c.get('honors', '-')}"
             for c in candidates
         )
-        # ✨ 多维度评分 Prompt
         prompt = (
             f"岗位要求：\n{position_requirements}\n\n"
             f"候选人列表（共 {len(candidates)} 人）：\n{candidates_text}\n\n"
@@ -352,8 +354,8 @@ class ResumeAIService:
             "2. experience_match (经验匹配度): 工作经验与岗位要求的匹配程度\n"
             "3. education_match (学历匹配度): 学历背景与岗位要求的匹配程度\n"
             "4. location_match (地域匹配度): 工作城市与岗位地点的匹配程度\n\n"
-            "输出完整 JSON 数组，包含所有候选人：\n"
-            '[{\n'
+            "严格输出 JSON 对象，不要输出任何其他文字。格式：\n"
+            '{"results": [{\n'
             '  "candidate_id": ID,\n'
             '  "match_score": 综合得分(0-100),\n'
             '  "dimensions": {\n'
@@ -363,44 +365,165 @@ class ResumeAIService:
             '    "location_match": 分数\n'
             '  },\n'
             '  "reason": "一句话综合评语"\n'
-            '}]'
+            '}]}'
         )
-        try:
-            resp = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": "你是招聘匹配助手。对每位候选人进行多维度评估（技能/经验/学历/地域），输出完整 JSON 数组，不要遗漏任何候选人。"},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.2,
-                timeout=120,
-            )
-            content = resp.choices[0].message.content.strip()
-            if content.startswith("```"):
-                content = content.split("\n", 1)[1] if "\n" in content else content[3:]
-            if content.endswith("```"):
-                content = content[:-3]
-            results = json.loads(content.strip())
-            if isinstance(results, dict) and "candidates" in results:
-                results = results["candidates"]
-            if isinstance(results, dict) and "results" in results:
-                results = results["results"]
+        logger.info("[岗位匹配] Prompt 总长度: {} 字符", len(prompt))
 
-            # ✨ 向后兼容：如果 AI 没有返回 dimensions，自动填充默认值
-            for r in results if isinstance(results, list) else []:
-                if "dimensions" not in r:
-                    score = r.get("match_score", 50)
-                    r["dimensions"] = {
-                        "skill_match": score,
-                        "experience_match": score,
-                        "education_match": score,
-                        "location_match": score,
-                    }
+        MATCH_TIMEOUT = 60
+        MATCH_MAX_RETRIES = 2
+        MATCH_RETRY_BACKOFF = [3, 6]
 
-            return results if isinstance(results, list) else []
-        except Exception as exc:
-            logger.error("AI 岗位匹配失败：{}", exc)
+        from openai import APIConnectionError, APIStatusError, APITimeoutError, RateLimitError
+
+        resp = None
+        for attempt in range(MATCH_MAX_RETRIES + 1):
+            try:
+                logger.info("[岗位匹配] 正在调用 AI API... (第{}次尝试)", attempt + 1)
+                resp = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": "你是招聘匹配助手。对每位候选人进行多维度评估（技能/经验/学历/地域），严格只输出 JSON，不要输出任何解释文字。"},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.2,
+                    timeout=MATCH_TIMEOUT,
+                    response_format={"type": "json_object"},
+                )
+                break
+            except (APITimeoutError, APIConnectionError, RateLimitError) as exc:
+                if attempt < MATCH_MAX_RETRIES:
+                    wait = MATCH_RETRY_BACKOFF[attempt]
+                    logger.warning("[岗位匹配] 第{}次重试 (等{}s): {} — {}",
+                                   attempt + 1, wait, type(exc).__name__, exc)
+                    _time.sleep(wait)
+                    continue
+                logger.error("[岗位匹配] 重试耗尽, 最终失败: {} — {}", type(exc).__name__, exc)
+                raise
+            except APIStatusError as exc:
+                if exc.status_code >= 500 and attempt < MATCH_MAX_RETRIES:
+                    wait = MATCH_RETRY_BACKOFF[attempt]
+                    logger.warning("[岗位匹配] 服务端错误 {} 第{}次重试 (等{}s): {}",
+                                   exc.status_code, attempt + 1, wait, exc)
+                    _time.sleep(wait)
+                    continue
+                logger.error("[岗位匹配] API 错误 {}: {}", exc.status_code, exc)
+                raise
+            except Exception as exc:
+                logger.error("[岗位匹配] AI 调用异常: {} — {}", type(exc).__name__, exc)
+                import traceback
+                logger.error("[岗位匹配] 完整堆栈:\n{}", traceback.format_exc())
+                raise
+
+        content = resp.choices[0].message.content
+        logger.info("[岗位匹配] AI 返回 content 类型={}, 长度={}",
+                    type(content).__name__, len(content) if content else 0)
+        if not content:
+            logger.error("[岗位匹配] AI 返回 content 为空!")
             return []
+
+        content = content.strip()
+        logger.info("[岗位匹配] AI 原始返回全文:\n{}", content)
+
+        finish_reason = resp.choices[0].finish_reason if resp.choices else "unknown"
+        logger.info("[岗位匹配] finish_reason={}", finish_reason)
+        if resp.usage:
+            logger.info("[岗位匹配] tokens: prompt={}, completion={}, total={}",
+                        resp.usage.prompt_tokens, resp.usage.completion_tokens, resp.usage.total_tokens)
+
+        results = self._extract_match_results(content)
+
+        if debug_logger:
+            debug_logger.log_ai_response(0, results)
+
+        for r in results:
+            if "dimensions" not in r:
+                score = r.get("match_score", 50)
+                r["dimensions"] = {
+                    "skill_match": score,
+                    "experience_match": score,
+                    "education_match": score,
+                    "location_match": score,
+                }
+
+        logger.info("[岗位匹配] 解析结果: {} 条匹配记录", len(results))
+        if results:
+            first = results[0]
+            logger.info("[岗位匹配] 首条示例: candidate_id={}, score={}, reason={}",
+                        first.get("candidate_id"), first.get("match_score"),
+                        str(first.get("reason", ""))[:80])
+        logger.info("[岗位匹配] ===== 匹配结束 =====")
+        return results
+
+    @staticmethod
+    def _extract_match_results(content: str) -> list[dict]:
+        """从 AI 返回内容中提取匹配结果列表，兼容多种格式。"""
+        import re
+
+        if content.startswith("```"):
+            content = content.split("\n", 1)[1] if "\n" in content else content[3:]
+        if content.endswith("```"):
+            content = content[:-3]
+        content = content.strip()
+        if content.startswith("json"):
+            content = content[4:].strip()
+
+        try:
+            parsed = json.loads(content)
+            logger.info("[岗位匹配] JSON 解析成功, 类型={}", type(parsed).__name__)
+            if isinstance(parsed, list):
+                logger.info("[岗位匹配] 直接为数组, 长度={}", len(parsed))
+                return parsed
+            if isinstance(parsed, dict):
+                logger.info("[岗位匹配] 为字典, keys={}", list(parsed.keys()))
+                for key in ("results", "candidates", "data", "items"):
+                    if key in parsed and isinstance(parsed[key], list):
+                        logger.info("[岗位匹配] 从 key='{}' 提取, 长度={}", key, len(parsed[key]))
+                        return parsed[key]
+                for k, v in parsed.items():
+                    if isinstance(v, list):
+                        logger.info("[岗位匹配] 从首个 list key='{}' 提取, 长度={}", k, len(v))
+                        return v
+                logger.warning("[岗位匹配] 字典中未找到任何 list 值")
+            return []
+        except json.JSONDecodeError as e:
+            logger.warning("[岗位匹配] 直接 JSON 解析失败: {}", e)
+            if isinstance(parsed, list):
+                return parsed
+            if isinstance(parsed, dict):
+                for key in ("results", "candidates", "data", "items"):
+                    if key in parsed and isinstance(parsed[key], list):
+                        return parsed[key]
+                # dict 只有一个 list 值
+                for v in parsed.values():
+                    if isinstance(v, list):
+                        return v
+            return []
+        except json.JSONDecodeError:
+            pass
+
+        # 回退：用正则提取最大的 JSON 数组或对象
+        arrays = re.findall(r'\[[\s\S]*\]', content)
+        for arr in sorted(arrays, key=len, reverse=True):
+            try:
+                parsed = json.loads(arr)
+                if isinstance(parsed, list):
+                    return parsed
+            except json.JSONDecodeError:
+                continue
+
+        objects = re.findall(r'\{[\s\S]*\}', content)
+        for obj in sorted(objects, key=len, reverse=True):
+            try:
+                parsed = json.loads(obj)
+                if isinstance(parsed, dict):
+                    for key in ("results", "candidates", "data", "items"):
+                        if key in parsed and isinstance(parsed[key], list):
+                            return parsed[key]
+            except json.JSONDecodeError:
+                continue
+
+        logger.warning("[岗位匹配] 无法从 AI 返回中提取 JSON: {}", content[:300])
+        return []
 
     _OUTLINE_SYSTEM_PROMPT = """\
 你是资深企业招聘面试官 & 人才测评专家，精通胜任力模型、STAR 行为面试法、结构化面试设计，擅长基于岗位真实需求和候选人个人简历，定制可直接现场使用的专属面试大纲。

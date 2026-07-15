@@ -1,0 +1,19 @@
+{
+  "active": "ff32d03b",
+  "profiles": [
+    {
+      "id": "ff32d03b",
+      "name": "DeepSeek",
+      "api_key": "sk-048349775c2e45b9a0d2c25940cb2c80",
+      "base_url": "https://api.deepseek.com/v1",
+      "model": "deepseek-chat"
+    },
+    {
+      "id": "b447a802",
+      "name": "MinMax",
+      "api_key": "sk-cp-7qBWkbKK-TupRvnub9CiZ5Z3L1lRgMfVnZTEK5tkfdZrgh2MTbqJxXKKvJrONQp7PBp_L4AYFrCIoyOX-pO7zX2am4yfuR_5yGSWtcVdzLidWrOfQt68ds4",
+      "base_url": "https://api.minimaxi.com/v1",
+      "model": "MiniMax-Text-01"
+    }
+  ]
+}

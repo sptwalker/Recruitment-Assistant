@@ -19,6 +19,14 @@ from components.theme_preview import (
     parse_theme_variables,
 )
 from recruitment_assistant.config.settings import get_settings
+from recruitment_assistant.config.ai_model_manager import (
+    PRESETS as AI_PRESETS,
+    load_profiles,
+    add_profile,
+    update_profile,
+    delete_profile,
+    set_active_profile,
+)
 
 
 st.set_page_config(page_title="系统设置", layout="wide", initial_sidebar_state="collapsed")
@@ -126,56 +134,117 @@ tabs = st.tabs(["AI模型", "主题风格"])
 
 with tabs[0]:
     st.caption("用于简历结构化解析、岗位匹配等 AI 功能。支持 DeepSeek / 通义千问 / OpenAI 等兼容 OpenAI 格式的 API。")
-    env_path = Path(".env")
-    env_lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
 
-    def _get_env_value(key: str) -> str:
-        for line in env_lines:
-            if line.strip().startswith(f"{key}="):
-                return line.split("=", 1)[1].strip().strip('"').strip("'")
-        return ""
+    data = load_profiles()
+    profiles = data.get("profiles", [])
+    active_id = data.get("active", "")
 
-    current_key = _get_env_value("AI_API_KEY")
-    current_url = _get_env_value("AI_BASE_URL") or "https://api.deepseek.com/v1"
-    current_model = _get_env_value("AI_MODEL") or "deepseek-chat"
-
-    api_key_col, api_test_col = st.columns([0.78, 0.22])
-    with api_key_col:
-        ai_api_key = st.text_input(
-            "API Key", value=current_key, type="password", key="ai_api_key_input",
-            help="DeepSeek / 通义千问 / OpenAI 的 API Key",
+    # ---- 当前使用模型 切换 ----
+    if profiles:
+        profile_names = [p["name"] for p in profiles]
+        active_idx = next((i for i, p in enumerate(profiles) if p["id"] == active_id), 0)
+        chosen_idx = st.selectbox(
+            "当前使用模型",
+            range(len(profiles)),
+            index=active_idx,
+            format_func=lambda i: f"✅ {profiles[i]['name']}（{profiles[i]['model']}）" if profiles[i]["id"] == active_id else f"{profiles[i]['name']}（{profiles[i]['model']}）",
+            key="ai_active_select",
         )
-    api_test_col.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
-    test_ai_api_clicked = api_test_col.button("API检测", key="test_ai_api_key", use_container_width=True)
-    presets = {
-        "DeepSeek": ("https://api.deepseek.com/v1", "deepseek-chat"),
-        "通义千问": ("https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen-plus"),
-        "OpenAI": ("https://api.openai.com/v1", "gpt-4o-mini"),
-        "自定义": (current_url, current_model),
-    }
-    preset_choice = st.selectbox(
-        "预设模型", list(presets.keys()), key="ai_preset",
-        index=0 if "deepseek" in current_url else (1 if "dashscope" in current_url else (2 if "openai" in current_url else 3)),
-    )
-    preset_url, preset_model = presets[preset_choice]
-    ai_base_url = st.text_input("API Base URL", value=preset_url, key="ai_base_url_input")
-    ai_model = st.text_input("模型名称", value=preset_model, key="ai_model_input")
-    if test_ai_api_clicked:
-        st.session_state["ai_api_test_config"] = {"api_key": ai_api_key, "base_url": ai_base_url, "model": ai_model}
-        open_ai_api_key_test_dialog()
+        if profiles[chosen_idx]["id"] != active_id:
+            set_active_profile(profiles[chosen_idx]["id"])
+            st.toast(f"已切换到 **{profiles[chosen_idx]['name']}**", icon="✅")
+            st.rerun()
 
-    if st.button("保存 AI 配置", key="save_ai_config"):
-        new_env = {"AI_API_KEY": ai_api_key, "AI_BASE_URL": ai_base_url, "AI_MODEL": ai_model}
-        existing = {}
-        if env_path.exists():
-            for line in env_path.read_text(encoding="utf-8").splitlines():
-                if "=" in line and not line.strip().startswith("#"):
-                    k, v = line.split("=", 1)
-                    existing[k.strip()] = v.strip()
-        existing.update(new_env)
-        env_path.write_text("\n".join(f"{k}={v}" for k, v in existing.items()) + "\n", encoding="utf-8")
-        get_settings.cache_clear()
-        st.success("AI 配置已保存，配置缓存已刷新。")
+    st.divider()
+
+    # ---- 模型列表 ----
+    st.markdown("**已配置模型**")
+    if not profiles:
+        st.info("暂无模型配置，请在下方添加。")
+
+    for idx, prof in enumerate(profiles):
+        is_active = prof["id"] == active_id
+        label = f"{'✅ ' if is_active else ''}{prof['name']}（{prof['model']}）"
+        with st.expander(label, expanded=False):
+            p_name = st.text_input("名称", value=prof["name"], key=f"pname_{prof['id']}")
+            key_col, test_col = st.columns([0.78, 0.22])
+            with key_col:
+                p_key = st.text_input("API Key", value=prof["api_key"], type="password", key=f"pkey_{prof['id']}")
+            test_col.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+            test_clicked = test_col.button("API检测", key=f"ptest_{prof['id']}", use_container_width=True)
+            p_url = st.text_input("API Base URL", value=prof["base_url"], key=f"purl_{prof['id']}")
+            p_model = st.text_input("模型名称", value=prof["model"], key=f"pmodel_{prof['id']}")
+
+            if test_clicked:
+                st.session_state["ai_api_test_config"] = {"api_key": p_key, "base_url": p_url, "model": p_model}
+                open_ai_api_key_test_dialog()
+
+            btn_cols = st.columns(3)
+            if btn_cols[0].button("💾 保存修改", key=f"psave_{prof['id']}", use_container_width=True):
+                update_profile(prof["id"], name=p_name, api_key=p_key, base_url=p_url, model=p_model)
+                st.toast(f"**{p_name}** 配置已保存", icon="✅")
+                st.rerun()
+            if not is_active:
+                if btn_cols[1].button("✅ 设为当前", key=f"pactivate_{prof['id']}", use_container_width=True):
+                    set_active_profile(prof["id"])
+                    st.session_state["ai_active_select"] = idx
+                    st.toast(f"已切换到 **{prof['name']}**", icon="✅")
+                    st.rerun()
+            else:
+                btn_cols[1].button("当前使用中", key=f"pactivate_{prof['id']}", use_container_width=True, disabled=True)
+            if btn_cols[2].button("🗑️ 删除", key=f"pdel_{prof['id']}", use_container_width=True):
+                if is_active and len(profiles) <= 1:
+                    st.warning("至少保留一个模型配置")
+                else:
+                    delete_profile(prof["id"])
+                    st.toast(f"已删除 **{prof['name']}**")
+                    st.rerun()
+
+    st.divider()
+
+    # ---- 添加新模型 ----
+    with st.expander("➕ 添加新模型", expanded=not profiles):
+        preset_options = list(AI_PRESETS.keys()) + ["自定义"]
+        new_preset = st.selectbox("预设模型", preset_options, key="new_ai_preset")
+
+        if new_preset != st.session_state.get("_prev_ai_preset"):
+            st.session_state["_prev_ai_preset"] = new_preset
+            if new_preset in AI_PRESETS:
+                st.session_state["new_prof_name"] = new_preset
+                st.session_state["new_prof_url"] = AI_PRESETS[new_preset][0]
+                st.session_state["new_prof_model"] = AI_PRESETS[new_preset][1]
+            else:
+                st.session_state["new_prof_name"] = ""
+                st.session_state["new_prof_url"] = ""
+                st.session_state["new_prof_model"] = ""
+            st.rerun()
+
+        if new_preset in AI_PRESETS:
+            default_url, default_model = AI_PRESETS[new_preset]
+            default_name = new_preset
+        else:
+            default_url, default_model = "", ""
+            default_name = ""
+        new_name = st.text_input("模型名称（自定义标签）", value=default_name, key="new_prof_name")
+        new_key = st.text_input("API Key", type="password", key="new_prof_key")
+        new_url = st.text_input("API Base URL", value=default_url, key="new_prof_url")
+        new_model = st.text_input("模型名称（model）", value=default_model, key="new_prof_model")
+
+        if st.button("➕ 添加模型", type="primary", key="add_new_profile"):
+            if not new_name.strip():
+                st.warning("请填写模型名称")
+            elif not new_key.strip():
+                st.warning("请填写 API Key")
+            elif not new_url.strip():
+                st.warning("请填写 API Base URL")
+            elif not new_model.strip():
+                st.warning("请填写模型名称")
+            else:
+                prof = add_profile(new_name.strip(), new_key.strip(), new_url.strip(), new_model.strip())
+                if len(load_profiles()["profiles"]) == 1:
+                    set_active_profile(prof["id"])
+                st.toast(f"已添加 **{new_name}**", icon="✅")
+                st.rerun()
 
 
 with tabs[1]:

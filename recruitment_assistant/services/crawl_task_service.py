@@ -1,33 +1,10 @@
 from datetime import datetime
 
-from sqlalchemy import BigInteger, Column, DateTime, Integer, MetaData, String, Table, Text, delete, func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session
 
 from recruitment_assistant.storage.db import engine
 from recruitment_assistant.storage.models import BossCandidateRecord, CrawlTask
-
-metadata = MetaData()
-platform_candidate_record = Table(
-    "platform_candidate_record",
-    metadata,
-    Column("id", BigInteger, primary_key=True, autoincrement=True),
-    Column("platform_code", String(32), nullable=False, index=True),
-    Column("target_site", String(64), nullable=False, index=True),
-    Column("candidate_key", String(64), nullable=False, index=True),
-    Column("candidate_signature", String(512)),
-    Column("name", String(128), index=True),
-    Column("gender", String(16)),
-    Column("job_title", String(255), index=True),
-    Column("phone", String(64)),
-    Column("resume_file_name", String(255)),
-    Column("source_url", Text),
-    Column("content_hash", String(64), index=True),
-    Column("raw_resume_id", BigInteger, index=True),
-    Column("task_id", BigInteger, index=True),
-    Column("hit_count", Integer, nullable=False, default=1),
-    Column("first_seen_at", DateTime(timezone=True), server_default=func.now()),
-    Column("last_seen_at", DateTime(timezone=True), server_default=func.now(), onupdate=func.now()),
-)
 
 
 class CrawlTaskService:
@@ -105,17 +82,6 @@ class CrawlTaskService:
         result = self.session.execute(stmt)
         self.session.commit()
         return int(result.rowcount or 0)
-
-
-class PlatformCandidateRecordService:
-    def __init__(self, session: Session):
-        self.session = session
-
-    def list_profile_lookup_keys(self, platform_code: str) -> set[str]:
-        stmt = select(platform_candidate_record.c.candidate_key).where(
-            platform_candidate_record.c.platform_code == platform_code
-        )
-        return {str(key) for key in self.session.execute(stmt).scalars() if key}
 
 
 class BossCandidateRecordService:

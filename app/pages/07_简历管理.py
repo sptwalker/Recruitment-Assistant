@@ -5,7 +5,6 @@ Tab 2: 简历库浏览（搜索 / 详情 / 删除 / 屏蔽 / 面试邀约）
 Tab 3: 招聘岗位录入/匹配（录入岗位 → AI 匹配候选人）
 """
 
-import importlib
 import io
 import os
 import re
@@ -28,19 +27,27 @@ from recruitment_assistant.storage.db import create_session
 from recruitment_assistant.storage.resume_db import create_resume_session, init_resume_database
 from recruitment_assistant.storage.models import JobPosition
 
-resume_parser_module = importlib.reload(resume_parser_module)
+# 注：不再每次 rerun 都 importlib.reload —— 重编译两个大模块（parser + ai_service）
+# 是解析热路径上每份文件都白付的固定开销。模块随进程加载一次即可。
 extract_doc_text = resume_parser_module.extract_doc_text
 extract_text_from_docx = resume_parser_module.extract_text_from_docx
 extract_text_from_pdf = resume_parser_module.extract_text_from_pdf
 is_empty_or_corrupted = resume_parser_module.is_empty_or_corrupted
 has_garbled_text = resume_parser_module.has_garbled_text
 
-resume_ai_service_module = importlib.reload(resume_ai_service_module)
 ResumeAIService = resume_ai_service_module.ResumeAIService
 normalize_platform = resume_ai_service_module.normalize_platform
 
-init_resume_database()
-get_settings.cache_clear()
+
+@st.cache_resource
+def _ensure_resume_db_initialized() -> bool:
+    # 仅每进程一次：迁移/PRAGMA 扫描不再每次 rerun 重跑
+    init_resume_database()
+    return True
+
+
+_ensure_resume_db_initialized()
+# 不再每次 rerun 主动清 settings 缓存：AI 配置变更时 ai_model_manager._write_env 会自行 cache_clear
 settings = get_settings()
 
 st.set_page_config(page_title="简历管理", layout="wide", initial_sidebar_state="collapsed")
@@ -49,15 +56,33 @@ page_header("简历分析管理", "自动解析入库、浏览管理、岗位匹
 
 
 @st.cache_resource
-def get_ai_service(api_key: str, base_url: str, model: str) -> ResumeAIService:
-    return ResumeAIService(
-        api_key=api_key,
-        base_url=base_url,
-        model=model,
-    )
+def get_ai_service(chain_key: tuple) -> ResumeAIService:
+    # chain_key 是端点链的可哈希摘要，用于 @st.cache_resource 缓存键
+    endpoints = [
+        {"name": n, "api_key": k, "base_url": u, "model": m}
+        for (n, k, u, m) in chain_key
+    ]
+    if not endpoints:
+        endpoints = [{"name": "默认接口", "api_key": settings.ai_api_key,
+                      "base_url": settings.ai_base_url, "model": settings.ai_model}]
+    return ResumeAIService(endpoints=endpoints)
 
 
-ai_service = get_ai_service(settings.ai_api_key, settings.ai_base_url, settings.ai_model)
+def _current_ai_service(purpose: str = "match") -> ResumeAIService:
+    from recruitment_assistant.config.ai_model_manager import get_endpoint_chain
+    chain = get_endpoint_chain(purpose)
+    chain_key = tuple((e["name"], e["api_key"], e["base_url"], e["model"]) for e in chain)
+    return get_ai_service(chain_key)
+
+
+ai_service = _current_ai_service("match")
+parse_ai_service = _current_ai_service("parse")  # 解析专用（可配更快的模型）
+
+
+def _show_failover_notices() -> None:
+    """把 AI 服务累积的自动降级通知提示给用户。"""
+    for msg in resume_ai_service_module.pop_failover_notices():
+        st.warning(msg)
 
 RESUME_DIRS = {
     "BOSS直聘": settings.attachment_dir / "boss",
@@ -66,6 +91,7 @@ RESUME_DIRS = {
 }
 
 
+@st.cache_data(ttl=15, show_spinner=False)
 def scan_resume_files() -> list[dict]:
     """扫描三个平台目录下所有 PDF/DOCX 简历文件。
 
@@ -167,6 +193,10 @@ def filter_duplicate_files_before_ai(files: list[dict]) -> tuple[list[dict], lis
     try:
         svc = ResumeArchiveService(session)
         for file_info in files:
+            # 优先按文件绝对路径查库：已入库文件直接跳过，覆盖文件名无姓名的情况
+            if svc.resume_source_exists(str(file_info["path"])):
+                skipped.append(file_info["name"])
+                continue
             name, age, education_level = infer_candidate_from_filename(file_info["name"])
             if name and svc.is_duplicate(name=name, age=age, education_level=education_level):
                 skipped.append(f"{name}（{file_info['name']}）")
@@ -193,10 +223,16 @@ with tabs[0]:
 
     # 数据库当前状态（非任务信息，保留在窗口外）
     all_files = scan_resume_files()
-    session = create_resume_session()
-    svc = ResumeArchiveService(session)
-    stats = svc.get_stats()
-    session.close()
+
+    @st.cache_data(ttl=15, show_spinner=False)
+    def _cached_resume_stats() -> dict:
+        _s = create_resume_session()
+        try:
+            return ResumeArchiveService(_s).get_stats()
+        finally:
+            _s.close()
+
+    stats = _cached_resume_stats()
 
     total = stats["total"] or 0
     boss_count = stats["platform_counts"].get("BOSS直聘", 0)
@@ -589,7 +625,7 @@ with tabs[0]:
                 candidate_data = None
                 ai_failed = False
                 try:
-                    candidate_data = ai_service.parse_resume_text(raw_text, source_name=fname)
+                    candidate_data = parse_ai_service.parse_resume_text(raw_text, source_name=fname)
                 except Exception as exc:
                     # pydantic ValidationError 是多行的，首行只是计数（"1 validation error for ..."）,
                     # 后续行才有 字段路径 / 实际值 / 错误类型，必须一并打到日志里才能定位 bug
@@ -600,6 +636,8 @@ with tabs[0]:
                     results["failed_files"]["AI 解析异常"].append(f"{fname}（{err_lines[0]}）")
                     results["fail_count"] += 1
                     ai_failed = True
+                for _fmsg in resume_ai_service_module.pop_failover_notices():
+                    log(f"           {_fmsg}")
 
                 if not ai_failed and not candidate_data:
                     log("           ⚠️ AI 返回空结果")
@@ -1151,124 +1189,148 @@ def _diagnose_fk_failure(debug_logger, svc, position_id: int, failed_cid: int):
     debug_logger.log("fk_diagnosis", f"首次保存失败的 FK 诊断 (candidate_id={failed_cid})", diag)
 
 
-def _run_single_position_match(pos, svc, ai_service, candidate_dicts) -> tuple[int, int, bool]:
-    """对单个岗位执行 AI 匹配（串行批次），返回 (save_ok, save_fail, timed_out)。"""
+def _prepare_position_match(pos, svc, candidate_dicts, force: bool = False) -> dict:
+    """匹配前的本地准备（无 AI 调用，很快）：清空(force)→数据一致性过滤→JD哈希→复用跳过。
+
+    返回 {chunks, jd_hash, full_jd, reused, debug_logger, total}。
+    chunks 为空 = 无待评分候选人（空/全部复用），调用方据此直接出提示。
+    """
+    import hashlib
     from recruitment_assistant.utils.match_debug_logger import MatchDebugLogger
     from sqlalchemy import text
 
-    POSITION_MATCH_TIMEOUT = 180
-
-    # ✨ 创建独立的调试日志记录器
-    logger.info("[调试日志] 开始为岗位 {} (id={}) 创建调试日志", pos.title, pos.position_id)
     debug_logger = MatchDebugLogger(pos.position_id, pos.title)
-    logger.info("[调试日志] MatchDebugLogger 已创建")
+    full_jd = _build_full_jd(pos)
+    jd_hash = hashlib.sha256(full_jd.encode("utf-8")).hexdigest()[:16]
+    reused = 0
+    empty = {"chunks": [], "jd_hash": jd_hash, "full_jd": full_jd,
+             "reused": reused, "debug_logger": debug_logger, "total": 0}
 
-    try:
+    if force:
         svc.clear_position_matches(pos.position_id)
-        total = len(candidate_dicts)
-        if total == 0:
-            debug_logger.log("empty", "候选人列表为空，跳过匹配")
-            return 0, 0, False
+    total = len(candidate_dicts)
+    if total == 0:
+        debug_logger.log("empty", "候选人列表为空，跳过匹配")
+        return empty
 
-        # ✨ 验证数据一致性：获取数据库中实际存在的候选人ID集合
-        resume_session = create_resume_session()
-        try:
-            result = resume_session.execute(text("SELECT candidate_id FROM candidates"))
-            valid_ids = {row[0] for row in result.fetchall()}
-            logger.info("[数据验证] 数据库中实际有 {} 个候选人", len(valid_ids))
-            debug_logger.log("data_validation", f"数据库实际候选人数量: {len(valid_ids)}", {
-                "db_count": len(valid_ids),
-                "orm_count": total,
-                "id_sample": list(valid_ids)[:20] if valid_ids else []
+    resume_session = create_resume_session()
+    try:
+        result = resume_session.execute(text("SELECT candidate_id FROM candidates"))
+        valid_ids = {row[0] for row in result.fetchall()}
+        debug_logger.log("data_validation", f"数据库实际候选人数量: {len(valid_ids)}", {
+            "db_count": len(valid_ids), "orm_count": total,
+            "id_sample": list(valid_ids)[:20] if valid_ids else [],
+        })
+        candidate_dicts = [c for c in candidate_dicts if c.get("candidate_id") in valid_ids]
+        filtered_count = len(candidate_dicts)
+        if filtered_count < total:
+            logger.warning("[数据验证] 过滤掉 {} 个不存在的候选人，剩余 {}",
+                           total - filtered_count, filtered_count)
+            debug_logger.log("data_filter", "过滤掉不存在的候选人", {
+                "original_count": total, "filtered_count": filtered_count,
+                "removed_count": total - filtered_count,
             })
+        if filtered_count == 0:
+            debug_logger.log("empty_after_filter", "过滤后无有效候选人")
+            return empty
 
-            # 过滤掉不存在的候选人
-            candidate_dicts = [c for c in candidate_dicts if c.get("candidate_id") in valid_ids]
-            filtered_count = len(candidate_dicts)
-            if filtered_count < total:
-                logger.warning("[数据验证] 过滤掉 {} 个不存在的候选人，剩余 {}",
-                              total - filtered_count, filtered_count)
-                debug_logger.log("data_filter", f"过滤掉不存在的候选人", {
-                    "original_count": total,
-                    "filtered_count": filtered_count,
-                    "removed_count": total - filtered_count
+        if not force:
+            already = svc.get_scored_candidate_ids(pos.position_id, jd_hash)
+            if already:
+                before = len(candidate_dicts)
+                candidate_dicts = [c for c in candidate_dicts if c.get("candidate_id") not in already]
+                reused = before - len(candidate_dicts)
+                logger.info("[复用] 岗位 '{}' 复用已评分候选人 {} 个，待评分 {} 个",
+                            pos.title, reused, len(candidate_dicts))
+                debug_logger.log("reuse_skip", f"复用已评分 {reused} 个，JD哈希={jd_hash}", {
+                    "reused": reused, "to_score": len(candidate_dicts), "jd_hash": jd_hash,
                 })
+            if not candidate_dicts:
+                debug_logger.log("all_reused", "全部候选人已评分且 JD 未变，无需调用 LLM")
+                return {**empty, "reused": reused}
 
-            if filtered_count == 0:
-                debug_logger.log("empty_after_filter", "过滤后无有效候选人")
-                return 0, 0, False
+        total = len(candidate_dicts)
+    finally:
+        resume_session.close()
 
-            total = filtered_count
-        finally:
-            resume_session.close()
+    chunk_size = max(3, min(20, total // 5))
 
-        chunk_size = max(3, min(20, total // 5))
-        full_jd = _build_full_jd(pos)
+    resume_session = create_resume_session()
+    try:
+        resume_svc = ResumeArchiveService(resume_session)
+        candidates_orm, _ = resume_svc.list_candidates(page=1, page_size=9999)
+        debug_logger.log_candidates(candidates_orm, candidate_dicts)
+    finally:
+        resume_session.close()
 
-        # ✨ 记录候选人数据
-        resume_session = create_resume_session()
-        try:
-            resume_svc = ResumeArchiveService(resume_session)
-            candidates_orm, _ = resume_svc.list_candidates(page=1, page_size=9999)
-            debug_logger.log_candidates(candidates_orm, candidate_dicts)
-        finally:
-            resume_session.close()
+    chunks = [candidate_dicts[i:i + chunk_size] for i in range(0, total, chunk_size)]
+    return {"chunks": chunks, "jd_hash": jd_hash, "full_jd": full_jd,
+            "reused": reused, "debug_logger": debug_logger, "total": total}
 
-        chunks = [candidate_dicts[i:i + chunk_size] for i in range(0, total, chunk_size)]
-        all_results = []
+
+def _process_match_chunk(chunk, full_jd, jd_hash, pos, svc, ai_service, debug_logger) -> tuple[int, int]:
+    """评估并即时保存一批候选人，返回 (save_ok, save_fail)。每批即存 → 停止/超时不丢已评分。"""
+    try:
+        results = ai_service.match_candidates(full_jd, chunk, debug_logger=debug_logger)
+    except Exception as exc:
+        logger.warning("[岗位匹配] 批次失败({}): {}", pos.title, exc)
+        debug_logger.log_error("batch", exc)
+        return 0, 0
+
+    save_ok, save_fail, fk_diagnosed = 0, 0, False
+    for r in results:
+        cid = r.get("candidate_id")
+        score = r.get("match_score", 0)
+        reason = r.get("reason", "")
+        dimensions = r.get("dimensions")
+        if cid and isinstance(score, (int, float)):
+            try:
+                svc.save_position_match(
+                    pos.position_id, int(cid), int(score), reason,
+                    dimensions=dimensions, jd_hash=jd_hash,
+                )
+                save_ok += 1
+            except Exception as exc:
+                save_fail += 1
+                debug_logger.log_error(f"save_candidate_{cid}", exc)
+                if not fk_diagnosed:
+                    fk_diagnosed = True
+                    _diagnose_fk_failure(debug_logger, svc, pos.position_id, int(cid))
+    return save_ok, save_fail
+
+
+def _run_single_position_match(pos, svc, ai_service, candidate_dicts, force: bool = False) -> tuple[int, int, bool, int]:
+    """对单个岗位执行 AI 匹配（串行批次），返回 (save_ok, save_fail, timed_out, reused)。
+
+    供「匹配所有岗位」自动匹配使用（同步跑完一个岗位）。手动单岗位匹配走 chunk 级 rerun 状态机。
+    force=False：只评「未评分/JD 变化」的候选人，其余复用；force=True：清空全量重算。
+    """
+    POSITION_MATCH_TIMEOUT = 180
+    prep = _prepare_position_match(pos, svc, candidate_dicts, force=force)
+    debug_logger = prep["debug_logger"]
+    try:
+        chunks = prep["chunks"]
+        if not chunks:
+            return 0, 0, False, prep["reused"]
+
+        save_ok, save_fail = 0, 0
         start_time = _time.monotonic()
         timed_out = False
         for chunk_idx, chunk in enumerate(chunks):
-            elapsed = _time.monotonic() - start_time
-            if elapsed > POSITION_MATCH_TIMEOUT:
-                logger.warning("[岗位匹配] 岗位 '{}' 超时(已用{:.0f}s>{}s)，已完成 {}/{} 批次",
-                               pos.title, elapsed, POSITION_MATCH_TIMEOUT, chunk_idx, len(chunks))
+            if _time.monotonic() - start_time > POSITION_MATCH_TIMEOUT:
+                logger.warning("[岗位匹配] 岗位 '{}' 超时，已完成 {}/{} 批次",
+                               pos.title, chunk_idx, len(chunks))
                 debug_logger.log("timeout", f"岗位匹配超时，已完成 {chunk_idx}/{len(chunks)} 批次")
                 timed_out = True
                 break
-            try:
-                # ✨ 传递 debug_logger 给 AI 服务
-                results = ai_service.match_candidates(full_jd, chunk, debug_logger=debug_logger)
-                all_results.extend(results)
-            except Exception as exc:
-                logger.warning("[岗位匹配] 批次失败({}): {}", pos.title, exc)
-                debug_logger.log_error(f"batch_{chunk_idx}", exc)
+            ok, fail = _process_match_chunk(chunk, prep["full_jd"], prep["jd_hash"],
+                                            pos, svc, ai_service, debug_logger)
+            save_ok += ok
+            save_fail += fail
 
-        # ✨ 记录保存尝试
-        candidate_ids = [r.get("candidate_id") for r in all_results if r.get("candidate_id")]
-        debug_logger.log_save_attempt(len(all_results), candidate_ids)
-
-        save_ok, save_fail = 0, 0
-        failed_ids = []
-        fk_diagnosed = False
-        for r in all_results:
-            cid = r.get("candidate_id")
-            score = r.get("match_score", 0)
-            reason = r.get("reason", "")
-            dimensions = r.get("dimensions")
-            if cid and isinstance(score, (int, float)):
-                try:
-                    svc.save_position_match(
-                        pos.position_id, int(cid), int(score), reason,
-                        dimensions=dimensions,
-                    )
-                    save_ok += 1
-                except Exception as exc:
-                    save_fail += 1
-                    failed_ids.append(int(cid))
-                    debug_logger.log_error(f"save_candidate_{cid}", exc)
-
-                    if not fk_diagnosed:
-                        fk_diagnosed = True
-                        _diagnose_fk_failure(debug_logger, svc, pos.position_id, int(cid))
-
-        # ✨ 记录保存结果
-        debug_logger.log_save_result(save_ok, save_fail, failed_ids)
-
-        return save_ok, save_fail, timed_out
-
+        debug_logger.log_save_result(save_ok, save_fail, [])
+        return save_ok, save_fail, timed_out, prep["reused"]
     finally:
-        # ✨ 完成日志记录并保存
         log_path = debug_logger.finalize()
         logger.info("[调试日志] 匹配调试日志已保存: {}", log_path)
 
@@ -1749,6 +1811,13 @@ with tabs[2]:
                         ResumeArchiveService(session_tmp).clear_position_matches(pos.position_id)
                         session_tmp.close()
                         st.rerun()
+                    if st.button("🔄 重新评分（全部重算）", key=f"pos_rematch_{pos.position_id}",
+                                 use_container_width=True,
+                                 disabled=not ai_service.is_configured,
+                                 help="清空该岗位已有评分并对所有候选人重新调用 AI 评分；平时用「智能匹配」即可，只会评分新候选人"):
+                        st.session_state.match_selected_pos = pos.position_id
+                        st.session_state["trigger_rematch"] = pos.position_id
+                        st.rerun()
                     pos_btn_cols2 = st.columns(2)
                     if pos_btn_cols2[0].button("✏️ 编辑岗位", key=f"pos_edit_{pos.position_id}",
                                                use_container_width=True):
@@ -1797,12 +1866,15 @@ with tabs[2]:
                                     st.session_state["auto_match_candidates"] = _build_candidate_dicts(all_cands)
 
                                 cand_dicts = st.session_state["auto_match_candidates"]
-                                save_ok, save_fail, timed_out = _run_single_position_match(
+                                save_ok, save_fail, timed_out, reused = _run_single_position_match(
                                     current_pos, svc, ai_service, cand_dicts
                                 )
-                                logger.info("[自动匹配] {}/{} 完成: {} — 保存 {} 条, 失败 {} 条{}",
-                                            done + 1, total, current_pos.title, save_ok, save_fail,
+                                logger.info("[自动匹配] {}/{} 完成: {} — 保存 {} 条, 复用 {} 条, 失败 {} 条{}",
+                                            done + 1, total, current_pos.title, save_ok, reused, save_fail,
                                             ", 超时截断" if timed_out else "")
+                                _show_failover_notices()
+                                if reused > 0:
+                                    st.caption(f"岗位「{current_pos.title}」复用已评分 {reused} 人，仅新评分 {save_ok} 人")
                                 if save_fail > 0:
                                     st.warning(f"岗位「{current_pos.title}」有 {save_fail} 条匹配结果保存失败。调试日志已保存到 logs/match_debug/ 目录")
                                 if timed_out:
@@ -1821,36 +1893,79 @@ with tabs[2]:
                         st.balloons()
                         st.rerun()
 
-                # 如果左栏触发了匹配，执行 AI 评估
-                if st.session_state.pop("trigger_match", None) == sel_pos.position_id:
+                # 如果左栏触发了匹配：准备（本地过滤+复用跳过）后进入 chunk 级状态机
+                _trig_normal = st.session_state.pop("trigger_match", None) == sel_pos.position_id
+                _trig_force = st.session_state.pop("trigger_rematch", None) == sel_pos.position_id
+                if _trig_normal or _trig_force:
                     all_candidates, _ = svc.list_candidates(page=1, page_size=10000)
                     candidate_dicts = _build_candidate_dicts(all_candidates)
-                    logger.info("[手动匹配] 岗位='{}' (id={}), 候选人={}, 候选人摘要={}",
-                                sel_pos.title, sel_pos.position_id,
-                                len(all_candidates), len(candidate_dicts))
-
-                    # ✨ 使用统一的匹配函数（包含调试日志）
-                    progress_bar = st.progress(0)
-                    status_text = st.empty()
-                    status_text.markdown(f"AI 正在评估候选人匹配度…")
-
-                    save_ok, save_fail, timed_out = _run_single_position_match(
-                        sel_pos, svc, ai_service, candidate_dicts
-                    )
-
-                    progress_bar.empty()
-                    status_text.empty()
-
-                    if save_fail > 0:
-                        st.warning(f"AI 匹配完成：保存 {save_ok} 条，失败 {save_fail} 条"
-                                   + (f"（匹配超时）" if timed_out else "")
-                                   + "\n\n💡 **提示**：调试日志已保存在 logs/match_debug/ 目录，可用于远程排查问题")
+                    logger.info("[手动匹配] 岗位='{}' (id={}), 候选人={}, force={}",
+                                sel_pos.title, sel_pos.position_id, len(candidate_dicts), _trig_force)
+                    prep = _prepare_position_match(sel_pos, svc, candidate_dicts, force=_trig_force)
+                    if not prep["chunks"]:
+                        # 无待评分（空 / 全部复用）→ 直接出提示，不进状态机
+                        prep["debug_logger"].finalize()
+                        if prep["reused"] > 0:
+                            st.success(f"全部 {prep['reused']} 人此前已评分且 JD 未变，直接复用，未消耗 AI 流量")
+                        else:
+                            st.info("没有可评分的候选人。")
                     else:
-                        st.success(f"AI 匹配完成：保存 {save_ok} 条"
-                                   + (f"（匹配超时）" if timed_out else ""))
-                    st.rerun()
+                        st.session_state["smatch"] = {
+                            "pid": sel_pos.position_id,
+                            "chunks": prep["chunks"],
+                            "idx": 0,
+                            "total": prep["total"],
+                            "done": 0,
+                            "save_ok": 0,
+                            "save_fail": 0,
+                            "reused": prep["reused"],
+                            "jd_hash": prep["jd_hash"],
+                            "full_jd": prep["full_jd"],
+                            "debug_logger": prep["debug_logger"],
+                            "stopped": False,
+                        }
+                        st.rerun()
 
-                # 展示匹配结果 Banner
+                # ---- 单岗位匹配状态机：每次 rerun 处理一批，进度条真实推进、可随时停止 ----
+                sm = st.session_state.get("smatch")
+                if sm and sm["pid"] == sel_pos.position_id:
+                    total = sm["total"]
+                    done = sm["done"]
+                    st.progress(done / total if total > 0 else 0)
+                    st.markdown(f"🎯 AI 正在评估候选人匹配度… **已评估 {done}/{total} 份简历**")
+                    if st.button("⏹ 停止匹配", type="secondary", use_container_width=True, key="stop_smatch"):
+                        sm["stopped"] = True
+
+                    finished = sm["stopped"] or sm["idx"] >= len(sm["chunks"])
+                    if finished:
+                        dbg = sm["debug_logger"]
+                        dbg.log_save_result(sm["save_ok"], sm["save_fail"], [])
+                        if sm["stopped"]:
+                            dbg.log("stopped", f"用户停止，已评估 {done}/{total}")
+                        dbg.finalize()
+                        _show_failover_notices()
+                        reuse_note = f"，复用已评分 {sm['reused']} 人" if sm["reused"] > 0 else ""
+                        if sm["stopped"]:
+                            st.warning(f"⏹ 已停止匹配：已保存 {sm['save_ok']} 条{reuse_note}（其余未评分，可再次点击继续）")
+                        elif sm["save_fail"] > 0:
+                            st.warning(f"AI 匹配完成：新评分 {sm['save_ok']} 条{reuse_note}，失败 {sm['save_fail']} 条"
+                                       + "\n\n💡 **提示**：调试日志已保存在 logs/match_debug/ 目录")
+                        else:
+                            st.success(f"AI 匹配完成：新评分 {sm['save_ok']} 条{reuse_note}")
+                        st.session_state.pop("smatch", None)
+                        st.rerun()
+                    else:
+                        chunk = sm["chunks"][sm["idx"]]
+                        ok, fail = _process_match_chunk(
+                            chunk, sm["full_jd"], sm["jd_hash"], sel_pos, svc, ai_service, sm["debug_logger"]
+                        )
+                        sm["idx"] += 1
+                        sm["done"] += len(chunk)
+                        sm["save_ok"] += ok
+                        sm["save_fail"] += fail
+                        st.rerun()
+
+
                 matches = svc.list_position_matches(sel_pos.position_id, min_score=30)
                 if matches:
                     st.markdown(f"**{sel_pos.title}** — 匹配结果（≥30%，共 {len(matches)} 人）")

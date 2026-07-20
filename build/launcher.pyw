@@ -116,11 +116,25 @@ def _safe_pgdata() -> Path:
     return safe
 
 
-PGSQL_DIR = _safe_pgsql()
-PG_CTL = PGSQL_DIR / "bin" / "pg_ctl.exe"
-INITDB = PGSQL_DIR / "bin" / "initdb.exe"
-PSQL = PGSQL_DIR / "bin" / "psql.exe"
-PGDATA_DIR = _safe_pgdata()
+# PG 路径延迟解析：M1 后正常启动不再用 PG；仅老库一次性迁移时按需解析（避免全新安装因缺
+# pgsql 二进制在模块加载期就崩）。
+PGSQL_DIR = None
+PG_CTL = None
+INITDB = None
+PSQL = None
+PGDATA_DIR = None
+
+
+def _resolve_pg_paths() -> None:
+    """仅迁移分支调用：解析老版 pgsql/pgdata 路径。"""
+    global PGSQL_DIR, PG_CTL, INITDB, PSQL, PGDATA_DIR
+    if PGSQL_DIR is not None:
+        return
+    PGSQL_DIR = _safe_pgsql()
+    PG_CTL = PGSQL_DIR / "bin" / "pg_ctl.exe"
+    INITDB = PGSQL_DIR / "bin" / "initdb.exe"
+    PSQL = PGSQL_DIR / "bin" / "psql.exe"
+    PGDATA_DIR = _safe_pgdata()
 
 
 def log(msg: str) -> None:
@@ -151,12 +165,15 @@ def _safe_pg_log() -> str:
 
 def get_env() -> dict:
     env = os.environ.copy()
-    env["PATH"] = f"{PGSQL_DIR / 'bin'};{PYTHON_DIR};{PYTHON_DIR / 'Scripts'};{env.get('PATH', '')}"
+    parts = [str(PYTHON_DIR), str(PYTHON_DIR / "Scripts")]
+    if PGSQL_DIR is not None:
+        parts.insert(0, str(PGSQL_DIR / "bin"))
+        env["PGDATA"] = str(PGDATA_DIR)
+        env["PGPORT"] = str(PG_PORT)
+        env["PGUSER"] = DB_USER
+        env["PGPASSWORD"] = DB_PASSWORD
+    env["PATH"] = ";".join(parts) + ";" + env.get("PATH", "")
     env["PYTHONPATH"] = str(APP_ROOT)
-    env["PGDATA"] = str(PGDATA_DIR)
-    env["PGPORT"] = str(PG_PORT)
-    env["PGUSER"] = DB_USER
-    env["PGPASSWORD"] = DB_PASSWORD
     return env
 
 
@@ -220,17 +237,92 @@ def ensure_database() -> None:
             [str(PSQL), "-U", DB_USER, "-p", str(PG_PORT), "-c", f"CREATE DATABASE {DB_NAME};"],
             env=env, creationflags=subprocess.CREATE_NO_WINDOW, check=True,
         )
-    log("Running database migrations...")
-    mig = subprocess.run(
-        [str(PYTHON_EXE), "-c", "from recruitment_assistant.storage.db import init_database; init_database()"],
-        cwd=str(APP_ROOT), env=env,
+
+
+def stop_postgres() -> None:
+    try:
+        subprocess.run(
+            [str(PG_CTL), "stop", "-D", str(PGDATA_DIR), "-m", "fast"],
+            env=get_env(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW, timeout=15,
+        )
+        log("PostgreSQL stopped (migration done).")
+    except Exception as exc:
+        log(f"stop_postgres error (ignored): {exc}")
+
+
+def ensure_sqlite_schema() -> None:
+    """建/补齐统一 SQLite 库的全部表（子进程内 import 应用）。"""
+    log("Ensuring SQLite schema...")
+    r = subprocess.run(
+        [str(PYTHON_EXE), "-c",
+         "from recruitment_assistant.storage.db import init_database; init_database()"],
+        cwd=str(APP_ROOT), env=get_env(),
         capture_output=True, text=True, encoding="utf-8", errors="replace",
         creationflags=subprocess.CREATE_NO_WINDOW,
     )
-    if mig.returncode != 0:
-        log(f"  migration stdout: {mig.stdout}")
-        log(f"  migration stderr: {mig.stderr}")
-        mig.check_returncode()
+    if r.returncode != 0:
+        log(f"  schema stdout: {r.stdout}")
+        log(f"  schema stderr: {r.stderr}")
+
+
+def run_one_time_pg_migration() -> None:
+    """老库升级：若存在 pgdata 且未迁移，起一次老 PG 把 5 张表搬进 SQLite，然后停 PG。
+
+    全新安装（无 pgdata）或已迁移：仅调用迁移模块写 marker/跳过，不碰 PG。
+    绝不阻塞启动。
+    """
+    marker = APP_ROOT / "data" / ".pg_migrated"
+    pgdata = APP_ROOT / "pgdata"
+    need_pg = (not marker.exists()) and pgdata.exists()
+
+    if need_pg:
+        try:
+            log("Detected legacy pgdata + no migration marker → one-time PG→SQLite migration.")
+            _resolve_pg_paths()
+            start_postgres()
+            ensure_database()
+        except Exception as exc:
+            log(f"PG start for migration failed (will still attempt/skip): {exc}")
+
+    # 迁移模块自身幂等：老库拷数据 / 全新装写 marker 跳过
+    r = subprocess.run(
+        [str(PYTHON_EXE), "-c",
+         "from recruitment_assistant.storage.migrate_pg_to_sqlite import migrate_if_needed;"
+         " print(migrate_if_needed())"],
+        cwd=str(APP_ROOT), env=get_env(),
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    log(f"  migration result: {(r.stdout or '').strip()} {(r.stderr or '').strip()}")
+
+    if need_pg:
+        stop_postgres()
+
+
+def main() -> None:
+    try:
+        log("=" * 50)
+        log("简历智采助手启动中...")
+        log(f"  APP_ROOT:  {APP_ROOT}")
+        run_one_time_pg_migration()   # 老库一次性迁移；全新装直接跳过
+        ensure_sqlite_schema()        # 建/补齐统一 SQLite 表
+        proc = start_streamlit()
+        wait_and_open_browser()
+        log("All services started. Waiting for Streamlit process...")
+        if proc is not None:
+            proc.wait()
+    except Exception as e:
+        log(f"ERROR: {e}")
+        import traceback
+        log(traceback.format_exc())
+        try:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(
+                0, f"启动失败：{e}\n\n详情请查看 logs/launcher.log", "简历智采助手", 0x10
+            )
+        except Exception:
+            pass
 
 
 def start_streamlit() -> subprocess.Popen | None:
@@ -263,33 +355,6 @@ def wait_and_open_browser() -> None:
             return
         time.sleep(0.5)
     log("WARNING: Streamlit did not become ready within 30 seconds.")
-
-
-def main() -> None:
-    try:
-        log("=" * 50)
-        log("简历智采助手启动中...")
-        log(f"  APP_ROOT:  {APP_ROOT}")
-        log(f"  PGSQL_DIR: {PGSQL_DIR}")
-        log(f"  PGDATA:    {PGDATA_DIR}")
-        start_postgres()
-        ensure_database()
-        proc = start_streamlit()
-        wait_and_open_browser()
-        log("All services started. Waiting for Streamlit process...")
-        if proc is not None:
-            proc.wait()
-    except Exception as e:
-        log(f"ERROR: {e}")
-        import traceback
-        log(traceback.format_exc())
-        try:
-            import ctypes
-            ctypes.windll.user32.MessageBoxW(
-                0, f"启动失败：{e}\n\n详情请查看 logs/launcher.log", "简历智采助手", 0x10
-            )
-        except Exception:
-            pass
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  const CONTENT_SCRIPT_VERSION = "2.50.0";
+  const CONTENT_SCRIPT_VERSION = "2.51.0";
 
   // 平台注册表：每个平台的 hostname、WS 端口、文本标记、localStorage key 一站式声明。
   // 这是从单平台升级到多平台的核心入口——新加平台只需在此对象增加一条配置。
@@ -3070,15 +3070,15 @@
     return false;
   }
 
-  async function tryDownloadResume(candidateId, signature, info, preview = null, previewAlreadyWaited = false) {
-    if (shouldAbortAsyncStep()) return;
+  async function tryDownloadResume(candidateId, signature, info, preview = null, previewAlreadyWaited = false, suppressSkip = false) {
+    if (shouldAbortAsyncStep()) return false;
     if (!preview && !previewAlreadyWaited) {
       preview = await waitForResumePreview(candidateId, signature, info);
     }
-    if (shouldAbortAsyncStep()) return;
+    if (shouldAbortAsyncStep()) return false;
     if (!preview) {
-      await skipCandidate(candidateId, signature, "resume_preview_not_found");
-      return;
+      if (!suppressSkip) await skipCandidate(candidateId, signature, "resume_preview_not_found");
+      return false;
     }
 
     emit({ type: "resume_preview_detected", data: { candidate_id: candidateId, candidate_signature: signature, ...preview.info } });
@@ -3087,19 +3087,19 @@
     emit({ type: "resume_download_strategy_start", data: { candidate_id: candidateId, candidate_signature: signature, pdf_iframe: Boolean(preview.pdf_iframe), iframe_src: preview.info?.iframe_src || "", preview_source: preview.info?.preview_source || "" } });
 
     if (await tryDirectIframeDownload(candidateId, signature, info, preview)) {
-      return;
+      return true;
     }
 
     if (await tryDomTextDownloadUrlScan(candidateId, signature, info, preview)) {
-      return;
+      return true;
     }
 
     if (resumePreviewLearnState.learnedClick && await clickLearnedDownload(candidateId, signature, info)) {
-      return;
+      return true;
     }
 
     if (await clickBossSvgDownloadIcon(candidateId, signature, info, preview)) {
-      return;
+      return true;
     }
 
     const downloadButton = await waitForDownloadButton(candidateId, signature, 5000);
@@ -3107,10 +3107,10 @@
       emit({ type: "all_download_strategies_exhausted", data: { candidate_id: candidateId, candidate_signature: signature, preview_source: preview?.info?.preview_source || "" } });
       // 兜底进入手动学习模式：所有自动策略都失败，让用户手动点一次重新捕获 selector
       if (await learnManualDownloadClickAfterFailure(candidateId, signature, info, "all_strategies_exhausted")) {
-        return;
+        return true;
       }
-      await skipCandidate(candidateId, signature, "download_button_not_found");
-      return;
+      if (!suppressSkip) await skipCandidate(candidateId, signature, "download_button_not_found");
+      return false;
     }
 
     emit({ type: "auto_download_click_used", data: { candidate_id: candidateId, candidate_signature: signature, ...getElementSnapshot(downloadButton), diagnostics: getDownloadClickDiagnostics(downloadButton, "auto_before_click") } });
@@ -3129,10 +3129,12 @@
     const downloadResult = await resultPromise;
     if (downloadResult.ok) {
       await finalizeDownloadWithPersistAck(candidateId, signature, downloadRequestId, "auto_download_button");
+      return true;
     } else if (downloadResult.reason === "download_timeout" && await learnManualDownloadClickAfterFailure(candidateId, signature, info, "auto_download_timeout")) {
-      return;
+      return true;
     } else {
-      await skipCandidate(candidateId, signature, downloadResult.reason || "download_failed", downloadResult.data || {});
+      if (!suppressSkip) await skipCandidate(candidateId, signature, downloadResult.reason || "download_failed", downloadResult.data || {});
+      return false;
     }
   }
 
@@ -5011,11 +5013,16 @@
               const clickX = Math.round(cdpRect.left + cdpRect.width / 2);
               const clickY = Math.round(cdpRect.top + cdpRect.height / 2);
               const bgResult = await new Promise((resolve) => {
+                let settled = false;
+                const done = (r) => { if (!settled) { settled = true; resolve(r); } };
+                // 3s 超时兜底：background service worker 未响应时不会永久挂起
+                const timer = setTimeout(() => done({ ok: false, error: "cdp_timeout" }), 3000);
                 try {
                   chrome.runtime.sendMessage({ type: "click_consent_via_vue", x: clickX, y: clickY }, (resp) => {
-                    resolve(resp || { ok: false, error: "no_response" });
+                    clearTimeout(timer);
+                    done(resp || { ok: false, error: "no_response" });
                   });
-                } catch (e) { resolve({ ok: false, error: String(e) }); }
+                } catch (e) { clearTimeout(timer); done({ ok: false, error: String(e) }); }
               });
               emit({ type: "resume_consent_cdp_fallback", data: {
                 candidate_id: candidateId, candidate_signature: signature,
@@ -5026,8 +5033,14 @@
           if (!brightened) {
             const finalBtn = findResumeButton();
             const finalConsent = acceptResumeConsentIfNeeded();
-            await skipCandidate(candidateId, signature, "resume_consent_clicked_but_not_brightened", {
+            // 撤回简历场景：同意按钮一直是 disabled、点不动，简历按钮也不会变亮 → 果断跳过
+            const consentStillDisabled = finalConsent ? isDisabled(finalConsent) : consentIsDisabled;
+            const skipReason = consentStillDisabled ? "resume_consent_disabled" : "resume_consent_clicked_but_not_brightened";
+            await skipCandidate(candidateId, signature, skipReason, {
+              fast_skip: true,
               elapsed_ms: 6000,
+              consent_was_disabled: consentIsDisabled,
+              consent_still_disabled: consentStillDisabled,
               final_resume_btn_found: !!finalBtn,
               final_resume_btn_state: finalBtn ? finalBtn.state : null,
               final_resume_btn_text: finalBtn ? finalBtn.text : null,
@@ -5085,17 +5098,39 @@
       try {
         const _candidateResult = await Promise.race([
           (async () => {
-            const preview = await startResumePreviewRecognition(candidateId, signature, info, btn, beforeUrl, stalePreview.closed, beforePreviewFingerprint);
+            const MAX_DOWNLOAD_ATTEMPTS = 3;
+            let preview = await startResumePreviewRecognition(candidateId, signature, info, btn, beforeUrl, stalePreview.closed, beforePreviewFingerprint);
             if (shouldAbortAsyncStep()) return "abort";
             if (!preview) {
               await skipCandidate(candidateId, signature, "resume_preview_not_found");
               return "skipped";
             }
-            await tryDownloadResume(candidateId, signature, info, preview, true);
+            // 兜底：附件下载最多重试 3 次；瞬时故障给机会，反复失败则强行跳过
+            let dlOk = false;
+            for (let attempt = 1; attempt <= MAX_DOWNLOAD_ATTEMPTS && !dlOk; attempt++) {
+              const isLast = attempt === MAX_DOWNLOAD_ATTEMPTS;
+              // 全程 suppressSkip：由下方 if(!dlOk) 统一做一次强行跳过，避免重复 skip 计数
+              dlOk = await tryDownloadResume(candidateId, signature, info, preview, true, /*suppressSkip=*/ true);
+              if (shouldAbortAsyncStep()) return "abort";
+              if (dlOk || isLast) break;
+              // 未成功且还有机会：关掉预览、重新点开附件、重取 preview 后再试
+              emit({ type: "resume_download_retry", data: { candidate_id: candidateId, candidate_signature: signature, attempt } });
+              await closeExistingResumePreview(candidateId, signature);
+              forceRemoveStalePdfPreviewFrames(signature);
+              await sleep(500);
+              clickElementReliably(btn.el);
+              await sleep(600);
+              preview = await startResumePreviewRecognition(candidateId, signature, info, btn, beforeUrl, true, getResumePreviewFingerprint());
+              if (shouldAbortAsyncStep()) return "abort";
+              if (!preview) break;
+            }
+            if (!dlOk) {
+              await skipCandidate(candidateId, signature, "download_failed_force_skip", { attempts: MAX_DOWNLOAD_ATTEMPTS });
+            }
             await closeExistingResumePreview(candidateId, signature);
             forceRemoveStalePdfPreviewFrames(signature);
             await sleep(500);
-            if (!shouldAbortAsyncStep()) {
+            if (dlOk && !shouldAbortAsyncStep()) {
               await tryDownloadBossAttachmentWorks(candidateId, signature, info);
             }
             return "done";

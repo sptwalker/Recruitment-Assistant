@@ -38,11 +38,11 @@ class TestAIParsingRetry:
 
         service = ResumeAIService("test_key", "http://test.com", "test_model")
 
-        # 验证方法签名包含 retry 参数
+        # 验证方法签名包含 retry 参数（默认 1；端点级降级由 _chat_completion 兜底）
         import inspect
         sig = inspect.signature(service.parse_resume_text)
         assert 'retry' in sig.parameters
-        assert sig.parameters['retry'].default == 2
+        assert sig.parameters['retry'].default == 1
 
 
 class TestDataValidation:

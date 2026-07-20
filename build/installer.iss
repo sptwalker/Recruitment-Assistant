@@ -2,7 +2,7 @@
 ; Compile with Inno Setup 6: https://jrsoftware.org/isinfo.php
 
 #define MyAppName "简历智采助手"
-#define MyAppVersion "3.14"
+#define MyAppVersion "3.24"
 #define MyAppPublisher "Resume AI Collector"
 #define MyAppURL "https://github.com/sptwalker/Recruitment-Assistant"
 #define MyAppExeName "launcher.pyw"
@@ -34,7 +34,9 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "Create desktop shortcut"; GroupDescription: "Additional icons:"
 
 [Files]
-Source: "..\dist\简历智采助手\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+; M1 后不再打包 PostgreSQL：全新安装无 pgsql/pgdata（体积大降、无 PG 复杂度）。
+; 老用户升级：Inno 不删旧文件，其磁盘上原有的 pgsql/pgdata 保留，供一次性 PG→SQLite 迁移用。
+Source: "..\dist\简历智采助手\*"; DestDir: "{app}"; Excludes: "pgsql\*,pgdata\*"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\python\pythonw.exe"; Parameters: """{app}\launcher.pyw"""; WorkingDir: "{app}"; IconFilename: "{app}\icon\app.ico"

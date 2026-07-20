@@ -1,7 +1,7 @@
 """简历归档数据库 Service 层。"""
 
 from sqlalchemy import delete, func, select, update
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from recruitment_assistant.schemas.resume_archive import CandidateCreate
 from recruitment_assistant.storage.resume_models import (
@@ -153,6 +153,34 @@ class ResumeArchiveService:
         stmt = stmt.order_by(Candidate.candidate_id.desc()).offset((page - 1) * page_size).limit(page_size)
         return list(self.session.scalars(stmt).all()), total
 
+    def export_candidates(self) -> list[dict]:
+        """全量导出候选人扁平记录，供 Excel 导出用（不分页）。"""
+        stmt = (
+            select(Candidate)
+            .options(selectinload(Candidate.resume_source))
+            .order_by(Candidate.candidate_id.desc())
+        )
+        rows: list[dict] = []
+        for c in self.session.scalars(stmt).all():
+            src = c.resume_source
+            rows.append({
+                "ID": c.candidate_id,
+                "姓名": c.name or "",
+                "性别": c.gender or "",
+                "年龄": c.age or "",
+                "电话": c.phone or "",
+                "邮箱": c.email or "",
+                "微信": c.wechat or "",
+                "城市": c.current_city or "",
+                "学历": c.education_level or "",
+                "来源平台": (src.source_platform if src else ""),
+                "简历文件": (src.file_name if src else ""),
+                "归档时间": (src.crawl_time.strftime("%Y-%m-%d %H:%M:%S")
+                             if src and src.crawl_time else ""),
+                "关注": "是" if c.is_favorite else "",
+            })
+        return rows
+
     # --- 删除 / 屏蔽 ---
 
     def delete_candidate(self, candidate_id: int) -> bool:
@@ -286,36 +314,42 @@ class ResumeArchiveService:
         score: int,
         reason: str,
         dimensions: dict | None = None,
+        jd_hash: str | None = None,
     ) -> None:
-        """保存岗位匹配结果，使用原始 SQL 绕过可能存在的 FK 架构问题。
+        """保存岗位匹配结果（M1 后走统一 ORM session，SQLite upsert）。
 
-        position_id 引用 PostgreSQL (跨库)，candidate_id 已在调用方预验证。
+        candidate_id 已在调用方预验证；position_id 与 job_position 同库，有真 FK。
+        用 SQLite ON CONFLICT 在 (position_id, candidate_id) 唯一键上 upsert，
+        取代原先的裸 sqlite3 + INSERT OR REPLACE。
         """
-        import sqlite3
-        from recruitment_assistant.storage.resume_db import RESUME_DB_PATH
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-        params = (
-            position_id,
-            candidate_id,
-            score,
-            reason,
-            dimensions.get("skill_match") if dimensions else None,
-            dimensions.get("experience_match") if dimensions else None,
-            dimensions.get("education_match") if dimensions else None,
-            dimensions.get("location_match") if dimensions else None,
+        values = {
+            "position_id": position_id,
+            "candidate_id": candidate_id,
+            "score": score,
+            "reason": reason,
+            "skill_match": dimensions.get("skill_match") if dimensions else None,
+            "experience_match": dimensions.get("experience_match") if dimensions else None,
+            "education_match": dimensions.get("education_match") if dimensions else None,
+            "location_match": dimensions.get("location_match") if dimensions else None,
+            "jd_hash": jd_hash,
+        }
+        stmt = sqlite_insert(PositionMatch).values(**values)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["position_id", "candidate_id"],
+            set_={
+                k: getattr(stmt.excluded, k)
+                for k in ("score", "reason", "skill_match", "experience_match",
+                          "education_match", "location_match", "jd_hash")
+            },
         )
-        conn = sqlite3.connect(str(RESUME_DB_PATH))
         try:
-            conn.execute(
-                "INSERT OR REPLACE INTO position_matches"
-                " (position_id, candidate_id, score, reason,"
-                "  skill_match, experience_match, education_match, location_match)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                params,
-            )
-            conn.commit()
-        finally:
-            conn.close()
+            self.session.execute(stmt)
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
 
     def list_position_matches(self, position_id: int, min_score: int = 50) -> list[tuple]:
         stmt = (
@@ -325,6 +359,23 @@ class ResumeArchiveService:
             .order_by(PositionMatch.score.desc(), PositionMatch.match_id)
         )
         return list(self.session.execute(stmt).all())
+
+    def get_scored_candidate_ids(self, position_id: int, jd_hash: str) -> set[int]:
+        """返回该岗位下已用指定 JD 哈希评分过的候选人 ID 集合。
+
+        用于跳过 JD 未变化、已评分的候选人，避免重复调用 LLM。
+        """
+        stmt = select(PositionMatch.candidate_id).where(
+            PositionMatch.position_id == position_id,
+            PositionMatch.jd_hash == jd_hash,
+        )
+        return {int(cid) for cid in self.session.scalars(stmt) if cid is not None}
+
+    def resume_source_exists(self, file_path: str) -> bool:
+        """按简历文件绝对路径判断是否已入库（用于解析前跳过已处理文件）。"""
+        return self.session.scalar(
+            select(ResumeSource.source_id).where(ResumeSource.file_path == file_path).limit(1)
+        ) is not None
 
     # --- 面试大纲 CRUD ---
 

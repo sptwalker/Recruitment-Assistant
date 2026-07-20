@@ -1711,6 +1711,8 @@ class BossWSBridge:
             "download_button_not_found": "未找到简历下载按钮",
             "download_timeout": "下载等待超时",
             "download_failed": "下载失败",
+            "download_failed_force_skip": "下载多次失败，已强行跳过",
+            "resume_consent_disabled": "对方已撤回简历（同意按钮不可点击），已跳过",
             "no_resume_button": "未找到附件简历按钮",
             "candidate_info_unrecognized": "候选人信息未识别",
             "click_failed": "点击候选人失败",

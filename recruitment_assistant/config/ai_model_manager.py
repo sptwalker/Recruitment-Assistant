@@ -1,8 +1,10 @@
-"""多 AI 模型 profile 管理：增删改查 + 切换 active profile + 同步 .env。
+"""多 AI 接口 profile 管理：增删改查 + 主要/启用开关 + 自动降级链 + 同步 .env。
 
 数据存储于 data/ai_models.json，首次启动自动从 .env 迁移。
-切换 profile 时同步更新 .env 中的 AI_API_KEY / AI_BASE_URL / AI_MODEL，
-确保下游 settings.py / ResumeAIService 无需改动。
+- 每个 profile 有 enabled(是否启用) / primary(是否主接口，单选) 两个开关。
+- 主接口同步进 .env 的 AI_API_KEY / AI_BASE_URL / AI_MODEL，保证脚本 / settings.py 等
+  未升级路径仍可用。
+- get_endpoint_chain() 返回 [主接口, ...其余已启用] 有序列表，供服务层做失败降级。
 """
 from __future__ import annotations
 
@@ -81,9 +83,52 @@ def _migrate_from_env() -> dict:
         "api_key": api_key,
         "base_url": base_url,
         "model": model,
+        "enabled": True,
+        "primary": True,
     }
     data = {"active": pid, "profiles": [profile]}
     save_profiles(data)
+    return data
+
+
+def _normalize(data: dict) -> dict:
+    """幂等补齐 enabled/primary 字段（老库迁移），并保证恰有一个 primary。
+
+    - 旧 profile 无 enabled → 默认 True。
+    - 旧 profile 无 primary → 由旧 active 那条置 True。
+    - 若出现零个或多个 primary，收敛为唯一：优先旧 active，否则第一个启用项。
+    """
+    profiles = data.get("profiles", [])
+    if not profiles:
+        return data
+
+    active_id = data.get("active")
+    changed = False
+    for p in profiles:
+        if "enabled" not in p:
+            p["enabled"] = True
+            changed = True
+        if "primary" not in p:
+            p["primary"] = (p["id"] == active_id)
+            changed = True
+
+    primaries = [p for p in profiles if p.get("primary")]
+    if len(primaries) != 1:
+        chosen = next((p for p in profiles if p["id"] == active_id), None) \
+            or next((p for p in profiles if p.get("enabled")), None) \
+            or profiles[0]
+        for p in profiles:
+            p["primary"] = (p is chosen)
+        chosen["enabled"] = True
+        changed = True
+
+    primary = next(p for p in profiles if p.get("primary"))
+    if data.get("active") != primary["id"]:
+        data["active"] = primary["id"]
+        changed = True
+
+    if changed:
+        save_profiles(data)
     return data
 
 
@@ -92,7 +137,7 @@ def load_profiles() -> dict:
         try:
             data = json.loads(AI_MODELS_PATH.read_text(encoding="utf-8"))
             if isinstance(data, dict) and "profiles" in data:
-                return data
+                return _normalize(data)
         except (json.JSONDecodeError, OSError):
             pass
     return _migrate_from_env()
@@ -106,38 +151,108 @@ def save_profiles(data: dict) -> None:
     )
 
 
-def get_active_profile() -> dict | None:
+def get_primary_profile() -> dict | None:
     data = load_profiles()
-    active_id = data.get("active")
     for p in data.get("profiles", []):
-        if p["id"] == active_id:
+        if p.get("primary"):
             return p
     profiles = data.get("profiles", [])
     return profiles[0] if profiles else None
 
 
-def set_active_profile(profile_id: str) -> None:
+def get_endpoint_chain(purpose: str = "match") -> list[dict]:
+    """返回失败降级链：[首选接口, ...其余已启用接口]，均要求 api_key 非空。
+
+    purpose="match"（默认）：首选=主接口（primary）。
+    purpose="parse"：首选=解析专用接口（parse_profile_id，若设置且启用且有 key）；
+      未设置或不可用时回退为主接口。用于简历解析可选一个更快的模型。
+    其余已启用接口按列表顺序作为降级备用。
+    """
     data = load_profiles()
+    profiles = data.get("profiles", [])
+    primary = next((p for p in profiles if p.get("primary")), None)
+
+    head = primary
+    if purpose == "parse":
+        pid = data.get("parse_profile_id")
+        if pid:
+            cand = next((p for p in profiles if p["id"] == pid), None)
+            if cand and cand.get("enabled") and cand.get("api_key"):
+                head = cand
+
+    chain: list[dict] = []
+    if head and head.get("api_key"):
+        chain.append(head)
+    for p in profiles:
+        if p is head:
+            continue
+        if p.get("enabled") and p.get("api_key"):
+            chain.append(p)
+    return chain
+
+
+def set_parse_profile(profile_id: str | None) -> None:
+    """设置简历解析专用接口；传 None 或空表示跟随主接口。"""
+    data = load_profiles()
+    if profile_id and not any(p["id"] == profile_id for p in data["profiles"]):
+        raise ValueError(f"Profile {profile_id} not found")
+    data["parse_profile_id"] = profile_id or ""
+    save_profiles(data)
+
+
+def set_primary_profile(profile_id: str) -> None:
+    """设为主接口（单选）：清其他 primary，本条 primary+enabled，同步 .env。"""
+    data = load_profiles()
+    target = None
     for p in data["profiles"]:
         if p["id"] == profile_id:
-            data["active"] = profile_id
-            save_profiles(data)
-            _sync_env(p)
-            return
-    raise ValueError(f"Profile {profile_id} not found")
+            target = p
+        p["primary"] = (p["id"] == profile_id)
+    if target is None:
+        raise ValueError(f"Profile {profile_id} not found")
+    target["enabled"] = True
+    data["active"] = profile_id
+    save_profiles(data)
+    _sync_env(target)
+
+
+def set_profile_enabled(profile_id: str, enabled: bool) -> None:
+    """启用/禁用某接口。禁用主接口时清除 primary 并把 .env 让给下一个可用启用项。"""
+    data = load_profiles()
+    target = next((p for p in data["profiles"] if p["id"] == profile_id), None)
+    if target is None:
+        raise ValueError(f"Profile {profile_id} not found")
+    target["enabled"] = enabled
+    if not enabled and target.get("primary"):
+        target["primary"] = False
+        fallback = next(
+            (p for p in data["profiles"] if p["id"] != profile_id and p.get("enabled")),
+            None,
+        )
+        if fallback:
+            fallback["primary"] = True
+            data["active"] = fallback["id"]
+            _sync_env(fallback)
+        else:
+            data["active"] = ""
+            _write_env({"AI_API_KEY": "", "AI_BASE_URL": "", "AI_MODEL": ""})
+    save_profiles(data)
 
 
 def add_profile(name: str, api_key: str, base_url: str, model: str) -> dict:
     data = load_profiles()
+    is_first = len(data["profiles"]) == 0
     profile = {
         "id": _new_id(),
         "name": name,
         "api_key": api_key,
         "base_url": base_url,
         "model": model,
+        "enabled": True,
+        "primary": is_first,
     }
     data["profiles"].append(profile)
-    if len(data["profiles"]) == 1:
+    if is_first:
         data["active"] = profile["id"]
         _sync_env(profile)
     save_profiles(data)
@@ -152,7 +267,7 @@ def update_profile(profile_id: str, **kwargs: str) -> None:
                 if k in ("name", "api_key", "base_url", "model"):
                     p[k] = v
             save_profiles(data)
-            if data.get("active") == profile_id:
+            if p.get("primary"):
                 _sync_env(p)
             return
     raise ValueError(f"Profile {profile_id} not found")
@@ -160,11 +275,17 @@ def update_profile(profile_id: str, **kwargs: str) -> None:
 
 def delete_profile(profile_id: str) -> None:
     data = load_profiles()
+    was_primary = any(p["id"] == profile_id and p.get("primary") for p in data["profiles"])
     data["profiles"] = [p for p in data["profiles"] if p["id"] != profile_id]
-    if data.get("active") == profile_id:
-        if data["profiles"]:
-            data["active"] = data["profiles"][0]["id"]
-            _sync_env(data["profiles"][0])
+    if was_primary:
+        # 主接口被删：primary 让给第一个启用项（无启用项则第一个），否则清空 .env
+        fallback = next((p for p in data["profiles"] if p.get("enabled")), None) \
+            or (data["profiles"][0] if data["profiles"] else None)
+        if fallback:
+            fallback["primary"] = True
+            fallback["enabled"] = True
+            data["active"] = fallback["id"]
+            _sync_env(fallback)
         else:
             data["active"] = ""
             _write_env({"AI_API_KEY": "", "AI_BASE_URL": "", "AI_MODEL": ""})

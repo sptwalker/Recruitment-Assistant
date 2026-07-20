@@ -17,6 +17,10 @@ env/
 /data/snapshots/
 /data/*.db
 /data/*.db.backup-*
+/data/ai_models.json
+debug_candidates.py
+/data/.pg_migrated
+/data/backups/
 /data/audit-*.txt
 /data/migrate-*.log
 /logs/

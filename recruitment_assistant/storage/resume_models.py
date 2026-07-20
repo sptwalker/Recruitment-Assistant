@@ -224,9 +224,9 @@ class PositionMatch(ResumeBase):
 
     match_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     position_id: Mapped[int] = mapped_column(
-        Integer,
+        ForeignKey("job_position.id"),
         nullable=False, index=True,
-    )  # references PG job_position.id (cross-DB)
+    )  # M1 后与 job_position 同库，真 FK
     candidate_id: Mapped[int] = mapped_column(
         ForeignKey("candidates.candidate_id", ondelete="CASCADE"),
         nullable=False, index=True,
@@ -239,6 +239,9 @@ class PositionMatch(ResumeBase):
     experience_match: Mapped[int | None] = mapped_column(Integer)
     education_match: Mapped[int | None] = mapped_column(Integer)
     location_match: Mapped[int | None] = mapped_column(Integer)
+
+    # ✨ 评分时 JD 文本哈希：用于跳过 JD 未变的候选人，减少重复 LLM 调用
+    jd_hash: Mapped[str | None] = mapped_column(Text)
 
     create_time: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 

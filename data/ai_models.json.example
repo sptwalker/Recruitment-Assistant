@@ -1,0 +1,15 @@
+{
+  "active": "",
+  "parse_profile_id": "",
+  "profiles": [
+    {
+      "id": "example1",
+      "name": "DeepSeek",
+      "api_key": "",
+      "base_url": "https://api.deepseek.com/v1",
+      "model": "deepseek-chat",
+      "enabled": true,
+      "primary": true
+    }
+  ]
+}

@@ -11,6 +11,7 @@ from sqlalchemy.orm import selectinload
 
 from components.layout import inject_vibe_style, page_header
 from recruitment_assistant.config.settings import get_settings
+import recruitment_assistant.services.resume_ai_service as resume_ai_service_module
 from recruitment_assistant.services.resume_ai_service import ResumeAIService
 from recruitment_assistant.services.resume_archive_service import ResumeArchiveService
 from recruitment_assistant.storage.resume_db import create_resume_session, init_resume_database
@@ -25,6 +26,7 @@ def ensure_resume_database_initialized() -> None:
 
 
 ensure_resume_database_initialized()
+get_settings.cache_clear()
 settings = get_settings()
 
 st.set_page_config(page_title="面试管理", layout="wide", initial_sidebar_state="collapsed")
@@ -33,15 +35,25 @@ page_header("面试管理", "集中跟进待面试、面试轮次、评价记录
 
 
 @st.cache_resource
-def get_ai_service(api_key: str, base_url: str, model: str) -> ResumeAIService:
-    return ResumeAIService(
-        api_key=api_key,
-        base_url=base_url,
-        model=model,
-    )
+def get_ai_service(chain_key: tuple) -> ResumeAIService:
+    endpoints = [
+        {"name": n, "api_key": k, "base_url": u, "model": m}
+        for (n, k, u, m) in chain_key
+    ]
+    if not endpoints:
+        endpoints = [{"name": "默认接口", "api_key": settings.ai_api_key,
+                      "base_url": settings.ai_base_url, "model": settings.ai_model}]
+    return ResumeAIService(endpoints=endpoints)
 
 
-ai_service = get_ai_service(settings.ai_api_key, settings.ai_base_url, settings.ai_model)
+def _current_ai_service() -> ResumeAIService:
+    from recruitment_assistant.config.ai_model_manager import get_endpoint_chain
+    chain = get_endpoint_chain()
+    chain_key = tuple((e["name"], e["api_key"], e["base_url"], e["model"]) for e in chain)
+    return get_ai_service(chain_key)
+
+
+ai_service = _current_ai_service()
 ROUND_LABELS = ["一面", "二面", "三面", "四面", "五面"]
 FILTERS = ["待面试", "第一轮面试", "第二轮面试", "第三轮以上面试", "已取消"]
 
@@ -238,6 +250,8 @@ def _open_outline_dialog():
                     evaluations=eval_text,
                 )
                 outline_row = svc.save_outline(inv_id, cand.candidate_id, inv.position_id, content)
+                for _fmsg in resume_ai_service_module.pop_failover_notices():
+                    st.warning(_fmsg)
 
         st.markdown(
             f"<div style='font-size:28px;font-weight:900;margin-bottom:8px;'>{cand.name}</div>"

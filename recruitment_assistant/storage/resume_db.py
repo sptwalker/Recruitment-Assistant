@@ -37,7 +37,9 @@ def create_resume_session() -> Session:
 
 
 def init_resume_database() -> None:
-    from recruitment_assistant.storage.resume_models import ResumeBase as _  # noqa: F401 ensure models registered
+    # 导入两套模型，确保全部表注册到统一 metadata（候选人 PII + 岗位/采集）
+    from recruitment_assistant.storage import resume_models as _rm  # noqa: F401
+    from recruitment_assistant.storage import models as _m  # noqa: F401
     ResumeBase.metadata.create_all(bind=resume_engine)
     _migrate_add_attachment_works_path()
     _migrate_add_match_dimensions()
@@ -69,3 +71,6 @@ def _migrate_add_match_dimensions() -> None:
             conn.exec_driver_sql("ALTER TABLE position_matches ADD COLUMN education_match INTEGER")
         if "location_match" not in cols:
             conn.exec_driver_sql("ALTER TABLE position_matches ADD COLUMN location_match INTEGER")
+        # ✨ jd_hash：记录评分时使用的 JD 文本哈希，JD 未变则跳过重复调用 LLM
+        if "jd_hash" not in cols:
+            conn.exec_driver_sql("ALTER TABLE position_matches ADD COLUMN jd_hash TEXT")

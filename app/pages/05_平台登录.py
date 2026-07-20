@@ -25,7 +25,9 @@ from recruitment_assistant.config.ai_model_manager import (
     add_profile,
     update_profile,
     delete_profile,
-    set_active_profile,
+    set_primary_profile,
+    set_profile_enabled,
+    set_parse_profile,
 )
 
 
@@ -129,42 +131,28 @@ def open_save_theme_dialog():
         st.rerun()
 
 
-tabs = st.tabs(["AI模型", "主题风格"])
+tabs = st.tabs(["AI模型", "主题风格", "数据备份"])
 
 
 with tabs[0]:
     st.caption("用于简历结构化解析、岗位匹配等 AI 功能。支持 DeepSeek / 通义千问 / OpenAI 等兼容 OpenAI 格式的 API。")
+    st.info("🌟 **主要接口**用于所有 AI 调用；调用失败时会自动降级到其他**已启用**的备用接口，并提示你。可添加多个接口。", icon="ℹ️")
 
     data = load_profiles()
     profiles = data.get("profiles", [])
-    active_id = data.get("active", "")
-
-    # ---- 当前使用模型 切换 ----
-    if profiles:
-        profile_names = [p["name"] for p in profiles]
-        active_idx = next((i for i, p in enumerate(profiles) if p["id"] == active_id), 0)
-        chosen_idx = st.selectbox(
-            "当前使用模型",
-            range(len(profiles)),
-            index=active_idx,
-            format_func=lambda i: f"✅ {profiles[i]['name']}（{profiles[i]['model']}）" if profiles[i]["id"] == active_id else f"{profiles[i]['name']}（{profiles[i]['model']}）",
-            key="ai_active_select",
-        )
-        if profiles[chosen_idx]["id"] != active_id:
-            set_active_profile(profiles[chosen_idx]["id"])
-            st.toast(f"已切换到 **{profiles[chosen_idx]['name']}**", icon="✅")
-            st.rerun()
-
-    st.divider()
+    primary_id = next((p["id"] for p in profiles if p.get("primary")), "")
 
     # ---- 模型列表 ----
-    st.markdown("**已配置模型**")
+    st.markdown("**已配置接口**")
     if not profiles:
-        st.info("暂无模型配置，请在下方添加。")
+        st.info("暂无接口配置，请在下方添加。")
 
     for idx, prof in enumerate(profiles):
-        is_active = prof["id"] == active_id
-        label = f"{'✅ ' if is_active else ''}{prof['name']}（{prof['model']}）"
+        is_primary = prof["id"] == primary_id
+        is_enabled = prof.get("enabled", True)
+        badge = "🌟 主要　" if is_primary else ""
+        state = "" if is_enabled else "（已禁用）"
+        label = f"{badge}{prof['name']}（{prof['model']}）{state}"
         with st.expander(label, expanded=False):
             p_name = st.text_input("名称", value=prof["name"], key=f"pname_{prof['id']}")
             key_col, test_col = st.columns([0.78, 0.22])
@@ -179,26 +167,67 @@ with tabs[0]:
                 st.session_state["ai_api_test_config"] = {"api_key": p_key, "base_url": p_url, "model": p_model}
                 open_ai_api_key_test_dialog()
 
-            btn_cols = st.columns(3)
+            # 第一行：设为主要 / 启用禁用
+            sw_cols = st.columns(2)
+            if is_primary:
+                sw_cols[0].button("🌟 主要接口", key=f"pprimary_{prof['id']}", use_container_width=True, disabled=True)
+            else:
+                if sw_cols[0].button("设为主要", key=f"pprimary_{prof['id']}", use_container_width=True):
+                    if not p_key.strip():
+                        st.warning("请先填写并保存 API Key 再设为主要接口")
+                    else:
+                        set_primary_profile(prof["id"])
+                        st.toast(f"已将 **{prof['name']}** 设为主要接口", icon="🌟")
+                        st.rerun()
+            if is_primary:
+                sw_cols[1].button("主接口默认启用", key=f"penable_{prof['id']}", use_container_width=True, disabled=True)
+            elif is_enabled:
+                if sw_cols[1].button("🚫 禁用", key=f"penable_{prof['id']}", use_container_width=True):
+                    set_profile_enabled(prof["id"], False)
+                    st.toast(f"已禁用 **{prof['name']}**")
+                    st.rerun()
+            else:
+                if sw_cols[1].button("✅ 启用", key=f"penable_{prof['id']}", use_container_width=True):
+                    set_profile_enabled(prof["id"], True)
+                    st.toast(f"已启用 **{prof['name']}**")
+                    st.rerun()
+
+            # 第二行：保存 / 删除
+            btn_cols = st.columns(2)
             if btn_cols[0].button("💾 保存修改", key=f"psave_{prof['id']}", use_container_width=True):
                 update_profile(prof["id"], name=p_name, api_key=p_key, base_url=p_url, model=p_model)
                 st.toast(f"**{p_name}** 配置已保存", icon="✅")
                 st.rerun()
-            if not is_active:
-                if btn_cols[1].button("✅ 设为当前", key=f"pactivate_{prof['id']}", use_container_width=True):
-                    set_active_profile(prof["id"])
-                    st.session_state["ai_active_select"] = idx
-                    st.toast(f"已切换到 **{prof['name']}**", icon="✅")
-                    st.rerun()
-            else:
-                btn_cols[1].button("当前使用中", key=f"pactivate_{prof['id']}", use_container_width=True, disabled=True)
-            if btn_cols[2].button("🗑️ 删除", key=f"pdel_{prof['id']}", use_container_width=True):
-                if is_active and len(profiles) <= 1:
-                    st.warning("至少保留一个模型配置")
+            if btn_cols[1].button("🗑️ 删除", key=f"pdel_{prof['id']}", use_container_width=True):
+                if len(profiles) <= 1:
+                    st.warning("至少保留一个接口配置")
                 else:
                     delete_profile(prof["id"])
                     st.toast(f"已删除 **{prof['name']}**")
                     st.rerun()
+
+    st.divider()
+
+    # ---- 简历解析专用接口（可选更快的模型）----
+    if profiles:
+        st.markdown("**简历解析专用接口**")
+        st.caption("简历解析是简单的结构化任务，可选一个更快的模型（如 DeepSeek/通义），解析速度远快于推理大模型；岗位匹配仍用主接口。留空＝跟随主接口。")
+        enabled_profiles = [p for p in profiles if p.get("enabled") and p.get("api_key")]
+        parse_pid = data.get("parse_profile_id", "") or ""
+        opts = [""] + [p["id"] for p in enabled_profiles]
+        id_to_name = {p["id"]: f"{p['name']}（{p['model']}）" for p in enabled_profiles}
+        cur_idx = opts.index(parse_pid) if parse_pid in opts else 0
+        chosen_parse = st.selectbox(
+            "解析使用的接口",
+            opts,
+            index=cur_idx,
+            format_func=lambda pid: "跟随主接口" if pid == "" else id_to_name.get(pid, pid),
+            key="parse_profile_select",
+        )
+        if chosen_parse != parse_pid:
+            set_parse_profile(chosen_parse or None)
+            st.toast("解析专用接口已更新", icon="⚡")
+            st.rerun()
 
     st.divider()
 
@@ -240,9 +269,7 @@ with tabs[0]:
             elif not new_model.strip():
                 st.warning("请填写模型名称")
             else:
-                prof = add_profile(new_name.strip(), new_key.strip(), new_url.strip(), new_model.strip())
-                if len(load_profiles()["profiles"]) == 1:
-                    set_active_profile(prof["id"])
+                add_profile(new_name.strip(), new_key.strip(), new_url.strip(), new_model.strip())
                 st.toast(f"已添加 **{new_name}**", icon="✅")
                 st.rerun()
 
@@ -315,3 +342,75 @@ with tabs[1]:
 
         if st.session_state.get("theme_overrides"):
             st.caption(f"已修改 {len(st.session_state['theme_overrides'])} 个变量，预览已实时更新。点击「保存自定义主题」持久化。")
+
+
+with tabs[2]:
+    st.markdown("### 数据备份与导出")
+    st.info(
+        "简历数据库（含全部候选人信息）保存在本机 `data/resume_archive.db`。"
+        "卸载或换机前请务必**先备份**——建议定期一键备份并把备份文件另存到别处。",
+        icon="🛡️",
+    )
+
+    from recruitment_assistant.services.backup_service import backup_resume_db, list_backups
+    from recruitment_assistant.services.resume_archive_service import ResumeArchiveService
+    from recruitment_assistant.storage.resume_db import create_resume_session
+
+    b_cols = st.columns(2)
+    with b_cols[0]:
+        st.markdown("**① 备份简历数据库**")
+        if st.button("💾 立即备份", use_container_width=True, type="primary", key="do_backup"):
+            try:
+                dest = backup_resume_db()
+                st.session_state["_last_backup"] = str(dest)
+                st.toast(f"已备份到 {dest.name}", icon="✅")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"备份失败：{exc}")
+        last = st.session_state.get("_last_backup")
+        if last and Path(last).exists():
+            with open(last, "rb") as fh:
+                st.download_button(
+                    "⬇️ 下载刚才的备份", data=fh.read(),
+                    file_name=Path(last).name, mime="application/octet-stream",
+                    use_container_width=True, key="dl_last_backup",
+                )
+
+    with b_cols[1]:
+        st.markdown("**② 导出候选人名单（Excel）**")
+        if st.button("📊 生成 Excel", use_container_width=True, key="do_export"):
+            import io
+            import pandas as pd
+            _s = create_resume_session()
+            try:
+                rows = ResumeArchiveService(_s).export_candidates()
+            finally:
+                _s.close()
+            if not rows:
+                st.warning("暂无候选人可导出。")
+            else:
+                buf = io.BytesIO()
+                pd.DataFrame(rows).to_excel(buf, index=False, engine="openpyxl")
+                st.session_state["_export_xlsx"] = buf.getvalue()
+                st.session_state["_export_count"] = len(rows)
+        if st.session_state.get("_export_xlsx"):
+            from datetime import datetime as _dt
+            st.download_button(
+                f"⬇️ 下载 Excel（{st.session_state.get('_export_count', 0)} 人）",
+                data=st.session_state["_export_xlsx"],
+                file_name=f"候选人名单_{_dt.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True, key="dl_export",
+            )
+
+    st.divider()
+    st.markdown("**已有备份**")
+    backups = list_backups()
+    if not backups:
+        st.caption("暂无备份。点击上方「立即备份」创建第一个。")
+    else:
+        for b in backups:
+            row = st.columns([3, 1.4, 1.2])
+            row[0].text(b["name"])
+            row[1].caption(f"{b['size_kb']} KB")
+            row[2].caption(b["mtime"])

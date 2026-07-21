@@ -75,6 +75,12 @@ def open_ai_api_key_test_dialog():
             )
         elapsed = time.perf_counter() - started_at
         content = (resp.choices[0].message.content or "").strip()
+        # ✨ 记录连通性测试的 AI 用量
+        try:
+            from recruitment_assistant.services.monitoring import record_ai_usage
+            record_ai_usage("连通性测试", model, model, False, getattr(resp, "usage", None))
+        except Exception:
+            pass
         st.success("AI API 接口正常，API Key 可用。")
         st.write(f"响应耗时：`{elapsed:.2f}s`")
         st.write(f"接口返回：`{content or '空响应'}`")

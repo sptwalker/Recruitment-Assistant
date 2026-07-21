@@ -325,9 +325,10 @@ class ResumeAIService:
     def is_configured(self) -> bool:
         return any(ep["api_key"] for ep in self._endpoints)
 
-    def _chat_completion(self, **kwargs):
+    def _chat_completion(self, *, feature: str = "unknown", **kwargs):
         """统一的补全调用入口：单端点内瞬时重试 2 次，耗尽后自动降级到下一端点。
 
+        feature 标识调用来源（parse/match/outline…），用于 AI 用量监测（不传给 SDK）。
         可降级错误：超时 / 连接失败 / 限流 / 5xx / 401 鉴权失败。
         其余错误（如 400 业务错误）立即抛出，由调用方处理。
 
@@ -349,6 +350,13 @@ class ResumeAIService:
             for attempt in range(PER_ENDPOINT_RETRIES + 1):
                 try:
                     resp = client.chat.completions.create(model=ep["model"], **call_kwargs)
+                    # ✨ AI 用量监测（best-effort，不影响调用）
+                    try:
+                        from recruitment_assistant.services.monitoring import record_ai_usage
+                        record_ai_usage(feature, ep["name"], ep["model"], idx != 0,
+                                        getattr(resp, "usage", None))
+                    except Exception:
+                        pass
                     if idx != 0:
                         prev = self._endpoints[0]
                         logger.warning("[AI降级] 「{}」→「{}」，原因：{}",
@@ -400,6 +408,7 @@ class ResumeAIService:
         for attempt in range(retry + 1):
             try:
                 resp = self._chat_completion(
+                    feature="parse",
                     messages=[
                         {"role": "system", "content": SYSTEM_PROMPT},
                         {"role": "user", "content": f"附件文件名：{source_name or '-'}\n\n请解析以下简历：\n\n{raw_text[:MAX_RESUME_TEXT_CHARS]}"},
@@ -519,6 +528,7 @@ class ResumeAIService:
         # 瞬时重试 + 多端点自动降级统一由 _chat_completion 处理
         logger.info("[岗位匹配] 正在调用 AI API...")
         resp = self._chat_completion(
+            feature="match",
             messages=[
                 {"role": "system", "content": "你是招聘匹配助手。对每位候选人进行多维度评估（技能/经验/学历/地域），严格只输出 JSON，不要输出任何解释文字。"},
                 {"role": "user", "content": prompt},
@@ -728,6 +738,7 @@ class ResumeAIService:
         prompt_parts.append("请根据以上素材，严格按照系统提示中的强制输出格式，生成该候选人的专属结构化面试大纲。")
         try:
             resp = self._chat_completion(
+                feature="outline",
                 messages=[
                     {"role": "system", "content": self._OUTLINE_SYSTEM_PROMPT},
                     {"role": "user", "content": "\n\n".join(prompt_parts)},

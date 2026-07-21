@@ -51,6 +51,20 @@ class CrawlTaskService:
         self.session.add(task)
         self.session.commit()
         self.session.refresh(task)
+        # ✨ 写系统操作日志（best-effort）——一处覆盖 BOSS/智联/51 三平台
+        try:
+            from recruitment_assistant.services.monitoring import record_operation
+            _plat = {"boss": "BOSS直聘", "zhilian": "智联招聘", "qiancheng": "51前程无忧"}.get(
+                task.platform_code, task.platform_code or "")
+            _tgt = f"{_plat}" + (f"·{task.query_keyword}" if task.query_keyword else "")
+            record_operation(
+                "简历采集", target=_tgt, status=status,
+                detail=f"成功{success_count} 失败{failed_count}"
+                       + (f"；{error_message}" if error_message else ""),
+                started_at=task.started_at,
+            )
+        except Exception:
+            pass
         return task
 
     def list_tasks(self, limit: int = 50, platform_code: str | None = None) -> list[CrawlTask]:

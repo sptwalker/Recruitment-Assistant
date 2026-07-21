@@ -250,6 +250,11 @@ def _open_outline_dialog():
                     evaluations=eval_text,
                 )
                 outline_row = svc.save_outline(inv_id, cand.candidate_id, inv.position_id, content)
+                try:
+                    from recruitment_assistant.services.monitoring import record_operation
+                    record_operation("面试大纲生成", target=cand.name, status="成功")
+                except Exception:
+                    pass
                 for _fmsg in resume_ai_service_module.pop_failover_notices():
                     st.warning(_fmsg)
 

@@ -10,8 +10,10 @@ skills_certificates / job_intention / honors / resume_source / system_evaluation
 from datetime import date, datetime
 
 from sqlalchemy import (
+    Boolean,
     Date,
     DateTime,
+    Float,
     ForeignKey,
     Integer,
     String,
@@ -262,3 +264,33 @@ class InterviewOutline(ResumeBase):
     content: Mapped[str] = mapped_column(Text, nullable=False)
     create_time: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     update_time: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class OperationLog(ResumeBase):
+    """系统操作日志：记录用户主要操作（采集/解析/匹配/邀约/评价…）及结果。"""
+    __tablename__ = "operation_log"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    action: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    target: Mapped[str | None] = mapped_column(String(255))
+    status: Mapped[str | None] = mapped_column(String(32))
+    detail: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime)
+    duration_seconds: Mapped[float | None] = mapped_column(Float)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), index=True)
+
+
+class AiUsageLog(ResumeBase):
+    """AI 调用用量记录：每次 LLM 调用一行（功能模块/接口/模型/token）。"""
+    __tablename__ = "ai_usage_log"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    feature: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    endpoint_name: Mapped[str | None] = mapped_column(String(128))
+    model: Mapped[str | None] = mapped_column(String(128))
+    is_failover: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    prompt_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    completion_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), index=True)

@@ -231,6 +231,15 @@ class ResumeArchiveService:
         self.session.add(ev)
         self.session.commit()
         self.session.refresh(ev)
+        try:
+            from recruitment_assistant.services.monitoring import record_operation
+            _cand = self.session.get(Candidate, candidate_id)
+            _name = _cand.name if _cand else str(candidate_id)
+            record_operation("面试评价", target=f"{_name}·{interview_round or '面试'}",
+                             status=conclusion or "已保存",
+                             detail=f"评分{score}" if score is not None else "")
+        except Exception:
+            pass
         return ev
 
     def list_interview_evals(self, candidate_id: int | None = None) -> list[InterviewEvaluation]:
@@ -276,6 +285,13 @@ class ResumeArchiveService:
         self.session.add(inv)
         self.session.commit()
         self.session.refresh(inv)
+        try:
+            from recruitment_assistant.services.monitoring import record_operation
+            _cand = self.session.get(Candidate, candidate_id)
+            record_operation("面试邀约", target=(_cand.name if _cand else str(candidate_id)),
+                             status="已发起")
+        except Exception:
+            pass
         return inv
 
     def get_invitation(self, invitation_id: int) -> InterviewInvitation | None:

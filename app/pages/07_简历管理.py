@@ -486,6 +486,7 @@ with tabs[0]:
     if start_btn:
         # 任务开始：按日期过滤文件列表 + 初始化统计
         st.session_state.parse_task_state = "running"
+        st.session_state["parse_started_at"] = datetime.now()
         since_dt = datetime.combine(st.session_state.parse_since_date, datetime.min.time())
         filtered_files = [
             f for f in all_files
@@ -571,6 +572,18 @@ with tabs[0]:
 
             log("")
             log("💡 顶部 4 个 metric 数字将在下次刷新页面（F5 或切 tab）后更新。")
+
+            # ✨ 系统操作日志（简历解析入库）
+            try:
+                from recruitment_assistant.services.monitoring import record_operation
+                record_operation(
+                    "简历解析入库", target=f"{len(queue)}份",
+                    status=("已停止" if is_stopping else "完成"),
+                    detail=f"成功{results['success_count']} 跳过{results['skip_count']} 失败{results['fail_count']}",
+                    started_at=st.session_state.get("parse_started_at"),
+                )
+            except Exception:
+                pass
 
             # 归位
             st.session_state.parse_task_state = "idle"
@@ -1306,11 +1319,13 @@ def _run_single_position_match(pos, svc, ai_service, candidate_dicts, force: boo
     force=False：只评「未评分/JD 变化」的候选人，其余复用；force=True：清空全量重算。
     """
     POSITION_MATCH_TIMEOUT = 180
+    _op_start = datetime.now()
     prep = _prepare_position_match(pos, svc, candidate_dicts, force=force)
     debug_logger = prep["debug_logger"]
     try:
         chunks = prep["chunks"]
         if not chunks:
+            _record_match_op(pos, 0, 0, False, prep["reused"], _op_start)
             return 0, 0, False, prep["reused"]
 
         save_ok, save_fail = 0, 0
@@ -1329,10 +1344,31 @@ def _run_single_position_match(pos, svc, ai_service, candidate_dicts, force: boo
             save_fail += fail
 
         debug_logger.log_save_result(save_ok, save_fail, [])
+        _record_match_op(pos, save_ok, save_fail, timed_out, prep["reused"], _op_start)
         return save_ok, save_fail, timed_out, prep["reused"]
     finally:
         log_path = debug_logger.finalize()
         logger.info("[调试日志] 匹配调试日志已保存: {}", log_path)
+
+
+def _record_match_op(pos, save_ok, save_fail, timed_out, reused, started_at, status=None):
+    """写岗位匹配的系统操作日志（best-effort）。status 可显式覆盖（如手动停止）。"""
+    try:
+        from recruitment_assistant.services.monitoring import record_operation
+        if status is None:
+            if save_ok == 0 and reused > 0 and save_fail == 0:
+                status = "全部复用"
+            elif timed_out:
+                status = "超时截断"
+            elif save_fail > 0:
+                status = "部分失败"
+            else:
+                status = "完成"
+        record_operation("岗位匹配", target=pos.title, status=status,
+                         detail=f"新评{save_ok} 复用{reused} 失败{save_fail}",
+                         started_at=started_at)
+    except Exception:
+        pass
 
 
 # ---------- Excel 批量导入工具函数 ----------
@@ -1923,6 +1959,7 @@ with tabs[2]:
                             "full_jd": prep["full_jd"],
                             "debug_logger": prep["debug_logger"],
                             "stopped": False,
+                            "op_start": datetime.now(),
                         }
                         st.rerun()
 
@@ -1943,6 +1980,10 @@ with tabs[2]:
                         if sm["stopped"]:
                             dbg.log("stopped", f"用户停止，已评估 {done}/{total}")
                         dbg.finalize()
+                        # ✨ 系统操作日志（手动匹配）
+                        _record_match_op(sel_pos, sm["save_ok"], sm["save_fail"],
+                                         False, sm["reused"], sm.get("op_start"),
+                                         status="已停止" if sm["stopped"] else None)
                         _show_failover_notices()
                         reuse_note = f"，复用已评分 {sm['reused']} 人" if sm["reused"] > 0 else ""
                         if sm["stopped"]:

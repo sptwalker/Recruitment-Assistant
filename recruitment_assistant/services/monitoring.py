@@ -11,7 +11,7 @@ from datetime import datetime as _dt
 from loguru import logger
 from sqlalchemy import func, select
 
-from recruitment_assistant.storage.db import create_session
+from recruitment_assistant.storage import db  # 用模块引用调用 create_session，便于测试 monkeypatch
 from recruitment_assistant.storage.resume_models import AiUsageLog, OperationLog
 
 
@@ -23,7 +23,7 @@ def record_operation(action: str, target: str = "", status: str = "",
     try:
         now = _dt.now()
         duration = (now - started_at).total_seconds() if started_at else None
-        s = create_session()
+        s = db.create_session()
         try:
             from recruitment_assistant.storage import tenancy
             s.add(OperationLog(
@@ -47,7 +47,7 @@ def record_ai_usage(feature: str, endpoint_name: str | None, model: str | None,
         pt = int(getattr(usage, "prompt_tokens", 0) or 0)
         ct = int(getattr(usage, "completion_tokens", 0) or 0)
         tt = int(getattr(usage, "total_tokens", 0) or 0) or (pt + ct)
-        s = create_session()
+        s = db.create_session()
         try:
             s.add(AiUsageLog(
                 feature=feature, endpoint_name=endpoint_name, model=model,
@@ -76,16 +76,19 @@ def _fmt(dt: datetime | None) -> str:
         return str(dt or "")
 
 
-def list_operations(day: date, limit: int = 2000) -> list[dict]:
-    """按日期返回操作日志（当天，倒序）。"""
+def list_operations(day: date, limit: int = 2000, tenant_id: int | None = None) -> list[dict]:
+    """按日期返回操作日志（当天，倒序）。tenant_id 非空则只返回该租户（M2 多租户隔离）。"""
     start, end = _day_bounds(day)
-    s = create_session()
+    s = db.create_session()
     try:
-        rows = s.scalars(
+        stmt = (
             select(OperationLog)
             .where(OperationLog.created_at >= start, OperationLog.created_at <= end)
-            .order_by(OperationLog.created_at.desc())
-            .limit(limit)
+        )
+        if tenant_id is not None:
+            stmt = stmt.where(OperationLog.tenant_id == tenant_id)
+        rows = s.scalars(
+            stmt.order_by(OperationLog.created_at.desc()).limit(limit)
         ).all()
         return [{
             "时间": _fmt(r.created_at),
@@ -100,16 +103,18 @@ def list_operations(day: date, limit: int = 2000) -> list[dict]:
         s.close()
 
 
-def operation_summary(day: date) -> dict[str, int]:
-    """当天各 action 计数。"""
+def operation_summary(day: date, tenant_id: int | None = None) -> dict[str, int]:
+    """当天各 action 计数。tenant_id 非空则只统计该租户。"""
     start, end = _day_bounds(day)
-    s = create_session()
+    s = db.create_session()
     try:
-        rows = s.execute(
+        stmt = (
             select(OperationLog.action, func.count(OperationLog.id))
             .where(OperationLog.created_at >= start, OperationLog.created_at <= end)
-            .group_by(OperationLog.action)
-        ).all()
+        )
+        if tenant_id is not None:
+            stmt = stmt.where(OperationLog.tenant_id == tenant_id)
+        rows = s.execute(stmt.group_by(OperationLog.action)).all()
         return {action: int(cnt) for action, cnt in rows}
     finally:
         s.close()
@@ -118,7 +123,7 @@ def operation_summary(day: date) -> dict[str, int]:
 def list_ai_usage(day: date, limit: int = 3000) -> list[dict]:
     """按日期返回 AI 用量明细（当天，倒序）。"""
     start, end = _day_bounds(day)
-    s = create_session()
+    s = db.create_session()
     try:
         rows = s.scalars(
             select(AiUsageLog)
@@ -155,7 +160,7 @@ def _feature_label(feature: str) -> str:
 def ai_usage_summary() -> dict:
     """今日/累计 调用次数 + token；并按 feature 分组（累计）。"""
     today_start, today_end = _day_bounds(_dt.now().date())
-    s = create_session()
+    s = db.create_session()
     try:
         def _agg(stmt):
             cnt, tot = s.execute(stmt).one()

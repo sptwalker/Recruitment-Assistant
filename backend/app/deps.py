@@ -51,12 +51,17 @@ def require_role(*roles: Role):
     return _dep
 
 
-def tenant_ctx(user: User = Depends(get_current_user)) -> Generator[User, None, None]:
+async def tenant_ctx(user: User = Depends(get_current_user)):
     """设置本请求的租户/用户上下文，供 storage.tenancy 的 ORM 层过滤/盖章使用；请求结束复位。
 
     业务路由都应 Depends(tenant_ctx)（而非直接 get_current_user），以保证租户过滤生效。
+    recruiter 只看自己盖章的根业务表（owner_id==自己）；admin/manager 看整租户。
+
+    必须是 async：ContextVar 在请求所在的事件循环上下文里 set，sync 端点经 threadpool
+    执行时会复制该上下文 → 过滤对 sync handler 生效（sync 依赖里 set 则不会传播过去）。
     """
-    tokens = tenancy.set_context(user.org_id, user.id)
+    owner_only = user.id if user.role == Role.recruiter.value else None
+    tokens = tenancy.set_context(user.org_id, user.id, owner_only)
     try:
         yield user
     finally:

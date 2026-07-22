@@ -38,6 +38,11 @@ def create_app() -> FastAPI:
     from backend.app.auth.feishu import router as auth_router
     app.include_router(auth_router)
 
+    from backend.app.routers import candidates, jobs, logs
+    app.include_router(candidates.router)
+    app.include_router(jobs.router)
+    app.include_router(logs.router)
+
     @app.get("/healthz")
     def healthz() -> dict:
         return {"status": "ok"}

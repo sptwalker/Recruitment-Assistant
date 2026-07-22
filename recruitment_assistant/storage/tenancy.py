@@ -21,6 +21,9 @@ from sqlalchemy.orm import Mapped, Session, mapped_column, with_loader_criteria
 
 _tenant_id: ContextVar[int | None] = ContextVar("tenant_id", default=None)
 _user_id: ContextVar[int | None] = ContextVar("user_id", default=None)
+# 行级归属过滤：设为某 user_id 时，OwnedMixin 根表只见 owner_id==该值（recruiter 只看自己的）。
+# None = 不按归属过滤（admin/manager 看整租户，或无上下文）。
+_owner_only: ContextVar[int | None] = ContextVar("owner_only", default=None)
 
 # 执行选项：显式绕过租户过滤（如跨租户后台维护），谨慎使用。
 SKIP_TENANT = "skip_tenant_filter"
@@ -38,19 +41,20 @@ class OwnedMixin(TenantMixin):
     owner_id: Mapped[int | None] = mapped_column(Integer, index=True, nullable=True)
 
 
-def set_context(tenant_id: int | None, user_id: int | None):
-    return _tenant_id.set(tenant_id), _user_id.set(user_id)
+def set_context(tenant_id: int | None, user_id: int | None, owner_only: int | None = None):
+    return _tenant_id.set(tenant_id), _user_id.set(user_id), _owner_only.set(owner_only)
 
 
 def reset_context(tokens) -> None:
-    t_tok, u_tok = tokens
+    t_tok, u_tok, o_tok = tokens
     _tenant_id.reset(t_tok)
     _user_id.reset(u_tok)
+    _owner_only.reset(o_tok)
 
 
 @contextmanager
-def tenant_scope(tenant_id: int | None, user_id: int | None = None):
-    tokens = set_context(tenant_id, user_id)
+def tenant_scope(tenant_id: int | None, user_id: int | None = None, owner_only: int | None = None):
+    tokens = set_context(tenant_id, user_id, owner_only)
     try:
         yield
     finally:
@@ -80,6 +84,13 @@ def _apply_tenant_filter(state) -> None:
             TenantMixin, lambda cls: cls.tenant_id == tid, include_aliases=True
         )
     )
+    oid = _owner_only.get()
+    if oid is not None:  # recruiter：根业务表再叠 owner_id==自己
+        state.statement = state.statement.options(
+            with_loader_criteria(
+                OwnedMixin, lambda cls: cls.owner_id == oid, include_aliases=True
+            )
+        )
 
 
 @event.listens_for(Session, "before_flush")

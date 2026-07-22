@@ -354,9 +354,10 @@ class ResumeArchiveService:
             "location_match": dimensions.get("location_match") if dimensions else None,
             "jd_hash": jd_hash,
         }
-        # ponytail: core insert 绕过 before_flush 盖章；M2.3 走 API（有租户上下文）时
-        # 需显式 values["tenant_id"] = tenancy.current_tenant_id()，否则匹配行 tenant_id 为空
-        # → 被租户过滤（fail-closed，非泄露）。无上下文（Streamlit/测试）下保持现状。
+        # core insert 绕过 before_flush 盖章：有租户上下文（走 API）时显式盖 tenant_id，
+        # 否则匹配行 tenant_id 为空 → 被租户过滤（fail-closed）。无上下文（Streamlit/测试）→ None。
+        from recruitment_assistant.storage import tenancy
+        values["tenant_id"] = tenancy.current_tenant_id()
         stmt = _insert(PositionMatch).values(**values)
         stmt = stmt.on_conflict_do_update(
             index_elements=["position_id", "candidate_id"],

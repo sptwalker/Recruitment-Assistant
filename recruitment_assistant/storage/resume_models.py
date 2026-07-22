@@ -282,7 +282,11 @@ class OperationLog(ResumeBase):
     started_at: Mapped[datetime | None] = mapped_column(DateTime)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime)
     duration_seconds: Mapped[float | None] = mapped_column(Float)
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), index=True)
+    # default=本地 now()：查询按本地 date.today() 过滤，若用 server_default=func.now()（SQLite 存 UTC）
+    # 在 UTC+N 时区近午夜会与查询日界错位（当天日志查不到）。与 started_at/finished_at 同用本地时间。
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.now, server_default=func.now(), index=True
+    )
 
 
 class AiUsageLog(ResumeBase):
@@ -297,4 +301,6 @@ class AiUsageLog(ResumeBase):
     prompt_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     completion_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     total_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), index=True)
+    created_at: Mapped[datetime] = mapped_column(  # 本地 now()，理由同 OperationLog.created_at
+        DateTime, default=datetime.now, server_default=func.now(), index=True
+    )

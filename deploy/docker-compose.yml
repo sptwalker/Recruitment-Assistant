@@ -1,10 +1,13 @@
-# M2 部署编排。M2.0 先起 PostgreSQL 供本地开发/迁移验证；
-# backend / frontend 容器在 M2.6 补入。
+# M2 部署编排：postgres + backend(FastAPI) + frontend(nginx 托管 SPA + 反代)。
 #
 # 用法：
-#   docker compose -f deploy/docker-compose.yml up -d db
-#   export DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5432/recruitment
-#   python -m alembic -c alembic.ini upgrade head   # 或后端启动时自动 upgrade
+#   1) 建 deploy/.env（勿提交），至少设 JWT_SECRET；飞书登录再补 FEISHU_*。
+#        JWT_SECRET=<强随机 32+ 字符>
+#        FEISHU_APP_ID=... / FEISHU_APP_SECRET=... / FEISHU_REDIRECT_URI=http://<域名>/auth/feishu/callback
+#   2) docker compose -f deploy/docker-compose.yml --env-file deploy/.env up -d --build
+#   3) 访问 http://<域名>/ （nginx 同源反代后端，cookie/WS 生效）
+#
+# 中国网络：Docker Hub 不可达时给 daemon 配 registry-mirror（如 docker.m.daocloud.io）。
 services:
   db:
     image: postgres:16-alpine
@@ -12,8 +15,6 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: recruitment
-    ports:
-      - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -21,6 +22,35 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+
+  backend:
+    build:
+      context: ..
+      dockerfile: deploy/backend.Dockerfile
+    environment:
+      # 连 db 容器；启动时自动 alembic upgrade head 建全表（PG 方言）。
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@db:5432/recruitment
+      # 密钥只走 env（勿提交）。JWT_SECRET 必填，缺失即报错拒启。
+      JWT_SECRET: ${JWT_SECRET:?请在 deploy/.env 设置 JWT_SECRET}
+      FEISHU_APP_ID: ${FEISHU_APP_ID:-}
+      FEISHU_APP_SECRET: ${FEISHU_APP_SECRET:-}
+      FEISHU_REDIRECT_URI: ${FEISHU_REDIRECT_URI:-http://localhost/auth/feishu/callback}
+      # 同源部署：SPA 与 API 同域，CORS 源即本站。
+      FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost}
+    depends_on:
+      db:
+        condition: service_healthy
+    expose:
+      - "8000"
+
+  frontend:
+    build:
+      context: ..
+      dockerfile: deploy/frontend.Dockerfile
+    ports:
+      - "${HTTP_PORT:-80}:80"
+    depends_on:
+      - backend
 
 volumes:
   pgdata:

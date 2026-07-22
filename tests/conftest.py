@@ -41,9 +41,10 @@ def temp_resume_db(tmp_path, monkeypatch):
     # backup_service 在 import 时绑定了 RESUME_DB_PATH，同步指向临时库
     monkeypatch.setattr(backup_service, "RESUME_DB_PATH", db_path, raising=True)
 
-    # 建表（导入两套模型，确保 18 张表全部注册到统一 metadata）
+    # 建表（导入全部模型，确保所有表注册到统一 metadata）
     from recruitment_assistant.storage.resume_models import ResumeBase
     from recruitment_assistant.storage import models as _m  # noqa: F401
+    from recruitment_assistant.storage import auth_models as _am  # noqa: F401
     ResumeBase.metadata.create_all(bind=engine)
 
     yield SessionLocal, db_path

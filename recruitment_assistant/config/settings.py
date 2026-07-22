@@ -29,6 +29,13 @@ class Settings(BaseSettings):
     ai_base_url: str = "https://api.deepseek.com/v1"
     ai_model: str = "deepseek-chat"
 
+    # M2 认证：飞书自建应用 + 本系统 JWT。密钥只走环境变量/.env，不入库。
+    feishu_app_id: str = ""
+    feishu_app_secret: str = ""
+    feishu_redirect_uri: str = "http://localhost:8000/auth/feishu/callback"
+    jwt_secret: str = "dev-insecure-change-me-0000000000000000"  # 生产必须用 env JWT_SECRET 覆盖
+    jwt_expire_hours: int = 168  # 7 天
+
     def ensure_local_dirs(self) -> None:
         for path in [
             self.export_dir,

@@ -83,9 +83,10 @@ def init_resume_database() -> None:
     from alembic import command
     from alembic.script import ScriptDirectory
 
-    # 注册两套模型到统一 metadata（env.py 也依赖）
+    # 注册全部模型到统一 metadata（env.py 也依赖）
     from recruitment_assistant.storage import resume_models as _rm  # noqa: F401
     from recruitment_assistant.storage import models as _m  # noqa: F401
+    from recruitment_assistant.storage import auth_models as _am  # noqa: F401
 
     insp = inspect(resume_engine)
     has_app_tables = insp.has_table("resume_source")
@@ -93,12 +94,14 @@ def init_resume_database() -> None:
 
     cfg = _alembic_config()
     if has_app_tables and not has_alembic and resume_engine.dialect.name == "sqlite":
-        # 老库引导（仅 SQLite）：补齐到当前模型 schema（== 基线），再打标基线，最后 upgrade
-        ResumeBase.metadata.create_all(bind=resume_engine)  # 补任何缺失的表
+        # 老库引导（仅 SQLite）：create_all 直接补齐到最新模型 schema（含后续迁移新增的表），
+        # 手工补齐历史缺失的列，再 stamp 到 head——因为 create_all 落的就是最新 metadata，
+        # 后续 DDL 迁移的效果已体现，stamp base+upgrade 会重复 create_table 而报错。
+        ResumeBase.metadata.create_all(bind=resume_engine)  # 补任何缺失的表（含 auth）
         _migrate_add_attachment_works_path()                # 补历史缺失的列
         _migrate_add_match_dimensions()
-        base_rev = ScriptDirectory.from_config(cfg).get_bases()[0]
-        command.stamp(cfg, base_rev)
+        head_rev = ScriptDirectory.from_config(cfg).get_current_head()
+        command.stamp(cfg, head_rev)
     command.upgrade(cfg, "head")
     _SCHEMA_READY = True
 

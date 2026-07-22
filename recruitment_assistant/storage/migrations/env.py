@@ -9,6 +9,7 @@ from sqlalchemy import engine_from_config, pool
 from recruitment_assistant.storage.db import Base
 from recruitment_assistant.storage import models  # noqa: F401
 from recruitment_assistant.storage import resume_models  # noqa: F401
+from recruitment_assistant.storage import auth_models  # noqa: F401
 from recruitment_assistant.storage.resume_db import resolve_db_url
 
 config = context.config

@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from backend.app.security import COOKIE_NAME, decode_access_token
 from recruitment_assistant.storage.auth_models import Role, User
 from recruitment_assistant.storage.db import SessionLocal
+from recruitment_assistant.storage import tenancy
 
 
 def get_db() -> Generator[Session, None, None]:
@@ -48,3 +49,15 @@ def require_role(*roles: Role):
         return user
 
     return _dep
+
+
+def tenant_ctx(user: User = Depends(get_current_user)) -> Generator[User, None, None]:
+    """设置本请求的租户/用户上下文，供 storage.tenancy 的 ORM 层过滤/盖章使用；请求结束复位。
+
+    业务路由都应 Depends(tenant_ctx)（而非直接 get_current_user），以保证租户过滤生效。
+    """
+    tokens = tenancy.set_context(user.org_id, user.id)
+    try:
+        yield user
+    finally:
+        tenancy.reset_context(tokens)

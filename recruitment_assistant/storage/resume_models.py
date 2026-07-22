@@ -24,9 +24,10 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from recruitment_assistant.storage.resume_db import ResumeBase
+from recruitment_assistant.storage.tenancy import OwnedMixin, TenantMixin
 
 
-class Candidate(ResumeBase):
+class Candidate(OwnedMixin, ResumeBase):
     __tablename__ = "candidates"
     __table_args__ = (
         UniqueConstraint("name", "age", "education_level", name="uq_candidate_dedup_fallback"),
@@ -142,7 +143,7 @@ class Honor(ResumeBase):
     candidate: Mapped["Candidate"] = relationship(back_populates="honors")
 
 
-class ResumeSource(ResumeBase):
+class ResumeSource(TenantMixin, ResumeBase):
     __tablename__ = "resume_source"
 
     source_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -176,7 +177,7 @@ class SystemEvaluation(ResumeBase):
     candidate: Mapped["Candidate"] = relationship(back_populates="system_evaluation")
 
 
-class InterviewEvaluation(ResumeBase):
+class InterviewEvaluation(TenantMixin, ResumeBase):
     __tablename__ = "interview_evaluations"
 
     eval_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -193,7 +194,7 @@ class InterviewEvaluation(ResumeBase):
     create_time: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
-class InterviewInvitation(ResumeBase):
+class InterviewInvitation(TenantMixin, ResumeBase):
     """面试邀约：浏览页发起 → 邀约 Tab 跟进 → 完成/解除。
 
     status 流转：pending(默认) → completed / cancelled。
@@ -218,7 +219,7 @@ class InterviewInvitation(ResumeBase):
     )
 
 
-class PositionMatch(ResumeBase):
+class PositionMatch(TenantMixin, ResumeBase):
     __tablename__ = "position_matches"
     __table_args__ = (
         UniqueConstraint("position_id", "candidate_id", name="uq_pos_cand_match"),
@@ -248,7 +249,7 @@ class PositionMatch(ResumeBase):
     create_time: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
-class InterviewOutline(ResumeBase):
+class InterviewOutline(TenantMixin, ResumeBase):
     __tablename__ = "interview_outlines"
 
     outline_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -275,6 +276,9 @@ class OperationLog(ResumeBase):
     target: Mapped[str | None] = mapped_column(String(255))
     status: Mapped[str | None] = mapped_column(String(32))
     detail: Mapped[str | None] = mapped_column(Text)
+    # 审计（M2.2）：谁在哪个租户做的。无请求上下文（本地/脚本）时为空。
+    actor_user_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    tenant_id: Mapped[int | None] = mapped_column(Integer, index=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime)
     duration_seconds: Mapped[float | None] = mapped_column(Float)

@@ -25,10 +25,13 @@ def record_operation(action: str, target: str = "", status: str = "",
         duration = (now - started_at).total_seconds() if started_at else None
         s = create_session()
         try:
+            from recruitment_assistant.storage import tenancy
             s.add(OperationLog(
                 action=action, target=target or None, status=status or None,
                 detail=detail or None, started_at=started_at, finished_at=now,
                 duration_seconds=duration,
+                actor_user_id=tenancy.current_user_id(),  # 有请求上下文时留痕 actor/租户
+                tenant_id=tenancy.current_tenant_id(),
             ))
             s.commit()
         finally:

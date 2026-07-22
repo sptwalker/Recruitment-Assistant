@@ -23,6 +23,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column, synonym
 
 from recruitment_assistant.storage.db import Base
+from recruitment_assistant.storage.tenancy import OwnedMixin
 
 
 class TimestampMixin:
@@ -111,7 +112,7 @@ class BossCandidateRecord(Base):
     last_seen_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
 
 
-class JobPosition(Base, TimestampMixin):
+class JobPosition(OwnedMixin, Base, TimestampMixin):
     __tablename__ = "job_position"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)

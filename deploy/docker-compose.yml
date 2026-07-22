@@ -1,0 +1,26 @@
+# M2 部署编排。M2.0 先起 PostgreSQL 供本地开发/迁移验证；
+# backend / frontend 容器在 M2.6 补入。
+#
+# 用法：
+#   docker compose -f deploy/docker-compose.yml up -d db
+#   export DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5432/recruitment
+#   python -m alembic -c alembic.ini upgrade head   # 或后端启动时自动 upgrade
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: recruitment
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:

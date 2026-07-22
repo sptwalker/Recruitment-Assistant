@@ -9,7 +9,11 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     app_env: str = "local"
-    database_url: str = "postgresql+psycopg://postgres:postgres@localhost:5432/recruitment_assistant"
+    # DB 连接串。空 → 本地 SQLite（见 storage.resume_db.resolve_db_url）；
+    # 设 postgresql+psycopg://… → 多用户 PG 部署。pydantic 自动读同名环境变量 DATABASE_URL。
+    database_url: str = ""
+    # 前端 SPA 源（CORS，携带 cookie）。
+    frontend_origin: str = "http://localhost:5173"
     playwright_headless: bool = False
     crawler_min_interval_seconds: int = 8
     crawler_max_interval_seconds: int = 30

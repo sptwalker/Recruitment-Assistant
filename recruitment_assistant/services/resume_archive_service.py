@@ -332,13 +332,16 @@ class ResumeArchiveService:
         dimensions: dict | None = None,
         jd_hash: str | None = None,
     ) -> None:
-        """保存岗位匹配结果（M1 后走统一 ORM session，SQLite upsert）。
+        """保存岗位匹配结果（走统一 ORM session，按方言 upsert）。
 
         candidate_id 已在调用方预验证；position_id 与 job_position 同库，有真 FK。
-        用 SQLite ON CONFLICT 在 (position_id, candidate_id) 唯一键上 upsert，
-        取代原先的裸 sqlite3 + INSERT OR REPLACE。
+        在 (position_id, candidate_id) 唯一键上 ON CONFLICT upsert；SQLite / PostgreSQL
+        的 on_conflict_do_update API 一致，仅 insert 构造器按方言选取。
         """
-        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+        if self.session.bind.dialect.name == "postgresql":
+            from sqlalchemy.dialects.postgresql import insert as _insert
+        else:
+            from sqlalchemy.dialects.sqlite import insert as _insert
 
         values = {
             "position_id": position_id,
@@ -351,7 +354,7 @@ class ResumeArchiveService:
             "location_match": dimensions.get("location_match") if dimensions else None,
             "jd_hash": jd_hash,
         }
-        stmt = sqlite_insert(PositionMatch).values(**values)
+        stmt = _insert(PositionMatch).values(**values)
         stmt = stmt.on_conflict_do_update(
             index_elements=["position_id", "candidate_id"],
             set_={

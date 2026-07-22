@@ -1,8 +1,11 @@
-"""独立 SQLite 简历归档数据库引擎。
+"""统一数据库引擎（M2 起支持双方言）。
 
-与现有 PostgreSQL 采集任务库完全隔离，数据文件位于 data/resume_archive.db。
+默认 SQLite（`data/resume_archive.db`，本地/桌面/测试）；设置环境变量
+`DATABASE_URL=postgresql+psycopg://…` 即切到 PostgreSQL（多用户部署）。
+方言相关处（外键 PRAGMA、alembic batch 模式、upsert）按 dialect 分支。
 """
 
+import os
 from pathlib import Path
 
 from sqlalchemy import create_engine, event
@@ -11,19 +14,28 @@ from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 RESUME_DB_PATH = Path("data/resume_archive.db")
 
 
+def resolve_db_url() -> str:
+    """引擎/迁移共用的 URL 解析：DATABASE_URL 优先，否则默认本地 SQLite。"""
+    url = os.environ.get("DATABASE_URL", "").strip()
+    if url:
+        return url
+    RESUME_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    return f"sqlite:///{RESUME_DB_PATH.as_posix()}"
+
+
 class ResumeBase(DeclarativeBase):
     pass
 
 
 def _get_resume_engine():
-    RESUME_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    engine = create_engine(f"sqlite:///{RESUME_DB_PATH}", echo=False)
+    engine = create_engine(resolve_db_url(), echo=False)
 
-    @event.listens_for(engine, "connect")
-    def _set_sqlite_pragma(dbapi_conn, _connection_record):
-        cursor = dbapi_conn.cursor()
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.close()
+    if engine.dialect.name == "sqlite":
+        @event.listens_for(engine, "connect")
+        def _set_sqlite_pragma(dbapi_conn, _connection_record):
+            cursor = dbapi_conn.cursor()
+            cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.close()
 
     return engine
 
@@ -49,7 +61,7 @@ def _alembic_config():
 
     cfg = Config()
     cfg.set_main_option("script_location", str(_MIGRATIONS_DIR))
-    cfg.set_main_option("sqlalchemy.url", f"sqlite:///{RESUME_DB_PATH}")
+    cfg.set_main_option("sqlalchemy.url", os.environ.get("ALEMBIC_DB_URL") or resolve_db_url())
     return cfg
 
 
@@ -80,8 +92,8 @@ def init_resume_database() -> None:
     has_alembic = insp.has_table("alembic_version")
 
     cfg = _alembic_config()
-    if has_app_tables and not has_alembic:
-        # 老库引导：补齐到当前模型 schema（== 基线），再打标基线，最后 upgrade
+    if has_app_tables and not has_alembic and resume_engine.dialect.name == "sqlite":
+        # 老库引导（仅 SQLite）：补齐到当前模型 schema（== 基线），再打标基线，最后 upgrade
         ResumeBase.metadata.create_all(bind=resume_engine)  # 补任何缺失的表
         _migrate_add_attachment_works_path()                # 补历史缺失的列
         _migrate_add_match_dimensions()

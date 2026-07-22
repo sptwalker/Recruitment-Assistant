@@ -24,6 +24,13 @@ def get_db() -> Generator[Session, None, None]:
         db.close()
 
 
+def get_session_factory():
+    """返回 session 工厂本身（非 session）。给 WebSocket 这类长连场景用：
+    在需要时临时开、用完立即关，不像 get_db 那样把连接占满整个连接生命周期。
+    测试可 override 成临时库的 sessionmaker。"""
+    return SessionLocal
+
+
 def get_current_user(
     access_token: str | None = Cookie(default=None, alias=COOKIE_NAME),
     db: Session = Depends(get_db),

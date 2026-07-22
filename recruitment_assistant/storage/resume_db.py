@@ -31,18 +31,64 @@ def _get_resume_engine():
 resume_engine = _get_resume_engine()
 ResumeSessionLocal = sessionmaker(bind=resume_engine)
 
+_MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
+_SCHEMA_READY = False
+
 
 def create_resume_session() -> Session:
     return ResumeSessionLocal()
 
 
+def _alembic_config():
+    """程序化构建 alembic Config（不依赖 cwd 下的 alembic.ini）。
+
+    script_location 用本模块旁的 migrations 目录绝对路径 → 打包后 cwd 变化也可靠。
+    URL 由 env.py 从 RESUME_DB_PATH 兜底设置，这里显式再设一遍保持一致。
+    """
+    from alembic.config import Config
+
+    cfg = Config()
+    cfg.set_main_option("script_location", str(_MIGRATIONS_DIR))
+    cfg.set_main_option("sqlalchemy.url", f"sqlite:///{RESUME_DB_PATH}")
+    return cfg
+
+
 def init_resume_database() -> None:
-    # 导入两套模型，确保全部表注册到统一 metadata（候选人 PII + 岗位/采集）
+    """确保统一 SQLite schema 到最新——alembic 为唯一迁移源。
+
+    进程内只跑一次（Streamlit 每次 rerun 都会调用本函数）。三种库形态：
+    - **全新库**：`alembic upgrade head` 按迁移脚本建全部表。
+    - **老库（create_all 时代，无 alembic_version）**：先 create_all 补齐缺失表 +
+      幂等补齐历史手工列 → 打标到基线版本 → 再 upgrade head 应用后续迁移。
+      （create_all / 手工 ALTER 仅作老库一次性引导，之后所有 schema 变更都走 alembic。）
+    - **已纳管库**：`alembic upgrade head` 应用尚未执行的迁移。
+    """
+    global _SCHEMA_READY
+    if _SCHEMA_READY:
+        return
+
+    from sqlalchemy import inspect
+    from alembic import command
+    from alembic.script import ScriptDirectory
+
+    # 注册两套模型到统一 metadata（env.py 也依赖）
     from recruitment_assistant.storage import resume_models as _rm  # noqa: F401
     from recruitment_assistant.storage import models as _m  # noqa: F401
-    ResumeBase.metadata.create_all(bind=resume_engine)
-    _migrate_add_attachment_works_path()
-    _migrate_add_match_dimensions()
+
+    insp = inspect(resume_engine)
+    has_app_tables = insp.has_table("resume_source")
+    has_alembic = insp.has_table("alembic_version")
+
+    cfg = _alembic_config()
+    if has_app_tables and not has_alembic:
+        # 老库引导：补齐到当前模型 schema（== 基线），再打标基线，最后 upgrade
+        ResumeBase.metadata.create_all(bind=resume_engine)  # 补任何缺失的表
+        _migrate_add_attachment_works_path()                # 补历史缺失的列
+        _migrate_add_match_dimensions()
+        base_rev = ScriptDirectory.from_config(cfg).get_bases()[0]
+        command.stamp(cfg, base_rev)
+    command.upgrade(cfg, "head")
+    _SCHEMA_READY = True
 
 
 def _migrate_add_attachment_works_path() -> None:

@@ -8,17 +8,11 @@
 import shutil
 import subprocess
 import sys
-import urllib.request
-import zipfile
 from pathlib import Path
 
 BUILD_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BUILD_DIR.parent
 DIST_DIR = PROJECT_ROOT / "dist" / "简历智采助手"
-
-PG_VERSION = "17.2-1"
-PG_ZIP_URL = f"https://get.enterprisedb.com/postgresql/postgresql-{PG_VERSION}-windows-x64-binaries.zip"
-PG_ZIP_NAME = f"postgresql-{PG_VERSION}-windows-x64-binaries.zip"
 
 APP_DIRS = ["app", "recruitment_assistant", "icon", "chrome_extension"]
 APP_FILES = ["pyproject.toml"]
@@ -27,28 +21,6 @@ DATA_DIRS = ["data/exports", "data/attachments/zhilian", "data/attachments/boss"
 
 def step(msg: str) -> None:
     print(f"\n{'='*60}\n  {msg}\n{'='*60}")
-
-
-def download_postgres() -> Path:
-    cache = BUILD_DIR / PG_ZIP_NAME
-    if cache.exists():
-        print(f"  Using cached {PG_ZIP_NAME}")
-        return cache
-    print(f"  Downloading PostgreSQL {PG_VERSION}...")
-    urllib.request.urlretrieve(PG_ZIP_URL, cache)
-    return cache
-
-
-def extract_postgres(zip_path: Path) -> None:
-    pg_dest = DIST_DIR / "pgsql"
-    if pg_dest.exists():
-        print("  PostgreSQL already extracted.")
-        return
-    print("  Extracting PostgreSQL (bin + lib + share only)...")
-    with zipfile.ZipFile(zip_path, "r") as zf:
-        for member in zf.namelist():
-            if member.startswith("pgsql/bin/") or member.startswith("pgsql/lib/") or member.startswith("pgsql/share/"):
-                zf.extract(member, DIST_DIR)
 
 
 def setup_python_env() -> None:
@@ -75,9 +47,9 @@ def create_data_dirs() -> None:
 
 
 def create_env_file() -> None:
+    # M1 后单一 SQLite（data/resume_archive.db），不再需要 PG DATABASE_URL。
     env_content = """\
 APP_ENV=local
-DATABASE_URL=postgresql+psycopg://postgres:932092@localhost:5432/recruitment_assistant
 CRAWLER_MIN_INTERVAL_SECONDS=8
 CRAWLER_MAX_INTERVAL_SECONDS=30
 CRAWLER_MAX_RESUMES_PER_TASK=50
@@ -99,26 +71,22 @@ def copy_launcher() -> None:
 
 
 def main() -> None:
-    step("1/6 Preparing dist directory")
+    step("1/5 Preparing dist directory")
     DIST_DIR.mkdir(parents=True, exist_ok=True)
 
-    step("2/6 Setting up embedded Python + dependencies")
+    step("2/5 Setting up embedded Python + dependencies")
     sys.path.insert(0, str(BUILD_DIR))
     setup_python_env()
 
-    step("3/6 Downloading and extracting PostgreSQL")
-    pg_zip = download_postgres()
-    extract_postgres(pg_zip)
-
-    step("4/6 Copying application code")
+    step("3/5 Copying application code")
     copy_app_code()
 
-    step("5/6 Creating data directories and config")
+    step("4/5 Creating data directories and config")
     create_data_dirs()
     create_env_file()
     copy_launcher()
 
-    step("6/6 Build complete!")
+    step("5/5 Build complete!")
     print(f"\n  Output: {DIST_DIR}")
     print(f"  To test: double-click {DIST_DIR / 'launcher.pyw'}")
     print(f"  To create installer: compile build/installer.iss with Inno Setup 6")

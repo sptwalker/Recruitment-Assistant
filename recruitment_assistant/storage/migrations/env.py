@@ -1,4 +1,5 @@
 from logging.config import fileConfig
+import os
 
 from alembic import context
 from sqlalchemy import engine_from_config, pool
@@ -11,7 +12,9 @@ from recruitment_assistant.storage import resume_models  # noqa: F401
 from recruitment_assistant.storage.resume_db import RESUME_DB_PATH
 
 config = context.config
-config.set_main_option("sqlalchemy.url", f"sqlite:///{RESUME_DB_PATH}")
+# ALEMBIC_DB_URL 覆盖（用于 autogenerate 基线时指向空库、CI 指向临时库）；否则用真实 SQLite。
+db_url = os.environ.get("ALEMBIC_DB_URL", f"sqlite:///{RESUME_DB_PATH}")
+config.set_main_option("sqlalchemy.url", db_url)
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)

@@ -1,10 +1,11 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session
 
 from recruitment_assistant.schemas.job import JobPositionCreate
 from recruitment_assistant.storage.models import JobPosition
+from recruitment_assistant.storage.resume_models import PositionMatch
 
 
 class JobService:
@@ -93,10 +94,16 @@ class JobService:
     # -- Delete (soft) --
 
     def delete_position(self, position_id: int) -> bool:
-        """Soft-delete a position by setting deleted_at."""
+        """Soft-delete a position; hard-delete its derived match rows (orphan cleanup).
+
+        岗位匹配（position_matches）是可再生的派生打分数据——岗位删除后不再可达，
+        一并清理，避免孤儿累积。面试邀约/评价/大纲是候选人面试历史，保留（岗位行
+        软删仍在，position_id 外键不悬空）。
+        """
         pos = self.session.get(JobPosition, position_id)
         if not pos or pos.deleted_at is not None:
             return False
         pos.deleted_at = datetime.now(timezone.utc)
+        self.session.execute(delete(PositionMatch).where(PositionMatch.position_id == position_id))
         self.session.commit()
         return True

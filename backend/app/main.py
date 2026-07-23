@@ -18,6 +18,10 @@ from recruitment_assistant.storage.resume_db import resolve_db_url
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     init_database()  # alembic upgrade head（PG 或 SQLite）
+    # 扩展上报事件 → 入库（BOSS 持久化路径）。crawl_ws 已在 tenant_scope 内调用它。
+    from backend.app.crawl_hub import hub
+    from backend.app.crawl_ingest import handle_boss_event
+    hub.on_event = handle_boss_event
     yield
 
 

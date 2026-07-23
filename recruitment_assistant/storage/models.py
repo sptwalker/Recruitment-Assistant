@@ -23,7 +23,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column, synonym
 
 from recruitment_assistant.storage.db import Base
-from recruitment_assistant.storage.tenancy import OwnedMixin
+from recruitment_assistant.storage.tenancy import OwnedMixin, TenantMixin
 
 
 class TimestampMixin:
@@ -47,7 +47,7 @@ class PlatformAccount(Base, TimestampMixin):
     remark: Mapped[str | None] = mapped_column(Text)
 
 
-class CrawlTask(Base, TimestampMixin):
+class CrawlTask(TenantMixin, Base, TimestampMixin):
     __tablename__ = "crawl_task"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -87,7 +87,7 @@ class RawResume(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
-class BossCandidateRecord(Base):
+class BossCandidateRecord(TenantMixin, Base):
     """采集期去重记录（三平台共用，按 platform_code 区分，名称含 boss 只是历史）。"""
     __tablename__ = "boss_candidate_record"
     __table_args__ = (UniqueConstraint("platform_code", "candidate_key", name="uk_boss_platform_candidate_key"),)

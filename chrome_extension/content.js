@@ -5,6 +5,8 @@
 
   // 平台注册表：每个平台的 hostname、WS 端口、文本标记、localStorage key 一站式声明。
   // 这是从单平台升级到多平台的核心入口——新加平台只需在此对象增加一条配置。
+  // 注：ws_url 字段为历史遗留、content.js 从不建立 WS 连接（全部经 background.js 中转）；
+  //     实际连接地址在 background.js（M3 后从 chrome.storage 读服务端 wss，见 SERVER_WS_URL）。
   const PLATFORM_REGISTRY = {
     boss: {
       code: "boss",

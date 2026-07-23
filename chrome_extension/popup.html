@@ -12,6 +12,12 @@
     .dot.on { background: #52c41a; }
     .dot.off { background: #ccc; }
     .info { color: #666; font-size: 11px; margin-top: 12px; padding-top: 10px; border-top: 1px solid #eee; }
+    .config { margin-top: 12px; padding-top: 10px; border-top: 1px solid #eee; }
+    .config label { display: block; font-size: 11px; color: #666; margin: 8px 0 3px; }
+    .config input { width: 100%; box-sizing: border-box; padding: 5px 6px; font-size: 11px; border: 1px solid #ddd; border-radius: 4px; }
+    .config button { margin-top: 8px; width: 100%; padding: 6px; font-size: 12px; color: #fff; background: #4A90E2; border: none; border-radius: 4px; cursor: pointer; }
+    .config button:hover { background: #3a7bc8; }
+    #saveMsg { font-size: 11px; color: #52c41a; margin-top: 6px; min-height: 14px; }
   </style>
 </head>
 <body>
@@ -53,8 +59,17 @@
     </div>
   </div>
 
+  <div class="config">
+    <label for="serverUrl">服务端 WebSocket 地址</label>
+    <input id="serverUrl" type="text" placeholder="wss://your-server.com/crawl/ws">
+    <label for="serverToken">Token（从系统面板复制）</label>
+    <input id="serverToken" type="password" placeholder="粘贴 JWT token">
+    <button id="saveBtn">保存并重连</button>
+    <div id="saveMsg"></div>
+  </div>
+
   <div class="info">
-    采集控制请在 Streamlit 面板操作
+    未配置服务端时连接本机 localhost（本地开发模式）
   </div>
   <script src="popup.js"></script>
 </body>

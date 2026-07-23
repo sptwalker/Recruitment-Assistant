@@ -1,10 +1,12 @@
 // 平台注册表：与 content.js 同步维护。
 // 每个平台一个 WS 连接 + 一组 tab URL 模式，互不干扰。
+// M3：ws_url 改为服务端统一地址，从 chrome.storage.local 读取配置。
+// fallback 为 localhost（本地开发不配 server 时保持旧行为）。
 const PLATFORM_REGISTRY = {
   boss: {
     code: "boss",
     name: "BOSS直聘",
-    ws_url: "ws://127.0.0.1:8765",
+    ws_url: "ws://127.0.0.1:8765", // legacy fallback（仅本地开发）
     tab_url_pattern: "https://www.zhipin.com/*",
     tab_url_regex: /^https:\/\/www\.zhipin\.com\//,
     extra_path_regex: /chat|friend|geek|boss|web/,
@@ -13,7 +15,7 @@ const PLATFORM_REGISTRY = {
   qiancheng: {
     code: "qiancheng",
     name: "51前程无忧",
-    ws_url: "ws://127.0.0.1:8766",
+    ws_url: "ws://127.0.0.1:8766", // legacy fallback
     tab_url_pattern: "https://ehire.51job.com/*",
     tab_url_regex: /^https:\/\/ehire\.51job\.com\//,
     extra_path_regex: /./, // 阶段 1 宽匹配，阶段 2 学习后收窄
@@ -22,13 +24,28 @@ const PLATFORM_REGISTRY = {
   zhilian: {
     code: "zhilian",
     name: "智联招聘",
-    ws_url: "ws://127.0.0.1:8767",
+    ws_url: "ws://127.0.0.1:8767", // legacy fallback
     tab_url_pattern: "https://*.zhaopin.com/*",
     tab_url_regex: /^https:\/\/rd[0-9]+\.zhaopin\.com\//,
     extra_path_regex: /./,
     download_dir_name: "智联招聘",
   },
 };
+
+// M3 服务端配置（从 chrome.storage.local 读取，popup 写入）。
+// server_ws_url: 服务端 WebSocket 基址，如 "wss://your-server.com/crawl/ws"
+// server_token: 用户 JWT（从 SPA 复制粘贴到扩展 popup）
+let SERVER_WS_URL = "";  // 非空时覆盖 legacy ws_url；空则走 localhost fallback
+let SERVER_TOKEN = "";
+
+// 启动时从 storage 加载配置；后续 popup 保存时也会 sendMessage 通知更新。
+function loadServerConfig(callback) {
+  chrome.storage.local.get(["server_ws_url", "server_token"], (result) => {
+    SERVER_WS_URL = result.server_ws_url || "";
+    SERVER_TOKEN = result.server_token || "";
+    if (callback) callback();
+  });
+}
 
 const EXTENSION_VERSION = (typeof chrome !== "undefined" && chrome.runtime && typeof chrome.runtime.getManifest === "function")
   ? (chrome.runtime.getManifest().version || "0.0.0")
@@ -61,7 +78,17 @@ function platformForUrl(url = "") {
 function connect(platform) {
   if (platform.ws && (platform.ws.readyState === WebSocket.OPEN || platform.ws.readyState === WebSocket.CONNECTING)) return;
 
-  platform.ws = new WebSocket(platform.cfg.ws_url);
+  // M3：配了服务端地址 → 统一连服务器 wss（多平台复用同一 endpoint，靠 platform query 区分）；
+  // 未配 → 保持 localhost fallback（本地开发/单机 Streamlit 模式不受影响）。
+  let url;
+  if (SERVER_WS_URL) {
+    if (!SERVER_TOKEN) return; // 配了地址却没 token：服务端会 1008 拒连，别陷入重连风暴
+    const sep = SERVER_WS_URL.includes("?") ? "&" : "?";
+    url = SERVER_WS_URL + sep + "platform=" + platform.cfg.code + "&token=" + encodeURIComponent(SERVER_TOKEN);
+  } else {
+    url = platform.cfg.ws_url;
+  }
+  platform.ws = new WebSocket(url);
 
   platform.ws.onopen = () => {
     platform.reconnectDelay = 1000;
@@ -573,7 +600,26 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse({
       connected: Object.values(platforms).some((p) => p.ws?.readyState === WebSocket.OPEN),
       platform_states: Object.fromEntries(Object.entries(platforms).map(([code, p]) => [code, { connected: p.ws?.readyState === WebSocket.OPEN, collectState: p.collectState }])),
+      server_ws_url: SERVER_WS_URL,
+      server_token: SERVER_TOKEN,
     });
+  } else if (msg.type === "update_server_config") {
+    // popup 保存配置后通知 background 热更新——断开旧连接、加载新配置、重连。
+    loadServerConfig(() => {
+      for (const p of Object.values(platforms)) {
+        // 先摘掉旧 socket 的回调再 close：否则旧 socket 迟到的 onclose 会把刚建的新
+        // socket 引用清成 null（闭包捕获的是 platform 而非具体 socket），导致新连上却
+        // 上报无门 + 再触发一次重连产生重复连接。
+        if (p.ws) {
+          p.ws.onopen = p.ws.onclose = p.ws.onmessage = p.ws.onerror = null;
+          try { p.ws.close(); } catch (e) {}
+          p.ws = null;
+        }
+        connect(p);
+      }
+      sendResponse({ ok: true });
+    });
+    return true; // async sendResponse
   } else if (msg.type === "extract_vue_data") {
     const tabId = sender?.tab?.id;
     if (!tabId) { sendResponse({ ok: false, error: "no_tab" }); return true; }
@@ -666,7 +712,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   return true;
 });
 
-// 启动所有平台的 WS 连接
-for (const platform of Object.values(platforms)) {
-  connect(platform);
-}
+// 启动所有平台的 WS 连接（先加载服务端配置，再连接）
+loadServerConfig(() => {
+  for (const platform of Object.values(platforms)) {
+    connect(platform);
+  }
+});

@@ -133,3 +133,16 @@ def test_ws_unauthenticated_status_401(env):
     tc, _, _, _ = env
     tc.cookies.clear()
     assert tc.get("/crawl/status").status_code == 401
+
+
+def test_token_mints_valid_jwt_for_current_user(env):
+    tc, _, cookie, users = env
+    cookie("org1")
+    r = tc.get("/crawl/token")
+    assert r.status_code == 200
+    # 签发的 token 能解回本人 id（供扩展跨站带 query token 连 WS）
+    assert security.decode_access_token(r.json()["token"]) == users["org1"]
+    # 未登录拿不到
+    tc.cookies.clear()
+    assert tc.get("/crawl/token").status_code == 401
+

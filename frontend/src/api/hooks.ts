@@ -106,5 +106,31 @@ export function useAiUsage(day: string, enabled = true) {
   });
 }
 
+export interface CrawlStatus {
+  connected: boolean;
+  platforms: string[];
+}
+
+export function useCrawlStatus() {
+  return useQuery({
+    queryKey: ["crawl-status"],
+    queryFn: async () => (await api.get<CrawlStatus>("/crawl/status")).data,
+    refetchInterval: 5000, // 轮询扩展在线状态
+  });
+}
+
+export function useCrawlCommand() {
+  return useMutation({
+    mutationFn: async (command: Record<string, unknown>) =>
+      (await api.post<{ delivered: number }>("/crawl/command", { command })).data,
+  });
+}
+
+export function useCrawlToken() {
+  return useMutation({
+    mutationFn: async () => (await api.get<{ token: string }>("/crawl/token")).data,
+  });
+}
+
 // 重新导出便于页面 import 类型
 export type { Candidate, Job, JobMatch };

@@ -4,6 +4,7 @@ import {
   TeamOutlined,
   ProfileOutlined,
   FileTextOutlined,
+  CloudDownloadOutlined,
   LogoutOutlined,
 } from "@ant-design/icons";
 import { Link, Outlet, useLocation, useNavigate } from "react-router-dom";
@@ -17,6 +18,7 @@ const ITEMS = [
   { key: "/", icon: <DashboardOutlined />, label: <Link to="/">看板</Link> },
   { key: "/candidates", icon: <TeamOutlined />, label: <Link to="/candidates">简历管理</Link> },
   { key: "/jobs", icon: <ProfileOutlined />, label: <Link to="/jobs">职位管理</Link> },
+  { key: "/crawl", icon: <CloudDownloadOutlined />, label: <Link to="/crawl">简历采集</Link> },
   { key: "/logs", icon: <FileTextOutlined />, label: <Link to="/logs">系统日志</Link> },
 ];
 

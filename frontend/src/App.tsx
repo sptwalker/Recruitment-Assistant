@@ -6,6 +6,7 @@ import { Dashboard } from "./pages/Dashboard";
 import { Candidates } from "./pages/Candidates";
 import { Jobs } from "./pages/Jobs";
 import { Logs } from "./pages/Logs";
+import { Crawl } from "./pages/Crawl";
 
 export function App() {
   return (
@@ -22,6 +23,7 @@ export function App() {
         <Route index element={<Dashboard />} />
         <Route path="candidates" element={<Candidates />} />
         <Route path="jobs" element={<Jobs />} />
+        <Route path="crawl" element={<Crawl />} />
         <Route path="logs" element={<Logs />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />

@@ -15,7 +15,7 @@ from starlette.websockets import WebSocketDisconnect
 
 from backend.app.crawl_hub import Conn, hub
 from backend.app.deps import get_current_user, get_session_factory
-from backend.app.security import COOKIE_NAME, decode_access_token
+from backend.app.security import COOKIE_NAME, create_access_token, decode_access_token
 from recruitment_assistant.storage import tenancy
 from recruitment_assistant.storage.auth_models import User
 
@@ -91,3 +91,11 @@ async def crawl_command(
 ) -> dict:
     delivered = await hub.send_to_user(user.id, body.command, platform=body.platform)
     return {"delivered": delivered}
+
+
+@router.get("/token")
+def crawl_token(user: User = Depends(get_current_user)) -> dict:
+    """签发一枚新 JWT 供用户复制到扩展 popup。登录 JWT 存 httpOnly cookie，SPA 的 JS
+    读不到；扩展跨站又带不了 cookie，故这里现签一枚（同 secret/有效期）让用户手工搬运。
+    """
+    return {"token": create_access_token(user.id)}

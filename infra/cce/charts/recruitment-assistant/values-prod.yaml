@@ -1,0 +1,19 @@
+namespace: recruitment-assistant
+
+replicaCount: 1
+
+image:
+  pullPolicy: IfNotPresent
+
+persistence:
+  enabled: true
+  storageClassName: csi-disk
+  size: 10Gi
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: "1"
+    memory: 2Gi

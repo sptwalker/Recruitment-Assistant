@@ -1,0 +1,139 @@
+stages:
+  - verify
+  - build
+  - deploy
+
+variables:
+  CCE_NAMESPACE: "recruitment-assistant"
+  DOCKER_BUILDKIT: "1"
+  FF_USE_FASTZIP: "true"
+  ARTIFACT_COMPRESSION_LEVEL: "fast"
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+
+workflow:
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: always
+    - when: never
+
+verify_python:
+  stage: verify
+  image: python:3.11-slim-bookworm
+  tags: [AI]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - when: never
+  cache:
+    key: "python-${CI_COMMIT_REF_SLUG}"
+    paths:
+      - .cache/pip/
+    policy: pull-push
+  script:
+    - python -m pip install --upgrade pip
+    - python -m pip install -e ".[dev]"
+    - python -m pytest
+
+verify_deployment:
+  stage: verify
+  image:
+    name: alpine/helm:3.17.3
+    entrypoint: [""]
+  tags: [AI]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - when: never
+  script:
+    - sh -n scripts/docker-entrypoint.sh scripts/swr-login.sh scripts/verify-public-route.sh scripts/tests/test-verify-public-route.sh
+    - sh scripts/tests/test-verify-public-route.sh
+    - helm lint infra/cce/charts/recruitment-assistant -f infra/cce/charts/recruitment-assistant/values-prod.yaml
+    - |
+      rendered_chart="$(mktemp)"
+      helm template recruitment-assistant infra/cce/charts/recruitment-assistant \
+        --namespace recruitment-assistant \
+        -f infra/cce/charts/recruitment-assistant/values-prod.yaml \
+        --set-string image.repository="swr.example.invalid/nexus-studio/recruitment-assistant" \
+        --set-string image.tag="ci-verify" > "${rendered_chart}"
+      grep -F 'host: hr.youdoogo.com' "${rendered_chart}"
+      grep -F 'path: /recruitment-assistant' "${rendered_chart}"
+      grep -F 'path: /recruitment-assistant/_stcore/health' "${rendered_chart}"
+
+build_image:
+  stage: build
+  image: docker:27-dind
+  services:
+    - name: docker:27-dind
+  variables:
+    DOCKER_TLS_CERTDIR: ""
+    DOCKER_HOST: tcp://docker:2375
+  tags: [AI]
+  needs: [verify_python, verify_deployment]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - when: never
+  before_script:
+    - apk add --no-cache ca-certificates curl
+    - ': "${SWR_REGION:?SWR_REGION must be configured in GitLab CI variables}"'
+    - ': "${SWR_AK:?SWR_AK must be configured in GitLab CI variables}"'
+    - ': "${SWR_PASSWORD:?SWR_PASSWORD must be configured in GitLab CI variables}"'
+    - export IMAGE_TAG="${CI_COMMIT_REF_SLUG}-${CI_COMMIT_SHORT_SHA}"
+    - . scripts/swr-login.sh
+    - docker buildx inspect --bootstrap
+  script:
+    - |
+      docker buildx build \
+        --push \
+        --provenance=false \
+        --platform linux/amd64 \
+        --tag "${SWR_REGISTRY}/recruitment-assistant:${IMAGE_TAG}" \
+        --tag "${SWR_REGISTRY}/recruitment-assistant:latest" \
+        --file Dockerfile \
+        .
+
+deploy_cce:
+  stage: deploy
+  image:
+    name: alpine/helm:3.17.3
+    entrypoint: [""]
+  tags: [AI]
+  needs: [build_image]
+  retry: 0
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - when: never
+  script:
+    - apk add --no-cache ca-certificates curl
+    - ': "${SWR_REGION:?SWR_REGION must be configured in GitLab CI variables}"'
+    - ': "${SWR_AK:?SWR_AK must be configured in GitLab CI variables}"'
+    - ': "${SWR_PASSWORD:?SWR_PASSWORD must be configured in GitLab CI variables}"'
+    - ': "${KUBECONFIG_CCE_B64:?KUBECONFIG_CCE_B64 must be configured in GitLab CI variables}"'
+    - export IMAGE_TAG="${CI_COMMIT_REF_SLUG}-${CI_COMMIT_SHORT_SHA}"
+    - export SWR_REGISTRY="swr.${SWR_REGION}.myhuaweicloud.com/nexus-studio"
+    - curl --fail --silent --show-error --location --output /usr/local/bin/kubectl "https://dl.k8s.io/release/v1.31.5/bin/linux/amd64/kubectl"
+    - chmod 0755 /usr/local/bin/kubectl
+    - mkdir -p "${HOME}/.kube"
+    - printf '%s' "${KUBECONFIG_CCE_B64}" | base64 -d > "${HOME}/.kube/config"
+    - chmod 0600 "${HOME}/.kube/config"
+    - kubectl get nodes
+    - kubectl create namespace "${CCE_NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
+    - |
+      kubectl create secret docker-registry swr-registry \
+        --namespace "${CCE_NAMESPACE}" \
+        --docker-server="swr.${SWR_REGION}.myhuaweicloud.com" \
+        --docker-username="${SWR_REGION}@${SWR_AK}" \
+        --docker-password="${SWR_PASSWORD}" \
+        --dry-run=client -o yaml | kubectl apply -f -
+    - |
+      helm upgrade --install recruitment-assistant infra/cce/charts/recruitment-assistant \
+        --namespace "${CCE_NAMESPACE}" \
+        --create-namespace \
+        --values infra/cce/charts/recruitment-assistant/values-prod.yaml \
+        --set-string image.repository="${SWR_REGISTRY}/recruitment-assistant" \
+        --set-string image.tag="${IMAGE_TAG}" \
+        --atomic \
+        --wait \
+        --timeout 5m \
+        --history-max 10
+    - kubectl rollout status deployment/recruitment-assistant --namespace "${CCE_NAMESPACE}" --timeout=5m
+    - helm status recruitment-assistant --namespace "${CCE_NAMESPACE}"
+    - kubectl get pods,service,endpoints,ingress --namespace "${CCE_NAMESPACE}" -o wide
+    - PUBLIC_VERIFY_ATTEMPTS=12 PUBLIC_VERIFY_DELAY_SECONDS=5 sh scripts/verify-public-route.sh

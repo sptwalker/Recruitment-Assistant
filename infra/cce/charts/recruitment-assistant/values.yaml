@@ -1,0 +1,96 @@
+nameOverride: ""
+fullnameOverride: "recruitment-assistant"
+
+namespace: recruitment-assistant
+
+replicaCount: 1
+
+image:
+  repository: swr.cn-south-1.myhuaweicloud.com/nexus-studio/recruitment-assistant
+  tag: latest
+  pullPolicy: IfNotPresent
+
+imagePullSecrets:
+  - name: swr-registry
+
+service:
+  type: ClusterIP
+  port: 8080
+  targetPort: 8080
+
+ingress:
+  enabled: true
+  className: cce
+  host: hr.youdoogo.com
+  path: /recruitment-assistant
+  pathType: Prefix
+  annotations:
+    kubernetes.io/elb.class: performance
+    kubernetes.io/elb.id: "abab7533-a1c6-4138-a4bc-59d53e3446e2"
+    kubernetes.io/elb.listen-ports: '[{"HTTP":80},{"HTTPS":443}]'
+    kubernetes.io/elb.tls-certificate-ids: "56de20421757445ea53f5af51ecb4e10"
+
+persistence:
+  enabled: true
+  existingClaim: ""
+  storageClassName: csi-disk
+  accessModes:
+    - ReadWriteOnce
+  size: 10Gi
+  mountPath: /var/lib/recruitment-assistant
+  retain: true
+
+config:
+  APP_ENV: production
+  PLAYWRIGHT_HEADLESS: "true"
+  EXPORT_DIR: /var/lib/recruitment-assistant/data/exports
+  ATTACHMENT_DIR: /var/lib/recruitment-assistant/data/attachments
+  BROWSER_STATE_DIR: /var/lib/recruitment-assistant/data/browser_state
+  SNAPSHOT_DIR: /var/lib/recruitment-assistant/data/snapshots
+  LOG_LEVEL: INFO
+  STREAMLIT_BROWSER_GATHER_USAGE_STATS: "false"
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: "1"
+    memory: 2Gi
+
+probes:
+  path: /recruitment-assistant/_stcore/health
+  startup:
+    failureThreshold: 30
+    periodSeconds: 5
+    timeoutSeconds: 3
+  readiness:
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+  liveness:
+    initialDelaySeconds: 15
+    periodSeconds: 20
+    timeoutSeconds: 5
+    failureThreshold: 3
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
